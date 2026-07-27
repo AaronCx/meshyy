@@ -46,6 +46,15 @@ public enum ControlFrame: Sendable, Equatable {
     /// transition, or when the matched prompt leaves the output tail.
     case quickActions([QuickAction])
     case resumeTooOld(ptyID: Int, earliestOffset: UInt64)
+    /// Asks the daemon for a session and a single-use token (design doc §5.1
+    /// step 2). Local transport only — over QUIC the handshake has already
+    /// happened, and answering this there would let a connection mint itself a
+    /// fresh token, defeating single use.
+    case bootstrapRequest(session: String)
+    /// The §5.1 handshake, as the JSON the client parses. Carried as an opaque
+    /// string rather than re-modelled so the bytes the client sees are exactly the
+    /// bytes the daemon produced.
+    case bootstrapResponse(json: String)
     case bye(reason: String)
     case error(code: Int, message: String)
     /// A frame this build does not know. Design doc §5.3: ignore it, but keep it
@@ -124,6 +133,8 @@ public enum ControlFrame: Sendable, Equatable {
         case .screenMode: "screen"
         case .agentEvent: "agent"
         case .quickActions: "qa"
+        case .bootstrapRequest: "boot"
+        case .bootstrapResponse: "booted"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
         case .error: "error"
@@ -183,6 +194,10 @@ extension ControlFrame {
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
+        case .bootstrapRequest(let session):
+            pairs.append((.text("sess"), .text(session)))
+        case .bootstrapResponse(let json):
+            pairs.append((.text("json"), .text(json)))
         case .bye(let reason):
             pairs.append((.text("reason"), .text(reason)))
         case .error(let code, let message):
@@ -312,6 +327,10 @@ extension ControlFrame {
                 ptyID: try requiredInt("pty"),
                 earliestOffset: try requiredOffset("earliest")
             )
+        case "boot":
+            return .bootstrapRequest(session: try requiredText("sess"))
+        case "booted":
+            return .bootstrapResponse(json: try requiredText("json"))
         case "bye":
             return .bye(reason: item["reason"]?.stringValue ?? "")
         case "error":

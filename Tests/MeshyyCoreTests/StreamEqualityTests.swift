@@ -50,8 +50,9 @@ private struct ClientModel {
     /// Applies a resume decision the way the client must.
     mutating func apply(_ decision: ResumeDecision) {
         switch decision {
-        case .fresh:
-            break
+        case .fresh(let from, let bytes):
+            delivered += bytes
+            ackedOffset = from + UInt64(bytes.count)
         case .replay(let from, let bytes):
             // The client asked from `ackedOffset`; the daemon must honour
             // exactly that, or the offsets have drifted.
@@ -189,12 +190,38 @@ struct StreamEqualityTests {
         #expect(decision.preservesStreamEquality)
     }
 
-    @Test("A fresh attach replays nothing and is not a failure")
-    func freshAttach() {
+    /// A fresh attach shows the current screen rather than a blank one.
+    ///
+    /// Sending nothing would be defensible — the client asked for nothing — but it
+    /// leaves a real terminal blank until the next keystroke, which reads as a
+    /// broken attach. Found by the M2 QUIC test, which sat on an empty screen.
+    @Test("A fresh attach replays what is in the buffer, not nothing")
+    func freshAttachShowsTheScreen() {
         var daemon = SessionBuffer(capacity: 1024)
         daemon.write(Array("scrollback".utf8))
-        #expect(daemon.resume(from: nil) == .fresh)
-        #expect(ResumeDecision.fresh.preservesStreamEquality)
+        #expect(daemon.resume(from: nil) == .fresh(from: 0, bytes: Array("scrollback".utf8)))
+        #expect(daemon.resume(from: nil).preservesStreamEquality,
+                "the client had nothing, so a full replay is still a consistent prefix")
+    }
+
+    /// And it is bounded by the redraw anchor when there is one, so attaching to a
+    /// session with megabytes of scrollback does not ship all of it.
+    @Test("A fresh attach starts at the redraw anchor when one exists")
+    func freshAttachUsesTheAnchor() {
+        var daemon = SessionBuffer(capacity: 4096)
+        daemon.write(Array("ancient history that should not be replayed\r\n".utf8))
+        let anchor = daemon.totalWritten
+        daemon.write(Array("\u{1B}[2J".utf8))
+        daemon.write(Array("current screen\r\n".utf8))
+
+        guard case .fresh(let from, let bytes) = daemon.resume(from: nil) else {
+            Issue.record("expected .fresh")
+            return
+        }
+        #expect(from == anchor, "a fresh attach should start at the last full clear")
+        #expect(bytes.starts(with: Array("\u{1B}[2J".utf8)),
+                "the replay must re-execute the clear so the screen ends up correct")
+        #expect(!String(decoding: bytes, as: UTF8.self).contains("ancient history"))
     }
 
     @Test("Resume across a five-minute background is byte-exact when it fits")
