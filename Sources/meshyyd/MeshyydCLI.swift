@@ -32,17 +32,34 @@ enum MeshyydCLI {
         let socketPath = option("socket") ?? LocalSocketServer.defaultSocketPath
 
         switch command {
+        case "bootstrap":
+            // What the SSH exec channel runs: `meshyyd attach --session X --json`
+            // is routed here by the `--json` flag below. Kept as a separate verb
+            // too so it can be exercised directly.
+            await Bootstrap.run(socketPath: socketPath, session: option("session") ?? "default")
         case "serve":
             await serve(
                 socketPath: socketPath,
                 shell: option("shell"),
-                buffer: option("buffer").flatMap(Int.init)
+                buffer: option("buffer").flatMap(Int.init),
+                allInterfaces: arguments.contains("--all-interfaces")
             )
         case "attach":
-            await AttachClient(
-                socketPath: socketPath,
-                session: option("session") ?? "default"
-            ).run()
+            // Design doc §5.1 step 2: the client runs
+            // `meshyyd attach --session <name> --json` over an SSH exec channel and
+            // expects the bootstrap JSON on stdout. Without --json it is the
+            // interactive local attach from M1.
+            if arguments.contains("--json") {
+                await Bootstrap.run(
+                    socketPath: socketPath,
+                    session: option("session") ?? "default"
+                )
+            } else {
+                await AttachClient(
+                    socketPath: socketPath,
+                    session: option("session") ?? "default"
+                ).run()
+            }
         case "list":
             await AttachClient(socketPath: socketPath, session: "").list()
         case "version":
@@ -51,22 +68,33 @@ enum MeshyydCLI {
             print("""
                 meshyyd \(Meshyy.version)
 
-                  serve   [--socket PATH] [--shell PATH] [--buffer BYTES]
-                  attach  [--session NAME] [--socket PATH]
-                  list    [--socket PATH]
+                  serve     [--socket PATH] [--shell PATH] [--buffer BYTES] [--all-interfaces]
+                  attach    [--session NAME] [--socket PATH] [--json]
+                  bootstrap [--session NAME] [--socket PATH]
+                  list      [--socket PATH]
                   version
+
+                `attach --json` and `bootstrap` are what an SSH exec channel runs:
+                they print the design doc §5.1 handshake and exit.
                 """)
             exit(command == "help" ? 0 : 2)
         }
     }
 
-    private static func serve(socketPath: String, shell: String?, buffer: Int?) async {
+    private static func serve(
+        socketPath: String,
+        shell: String?,
+        buffer: Int?,
+        allInterfaces: Bool
+    ) async {
         var config = DaemonConfig()
         if let shell { config.shell = shell }
         if let buffer { config.bufferCapacity = buffer }
+        config.bindAllInterfaces = allInterfaces
 
         let store = SessionStore(config: config)
-        let server = LocalSocketServer(path: socketPath, store: store)
+        let tokens = TokenActor()
+        let server = LocalSocketServer(path: socketPath, store: store, tokens: tokens)
         do {
             try server.start()
         } catch {
@@ -74,11 +102,41 @@ enum MeshyydCLI {
             exit(1)
         }
 
+        // QUIC listener (design doc §5.2). Failing to start it is not fatal: the
+        // local socket still works, and saying so beats refusing to run at all.
+        var quicPort: UInt16 = 0
+        var quicFingerprint = ""
+        do {
+            let identity = try DaemonIdentity.loadOrCreate()
+            let quic = QUICServer(
+                identity: identity,
+                store: store,
+                tokens: tokens,
+                bindAllInterfaces: config.bindAllInterfaces
+            )
+            quicPort = try quic.start()
+            quicFingerprint = identity.fingerprint
+            server.attachQUIC(quic, fingerprint: identity.fingerprint)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "meshyyd: QUIC listener unavailable (\(error)); local socket only\n".utf8
+            ))
+        }
+
         // Design doc §9: logs are opt-in, local, and redact PTY content. These
         // lines carry no session content — a path, a shell, a buffer size.
         print("meshyyd \(Meshyy.version) listening on \(socketPath)")
         print("shell: \(config.shell) \(config.shellArguments.joined(separator: " "))")
         print("ring buffer: \(config.bufferCapacity) bytes per session")
+        if quicPort != 0 {
+            print("quic: port \(quicPort) cert-sha256 \(quicFingerprint)")
+            if config.bindAllInterfaces {
+                // Design doc §8 requires an explicit flag AND a startup warning.
+                print("WARNING: bound to all interfaces. Anyone who can reach this "
+                    + "port can attempt a handshake; only a valid single-use token "
+                    + "gets a session, but prefer loopback or Tailscale.")
+            }
+        }
         fflush(stdout)
 
         // A dead session still holds its ring buffer, so sweep periodically or a
