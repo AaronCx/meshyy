@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+.DS_Store
+# macOS Finder duplicate junk — never commit these
+* 2.*
+*\ 2

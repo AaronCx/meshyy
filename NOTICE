@@ -1,0 +1,43 @@
+# NOTICE
+
+meshyy
+Copyright (c) 2026 Aaron Character
+Licensed under the MIT License. See LICENSE.
+
+## Third-party components
+
+meshyy has **no third-party source dependencies**. Every line under `Sources/`
+is original work by this project's authors, written against the permitted
+sources recorded in `docs/provenance.md`.
+
+This is deliberate. See `CLAUDE.md` §Clean-room policy: a zero-dependency tree
+is the cheapest way to keep the licensing claim unambiguous.
+
+### System frameworks (linked, not vendored)
+
+| Component | Vendor | Terms |
+|---|---|---|
+| Network.framework (QUIC, TLS 1.3, NWPathMonitor) | Apple | Apple SDK licence; system framework, not redistributed |
+| Security.framework (SecKey, SecCertificate, sec_identity_t) | Apple | Apple SDK licence; system framework, not redistributed |
+| Foundation / Darwin libc (termios, pty, posix_spawn) | Apple | Apple SDK licence; system framework, not redistributed |
+| swift-corelibs / Swift standard library | Apple | Apache-2.0 WITH LLVM-exception |
+
+### Build- and test-time only (not linked into shipped binaries)
+
+| Component | Terms |
+|---|---|
+| swift-testing (bundled with the Swift 6.3 toolchain) | Apache-2.0 WITH LLVM-exception |
+
+### Consumer-side note
+
+`MeshyyKit` is consumed by a+Terminal, which additionally links SwiftTerm (MIT)
+and Citadel (MIT). Those are dependencies of the *app*, not of meshyy, and
+meshyy does not import them.
+
+## Licence allowlist
+
+CI (`scripts/check-licenses.sh`) fails the build on any dependency whose licence
+is not one of: MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, ISC,
+Apache-2.0-WITH-LLVM-exception.
+
+GPL, AGPL, and LGPL dependencies are prohibited without exception.
