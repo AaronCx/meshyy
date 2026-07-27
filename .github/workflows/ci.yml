@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # The three gates are bash and Python: no Xcode needed, so they run fast and
+    # fail early on a licence, privacy, or header violation.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency licence allowlist (design doc §0.3)
+        run: scripts/check-licenses.sh
+      - name: Privacy invariants (design doc §9)
+        run: scripts/check-privacy.py
+      - name: MIT headers (design doc §0.3)
+        run: scripts/check-headers.sh
+
+  clean-room:
+    # A structural check that the one rule the project exists for has not been
+    # broken: no mosh source, no GPL reimplementation, no copyleft dependency.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No mosh source in the tree
+        run: scripts/check-clean-room.sh
+
+  build-test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version && xcodebuild -version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
