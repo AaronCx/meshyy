@@ -32,6 +32,12 @@ struct ControlFrameTests {
         .agentEvent(kind: .waiting, agentID: nil, detail: nil),
         .agentEvent(kind: .working, agentID: "claude-code", detail: "esc to interrupt"),
         .agentEvent(kind: .idle, agentID: "claude-code", detail: nil),
+        .quickActions([
+            QuickAction(id: "approve", label: "Approve"),
+            QuickAction(id: "deny", label: "Deny"),
+            QuickAction(id: "opt2", label: "2"),
+        ]),
+        .quickActions([]),
         .resumeTooOld(ptyID: 0, earliestOffset: 4096),
         .bye(reason: "client requested"),
         .error(code: 7, message: "token expired"),
@@ -176,7 +182,64 @@ struct ControlFrameTests {
          "a261746362796566726561736f6e70636c69656e7420726571756573746564"),
         ("error", .error(code: 7, message: "token expired"),
          "a36174656572726f7264636f646507636d73676d746f6b656e2065787069726564"),
+        ("qa_offer",
+         .quickActions([
+             QuickAction(id: "approve", label: "Approve"),
+             QuickAction(id: "deny", label: "Deny"),
+             QuickAction(id: "opt2", label: "2"),
+         ]),
+         "a2617462716167616374696f6e7383a262696467617070726f7665656c6162656c67417070726f7665a26269646464656e79656c6162656c6444656e79a2626964646f707432656c6162656c6132"),
+        ("qa_withdraw", .quickActions([]), "a2617462716167616374696f6e7380"),
     ]
+
+    // MARK: - Quick actions (design doc §7.3)
+
+    @Test("An empty quick-action list withdraws an offer and is distinct from absent")
+    func quickActionWithdrawal() throws {
+        let withdraw = ControlFrame.quickActions([])
+        #expect(try ControlFrame.decode(withdraw.encoded) == withdraw)
+        #expect(withdraw.encode()["actions"] == .array([]),
+                "withdrawal must be an explicit empty list, not a missing key")
+    }
+
+    /// Design doc §7.3: a malformed entry drops that action, not the whole frame.
+    /// A partly-understood offer is still safe, because everything a client acts
+    /// on comes from its own profile.
+    @Test("A malformed quick action is dropped without discarding the others")
+    func malformedQuickActionIsDropped() throws {
+        let mixed = CBOR.map([
+            (.text("t"), .text("qa")),
+            (.text("actions"), .array([
+                .map([(.text("id"), .text("ok")), (.text("label"), .text("Approve"))]),
+                .map([(.text("id"), .text("no-label"))]),
+                .map([(.text("label"), .text("no id"))]),
+                .map([(.text("id"), .text("fine")), (.text("label"), .text("Deny"))]),
+            ])),
+        ])
+        #expect(try ControlFrame.decode(mixed) == .quickActions([
+            QuickAction(id: "ok", label: "Approve"),
+            QuickAction(id: "fine", label: "Deny"),
+        ]))
+    }
+
+    /// The security property from §7.3: the wire carries an id and a label and
+    /// nothing else. Bytes-to-send live only in the client's local profile, so a
+    /// remote cannot choose what a tap sends even if it forges the whole frame.
+    @Test("The wire form of a quick action carries no payload for the client to send")
+    func quickActionCarriesNoPayload() {
+        let encoded = ControlFrame.quickActions([
+            QuickAction(id: "approve", label: "Approve"),
+        ]).encode()
+        guard let actions = encoded["actions"]?.arrayValue, let first = actions.first,
+              case .map(let fields) = first
+        else {
+            Issue.record("unexpected encoding: \(encoded)")
+            return
+        }
+        let keys = Set(fields.compactMap { $0.0.stringValue })
+        #expect(keys == ["id", "label"],
+                "a quick action must never carry sendable bytes on the wire; got \(keys)")
+    }
 
     @Test("Golden: the bytes on the wire are exactly these", arguments: goldens)
     func goldenWireFormat(golden: (name: String, frame: ControlFrame, wire: String)) {

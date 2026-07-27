@@ -171,7 +171,7 @@ public final class ChaosTCPProxy: @unchecked Sendable {
         server.start(queue: queue)
 
         if let sever = profile.severAfter {
-            queue.asyncAfter(deadline: .now() + sever.seconds) { [weak self] in
+            queue.asyncAfter(deadline: .now() + sever.timeInterval) { [weak self] in
                 self?.retire(pair)
             }
         }
@@ -193,7 +193,7 @@ public final class ChaosTCPProxy: @unchecked Sendable {
             if isComplete || error != nil {
                 // Delay the teardown by one delivery interval so bytes already
                 // in flight are not cut off by the FIN racing ahead of them.
-                self.queue.asyncAfter(deadline: .now() + self.profile.delay.seconds + 0.05) {
+                self.queue.asyncAfter(deadline: .now() + self.profile.delay.timeInterval + 0.05) {
                     self.retire(pair)
                 }
                 return
@@ -205,7 +205,7 @@ public final class ChaosTCPProxy: @unchecked Sendable {
     private func forward(_ data: Data, pair: Pair, to sink: NWConnection, up: Bool) {
         var generator = SystemRandomNumberGenerator()
         let delay = profile.sampleDelay(using: &generator)
-        let earliest = DispatchTime.now() + delay.seconds
+        let earliest = DispatchTime.now() + delay.timeInterval
         let clamped = up ? max(earliest, pair.nextUp) : max(earliest, pair.nextDown)
         if up { pair.nextUp = clamped } else { pair.nextDown = clamped }
 

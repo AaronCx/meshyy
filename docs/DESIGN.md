@@ -123,7 +123,8 @@ design follows from that constraint.
 
 **meshyy controls both ends.** That single difference removes most of mosh's
 complexity and enables the one thing meshyy can genuinely do better, described
-in section 7.
+in section 7 — which, after the measurement in §7.1, is one-tap agent actions
+rather than the predictive echo this document originally proposed.
 
 ## 3. Design principles
 
@@ -151,7 +152,7 @@ a+Terminal                          meshyyd (launchd agent)
   MeshyyKit (Swift)                   PTY ownership
     QUIC/TLS client        <====>     ring buffer per session
     resume state                      termios watcher
-    prediction engine                 alt-screen scanner
+    quick actions                     alt-screen scanner
   SwiftTerm renderer                  agent status hooks
   Citadel SSH (bootstrap only)        QUIC/TLS listener
 ```
@@ -264,71 +265,122 @@ PTY. No gaps, no duplicates, no reordering.
 This is a property test, and it is the single most important test in the
 project. Write it in M3 and never let it go red.
 
-## 7. Predictive echo
+## 7. Quick actions
 
 This is where meshyy can be better than mosh rather than merely different.
 
-### 7.1 The insight
+### 7.1 The measurement that reshaped this section
 
-mosh predicts blind. It cannot know whether the remote will echo a keystroke, so
-it infers from the output stream and hedges with heuristics. That inference is
-the bulk of its overlay engine's complexity and the source of its failure modes.
+The original design for this section was predictive local echo, on the reasoning
+that the daemon owns the PTY and can therefore call `tcgetattr` and *know*
+whether the kernel will echo a keystroke, rather than inferring it the way a
+drop-in SSH replacement must. The gate was: predict only when `ECHO` and
+`ICANON` are set and the alternate screen is off.
 
-**meshyy does not have to guess.** The daemon owns the PTY. It can call
-`tcgetattr` on the master fd and read the line discipline directly:
+That reasoning is sound. The conclusion drawn from it was wrong. Measured on a
+real PTY, reading `c_lflag` on the master:
 
-- `ECHO` set means the kernel will echo the character. Prediction is safe.
-- `ICANON` set means line-buffered input, so the cursor advances predictably.
-- Raw mode means the application handles input itself. Prediction is unsafe.
+| Program | ECHO | ICANON | gate opens? |
+|---|---|---|---|
+| `/bin/sh` (bash 3.2, readline) | false | false | **no** |
+| `bash -i` | false | false | **no** |
+| `zsh -i` | false | false | **no** |
+| `zsh -f -i` (no rc files) | false | false | **no** |
+| `tmux attach` | false | false | **no** |
+| `cat` | true | true | yes |
+| `sed -u` | true | true | yes |
 
-The daemon watches termios and pushes `Termios` frames on change. Poll at 50ms
-while a prediction is outstanding, 500ms otherwise. It also scans output for
-alt-screen enter and exit and pushes `ScreenMode`.
+Readline and zle are line editors. To do history, completion and highlighting
+they must see each keystroke as it arrives and control exactly what appears, so
+the first thing either does is take the terminal out of cooked mode and echo
+characters itself. **The echo you see at a shell prompt is the shell drawing, not
+the kernel.** `ECHO` was never on.
 
-The client therefore knows, as fact rather than inference, whether it is safe to
-predict. That is a real improvement and it is only available because both ends
-are yours.
+So the gate never opens: not in an agent TUI, and not at a bare shell prompt
+either. Prediction would have been dead code in every configuration a+Terminal is
+used in. The full write-up, including the harness, is
+`docs/spikes/2026-07-27-line-discipline.md`.
 
-### 7.2 Rules (v1)
+Two things follow. First, the *capability* is real and the *inference* was
+wrong — the daemon does read the line discipline correctly, it just always
+learns "no". Second, the "better than mosh" claim does not survive: what needs
+predicting is the **shell's** echo, and the shell does not publish its
+intentions, so predicting it means inferring from the output stream. That is
+mosh's approach and where mosh's complexity lives. Owning both ends does not
+help, because the line editor is on neither end.
 
-Predict only when **all** of:
+### 7.2 The right target
 
-- `echo == true`
-- `icanon == true`
-- `alt == false`
-- smoothed RTT exceeds a threshold, default 120ms. Below that, prediction is
-  invisible and only adds risk.
+Predictive echo was aimed at the wrong latency.
 
-Predict only printable ASCII and backspace. Never predict across a newline.
-Never predict control characters, escape sequences, or paste.
+The interaction that actually happens, dozens of times a day, is not typing a
+long command into a shell prompt. It is answering an agent: approving a tool
+call, denying one, picking option 2 of 3. On a phone that costs finding the key
+on a software keyboard, hitting it accurately, and checking it landed — human
+latency that dwarfs the 60–120 ms of network RTT prediction was trying to hide.
 
-Render predicted cells with an underline attribute until confirmed.
+**Quick actions:** the client shows one-tap buttons — approve, deny, and the
+numeric choices — driven off the agent profile. Zero typing, zero prediction.
 
-**Kill all outstanding predictions and bump the epoch on:** any `Termios`
-change, any `ScreenMode` change, any cursor-moving escape sequence in the
-incoming stream, any mismatch between predicted and authoritative bytes, or
-reconnect. On kill, the authoritative stream is truth and the screen resyncs.
+Why this is strictly better than what it replaces:
 
-Confirm silently when incoming bytes match the prediction at that position.
+- **It works exactly where prediction cannot.** Agents run in raw mode with the
+  alternate screen up. That is the case the §7.1 gate rules out and the case the
+  product exists for.
+- **It removes more latency.** Prediction hid one RTT of echo. This removes a
+  keyboard interaction.
+- **It needs no overlay.** No shadow cell model, no separate render layer, no
+  replicated font metrics, no SwiftTerm fork. §7.4's "biggest unknown in the
+  project" is retired by being unnecessary rather than solved.
+- **Agent identity stays data.** Actions come from `AgentProfile`, so supporting a
+  new agent is a profile entry, not code.
 
-### 7.3 Honest expectation
+### 7.3 Design
 
-Agent TUIs run in raw mode with alt-screen. Under the rules above, prediction
-will be **off** during a Claude Code session and **on** at a bare shell prompt.
-That is correct behavior, and it means the feature will do nothing in the
-workflow the app exists for.
+The daemon already scans PTY output for agent state (§5.3 `AgentEvent`, M5) and
+for alternate-screen transitions (§6.3). Quick actions ride the same machinery.
 
-Build it anyway if you want it, but build it last, and know what you are buying.
-Before starting M6, spend an evening driving real mosh from Blink Shell over LTE
-against the same machine, and see whether prediction is noticeable at your actual
-RTT. Record the finding in `docs/benchmarks.md`.
+- `AgentProfile` gains `quickActions`: an ordered list of
+  `{ id, label, matches: [String], sends: [UInt8] }`.
+- When a profile's `matches` appear in the recent output tail, the daemon emits
+  `QuickActions { actions: [{id, label}] }` on the control stream.
+- The client renders them in the key accessory bar. A tap sends that action's
+  `sends` bytes on the PTY channel — byte for byte what the user's own keystroke
+  would have sent.
+- The offer is withdrawn — `QuickActions { actions: [] }` — on any full-screen
+  clear, any alternate-screen transition, or when the matched text leaves the
+  tail. The invalidation signals already exist for the resume anchor.
 
-### 7.4 Integration risk
+**Two rules that are not negotiable.**
 
-SwiftTerm owns the framebuffer. Overlaying predicted cells needs one of: a
-shadow model plus a separate render layer, injected sequences that get retracted
-(fragile, do not), or a SwiftTerm fork that understands an overlay. This is the
-biggest unknown in the project. It is M0 spike work, not M6 work.
+1. **Label and payload come from the local profile, never from remote output.**
+   Output only selects *which* profile action matches. Otherwise a hostile or
+   merely confused remote could draw text that looks like a permission prompt and
+   have the daemon offer a button whose payload it chose — a one-tap confused
+   deputy. The remote picks the question; only local data may write the answer.
+2. **Never auto-answer.** A quick action is a manual action with fewer taps. The
+   daemon must not send an action's bytes on its own for any reason, including a
+   timeout. This is a privacy-and-agency product; deciding on the user's behalf
+   is out of scope for good.
+
+### 7.4 Honest expectation
+
+This is a real win but a modest one, and it is worth stating what it is not: it
+does not reduce round trips, it does not make the transport faster, and it does
+nothing for a session that is not running a recognised agent.
+
+It also depends on profile quality. A profile whose `matches` are too loose will
+offer buttons at the wrong moment, which is worse than offering none — so
+matching should be conservative and each profile needs a test with real captured
+output. Design doc §11 gains a case for it.
+
+The M6 milestone in §10 replaces predictive echo with this. The mosh comparison
+in §7.1 is no longer a reason to build M6 at all; it is only a reason to be
+careful if anyone ever revisits prediction. If prediction is revisited, the entry
+point is bracketed-paste mode (`ESC[?2004h`), which readline and zle both set and
+which is a genuine signal that a line editor is at a prompt — bounded inference
+against two known programs rather than open-ended heuristics.
+
 
 ## 8. Security model
 
@@ -396,7 +448,14 @@ Pushover endpoint.
 - **This is the milestone that actually fixes the product gap. If only part of
   meshyy ever ships, ship M1 through M5.**
 
-**M6. Predictive echo.** Per section 7. Gated on the section 7.3 finding.
+**M6. Quick actions.** Per section 7. One-tap approve / deny / numeric buttons
+driven off `AgentProfile`, offered and withdrawn by the daemon on the control
+stream.
+- Acceptance: a Claude Code permission prompt produces buttons that answer it in
+  one tap, the offer disappears when the prompt does, and no action is ever sent
+  without a tap.
+- Replaces predictive echo, which §7.1 measured as unreachable in every real
+  configuration.
 
 **M7. Attachments.** Blob streams replace the separate SFTP round trip.
 
@@ -408,8 +467,9 @@ Pushover endpoint.
   drops. Every milestone runs against it.
 - **Golden protocol tests:** encoded frames as fixtures so wire format changes
   are visible in diffs.
-- **Prediction tests:** scripted termios and output sequences, asserting
-  predictions are made, confirmed, and killed at the right moments. No network.
+- **Quick action tests:** captured real agent output, asserting the right actions
+  are offered, that they are withdrawn on a clear or an alt-screen transition, and
+  that a label or payload is never taken from remote output. No network.
 - **Manual device matrix** in `docs/qa/`: background 5 minutes, airplane mode 60
   seconds, WiFi to LTE, daemon restart mid-session, buffer overrun, token
   expiry.
@@ -419,7 +479,9 @@ Pushover endpoint.
 1. Does Network framework's QUIC actually do connection migration on iOS? M0
    decides. If not, fall back to TCP+TLS and rely on 0-RTT resume alone, which
    costs little given section 6.1.
-2. Can SwiftTerm render an overlay without a fork? M0 decides.
+2. ~~Can SwiftTerm render an overlay without a fork?~~ **Resolved and now moot.**
+   M0 found it feasible without a fork (`docs/spikes/2026-07-27-swiftterm-overlay.md`),
+   and §7's move to quick actions removes the need for an overlay at all.
 3. Ring buffer sizing. 4 MB is a guess. Instrument real sessions.
 4. Multiple PTYs per connection: worth it, or does tmux already cover it?
 5. Does the daemon need to survive its own restart with sessions intact? That
@@ -430,8 +492,10 @@ Pushover endpoint.
 
 ## 13. Risks
 
-- **Prediction may never engage in the target workflow.** Section 7.3. This is
-  known going in, not a surprise to discover in M6.
+- **Predictive echo was unreachable, and this was found by measuring rather than
+  by shipping it.** Section 7.1. Replaced by quick actions, whose own risk is
+  profile quality: matching too loosely offers a button at the wrong moment, which
+  is worse than offering none.
 - **The daemon is new attack surface** on a privacy-branded product. It holds
   PTYs and listens on a port. A vulnerability here is worse than anything in the
   app.

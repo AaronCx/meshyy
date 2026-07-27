@@ -3,9 +3,27 @@
 //
 // Everything is additive and unknown frame types decode to `.unknown` rather
 // than failing, so version skew degrades gracefully in both directions. That is
-// a protocol guarantee, not an implementation detail: `UnknownFrameTests` pins it.
+// a protocol guarantee, not an implementation detail; `ControlFrameTests` pins it.
 
 import Foundation
+
+/// One thing the user can do to the agent in a single tap (design doc §7.3).
+///
+/// The label and the bytes both come from the local `AgentProfile`. Remote output
+/// only selects *which* action matches — it never supplies either field. That
+/// separation is the whole security property: otherwise a remote that draws a
+/// convincing fake permission prompt gets to choose what a tap sends.
+public struct QuickAction: Sendable, Equatable {
+    /// Stable identifier from the profile, so a client can remember placement.
+    public var id: String
+    /// What the button says. From the profile, never from the output stream.
+    public var label: String
+
+    public init(id: String, label: String) {
+        self.id = id
+        self.label = label
+    }
+}
 
 /// Agent status carried on the control stream (design doc §5.3 `AgentEvent`).
 public enum AgentEventKind: String, Sendable, Equatable, CaseIterable {
@@ -23,6 +41,10 @@ public enum ControlFrame: Sendable, Equatable {
     case termios(TermiosState)
     case screenMode(alt: Bool)
     case agentEvent(kind: AgentEventKind, agentID: String?, detail: String?)
+    /// The actions currently answerable in one tap (design doc §7.3). An empty
+    /// list withdraws a previous offer — sent on a full clear, an alt-screen
+    /// transition, or when the matched prompt leaves the output tail.
+    case quickActions([QuickAction])
     case resumeTooOld(ptyID: Int, earliestOffset: UInt64)
     case bye(reason: String)
     case error(code: Int, message: String)
@@ -37,6 +59,13 @@ public enum ControlFrame: Sendable, Equatable {
         public var rows: Int
         /// Byte offset the client already holds. Absent on a fresh session.
         public var resumeFrom: UInt64?
+        /// Session to attach to, by name.
+        ///
+        /// Unused over QUIC, where §5.1's single-use token is already bound to a
+        /// session id and naming a second one would be a confused-deputy hole.
+        /// Needed over the unix socket, where there is no token to bind: the
+        /// caller has already proved local access by opening a 0600 socket.
+        public var session: String?
         public var protocolVersion: Int
 
         public init(
@@ -45,6 +74,7 @@ public enum ControlFrame: Sendable, Equatable {
             cols: Int,
             rows: Int,
             resumeFrom: UInt64? = nil,
+            session: String? = nil,
             protocolVersion: Int = Meshyy.protocolVersion
         ) {
             self.token = token
@@ -52,6 +82,7 @@ public enum ControlFrame: Sendable, Equatable {
             self.cols = cols
             self.rows = rows
             self.resumeFrom = resumeFrom
+            self.session = session
             self.protocolVersion = protocolVersion
         }
     }
@@ -92,6 +123,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .termios: "termios"
         case .screenMode: "screen"
         case .agentEvent: "agent"
+        case .quickActions: "qa"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
         case .error: "error"
@@ -103,9 +135,9 @@ public enum ControlFrame: Sendable, Equatable {
 // MARK: - Encoding
 
 extension ControlFrame {
-    /// Field order is fixed so the golden fixtures in
-    /// `Tests/MeshyyCoreTests/Fixtures` stay stable. Changing the order is a
-    /// wire-format change and will show up as a fixture diff.
+    /// Field order is fixed so the `goldens` table in `ControlFrameTests` stays
+    /// stable. Changing the order is a wire-format change and shows up there as a
+    /// diff — which is the point.
     public func encode() -> CBOR {
         var pairs: [(CBOR, CBOR)] = [(.text("t"), .text(wireType))]
 
@@ -118,6 +150,9 @@ extension ControlFrame {
             pairs.append((.text("pv"), .int(hello.protocolVersion)))
             if let resumeFrom = hello.resumeFrom {
                 pairs.append((.text("from"), .unsigned(resumeFrom)))
+            }
+            if let session = hello.session {
+                pairs.append((.text("sess"), .text(session)))
             }
         case .welcome(let welcome):
             pairs.append((.text("sid"), .text(welcome.sessionID)))
@@ -141,6 +176,10 @@ extension ControlFrame {
             pairs.append((.text("kind"), .text(kind.rawValue)))
             if let agentID { pairs.append((.text("aid"), .text(agentID))) }
             if let detail { pairs.append((.text("detail"), .text(detail))) }
+        case .quickActions(let actions):
+            pairs.append((.text("actions"), .array(actions.map { action in
+                .map([(.text("id"), .text(action.id)), (.text("label"), .text(action.label))])
+            })))
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
@@ -221,6 +260,7 @@ extension ControlFrame {
                 cols: try requiredInt("cols"),
                 rows: try requiredInt("rows"),
                 resumeFrom: item["from"]?.uint64Value,
+                session: item["sess"]?.stringValue,
                 // A peer that predates the field is protocol 1 by definition.
                 protocolVersion: item["pv"]?.intValue ?? 1
             ))
@@ -256,6 +296,17 @@ extension ControlFrame {
                 agentID: item["aid"]?.stringValue,
                 detail: item["detail"]?.stringValue
             )
+        case "qa":
+            // A malformed entry drops that action rather than the whole frame: a
+            // partly-understood offer is still safe, because every field a client
+            // acts on comes from its own profile.
+            let actions = (item["actions"]?.arrayValue ?? []).compactMap { entry -> QuickAction? in
+                guard let id = entry["id"]?.stringValue,
+                      let label = entry["label"]?.stringValue
+                else { return nil }
+                return QuickAction(id: id, label: label)
+            }
+            return .quickActions(actions)
         case "tooold":
             return .resumeTooOld(
                 ptyID: try requiredInt("pty"),

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  meshyy — launchd agent for meshyyd.
+  Copyright (c) 2026 Aaron Character. MIT licence — see LICENSE.
+
+  A LaunchAgent, not a LaunchDaemon. meshyyd is per-user: it owns PTYs running as
+  the user and a socket only the user can open, and running it as root would
+  create the multi-user question the design does not answer (design doc §8).
+
+  Install with scripts/install-agent.sh, which substitutes __BINARY__ and
+  __LOG_DIR__ rather than making you edit this file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aaroncx.meshyyd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BINARY__</string>
+        <string>serve</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on a crash, but not on a clean exit: `meshyyd serve` exits 0
+             only when it was asked to stop, and fighting that would make the
+             agent impossible to shut down. -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Sessions die with the daemon, so a restart is disruptive; back off
+         rather than thrashing if something is structurally wrong. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Design doc §9: logs are opt-in, local, and redact PTY content. meshyyd's
+         stdout carries only a socket path, a shell path and a buffer size — never
+         session content. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/meshyyd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/meshyyd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

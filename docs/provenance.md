@@ -94,6 +94,16 @@ Consulted: Winstein & Balakrishnan, USENIX ATC 2012, §3; design doc §3.2, §6.
 
 ## 2026-07-27 Prediction gated on observed termios, not inferred echo
 
+> **SUPERSEDED** the same day by "§7 rewritten: quick actions instead of
+> predictive echo" below. Kept because a provenance log is a record of what was
+> decided and why, not a snapshot of what currently holds — and because the
+> reasoning here was sound while the conclusion drawn from it was not, which is
+> the more useful thing to be able to look back at.
+>
+> What survived: the daemon does read `tcgetattr` on the master and does push
+> `Termios` frames, and `PTYTests` proves a child's own `tcsetattr` is visible.
+> What did not: the belief that this would ever permit prediction.
+
 Decision: the daemon calls `tcgetattr` on the PTY master and pushes a `Termios`
 frame on change. The client predicts only when the daemon has reported
 `ECHO && ICANON && !alt-screen`.
@@ -152,3 +162,47 @@ deterministically.
 Source: `AaronCx/a-plus-terminal`, MIT, same copyright holder.
 
 Consulted: design doc §4.
+
+---
+
+## 2026-07-27 §7 rewritten: quick actions instead of predictive echo
+
+Decision: design doc §7 no longer specifies predictive local echo. It specifies
+one-tap quick actions — approve, deny, and numeric choices — offered by the
+daemon on the control stream and driven off `AgentProfile`.
+
+Rationale, in two steps.
+
+**The original mechanism was unreachable.** §7's premise was that owning the PTY
+lets the daemon read the line discipline with `tcgetattr` and *know* whether a
+keystroke will be echoed, instead of inferring it. That premise is correct. The
+conclusion — that prediction would therefore be safe at a shell prompt — is not.
+Measured on a real PTY, `bash -i`, `zsh -i`, `zsh -f -i` and `tmux` all hold the
+tty in raw mode, because readline and zle are line editors and echo characters
+themselves. Only programs that do no input handling (`cat`, `sed`) leave cooked
+mode on. The gate never opens, so prediction would have been dead code in every
+configuration a+Terminal is used in.
+
+**The latency was mis-targeted anyway.** Prediction hides one round trip of echo
+while typing. The interaction that actually recurs on a phone is answering an
+agent — approve a tool call, deny one, pick option 2 — where the cost is the
+keyboard interaction, not the RTT. Quick actions remove that entirely, work in
+raw mode with the alternate screen up (exactly where prediction cannot), and need
+no overlay, so they also retire the SwiftTerm render-layer risk §7.4 called the
+biggest unknown in the project.
+
+Two constraints recorded because they are security properties, not preferences:
+the action's label and payload come from the local profile and never from remote
+output (otherwise a remote that draws a convincing fake prompt gets a one-tap
+confused deputy), and the daemon never sends an action's bytes without a tap.
+
+Source: original design, prompted by the measurement. The measurement harness and
+the full table are in `docs/spikes/2026-07-27-line-discipline.md`; the table is
+also inline in §7.1 so a reader of the design doc does not have to go looking for
+the evidence that changed it.
+
+Consulted: POSIX `termios.h`; `tcgetattr(3)`; readline and zle behaviour observed
+as a black box; design doc §5.3, §6.3, §7, §10, §11, §13.
+
+Decided by: Aaron, on being shown the measurement — "the answer was never
+per-keystroke prediction."
