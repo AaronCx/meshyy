@@ -83,4 +83,15 @@ extension Duration {
         let (seconds, attoseconds) = components
         return seconds * 1000 + attoseconds / 1_000_000_000_000_000
     }
+
+    /// Seconds as a `TimeInterval`, for the Dispatch and Foundation APIs that
+    /// still take one.
+    ///
+    /// Deliberately not named `seconds`: that collides with the static
+    /// `Duration.seconds(_:)` factory and the compiler rejects the member on an
+    /// instance with a confusing message.
+    public var timeInterval: TimeInterval {
+        let (seconds, attoseconds) = components
+        return TimeInterval(seconds) + TimeInterval(attoseconds) / 1e18
+    }
 }

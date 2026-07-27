@@ -68,7 +68,10 @@ extension Duration {
     }
 
     /// Seconds as a `Double`, for `DispatchQueue.asyncAfter` and reporting.
-    public var seconds: Double {
+    ///
+    /// Named to match `MeshyyCore`'s accessor, and deliberately not `seconds`:
+    /// that collides with the static `Duration.seconds(_:)` factory.
+    public var timeInterval: Double {
         Double(wholeNanoseconds) / 1_000_000_000
     }
 }
