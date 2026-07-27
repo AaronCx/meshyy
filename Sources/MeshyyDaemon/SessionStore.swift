@@ -125,6 +125,18 @@ public actor SessionStore {
         sessions[name]
     }
 
+    /// Looks a session up by its 128-bit id rather than its name.
+    ///
+    /// This is what the QUIC path uses: design doc §5.1 binds the bootstrap token
+    /// to a session *id*, so the id is what the daemon is entitled to act on. A
+    /// name-based lookup there would let any valid token reach any session.
+    public func session(withID sessionID: String) async -> PTYSession? {
+        for session in sessions.values where session.sessionID == sessionID {
+            return session
+        }
+        return nil
+    }
+
     public func list() async -> [SessionInfo] {
         var infos: [SessionInfo] = []
         for session in sessions.values {
