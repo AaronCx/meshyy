@@ -89,39 +89,53 @@ skips every rc file and behaves identically. It is what a line editor is.
 
 ## What to do instead
 
-Three options, in the order I would take them.
+**Decided: replace §7 with quick actions.** Aaron's call on being shown the table
+above — "if the goal was reducing felt latency in the agent workflow, the answer
+was never per-keystroke prediction."
 
-**A. Drop M6.** Cheapest and, on this evidence, correct. It removes the
-project's largest speculative surface, the SwiftTerm overlay work, and a whole
-class of "why did the wrong character appear" bugs. §13 already lists
-"prediction may never engage in the target workflow" as a known risk; this
-promotes it from risk to fact. Design doc §10 already says M1–M5 is a coherent
-shippable product.
+The options I put up were: drop M6; re-scope prediction against the line editor
+via bracketed-paste mode; or ship the raw-mode fact as a UI indicator. All three
+missed the better answer, which is that **the latency was mis-targeted, not just
+unreachable**.
 
-**B. Re-scope prediction against the line editor, not the kernel.** Keep the
-termios gate as a *necessary* condition (raw mode from a full-screen app is still
-a hard no) and add shell-specific knowledge on top: bracketed-paste mode
-(`ESC[?2004h`), which readline and zle both set, is a reliable signal that a line
-editor is at a prompt and expects printable input to echo at the cursor. That is
-inference, with the failure modes inference brings — but it is bounded inference
-against two known programs rather than open-ended heuristics.
+Prediction hides one round trip of echo while typing a command. The interaction
+that actually recurs on a phone is *answering an agent* — approve this tool call,
+deny it, pick option 2 of 3 — and there the cost is the keyboard interaction:
+finding the key on a software keyboard, hitting it accurately, checking it landed.
+That dwarfs the 60–120 ms prediction was trying to hide, and it happens dozens of
+times a day.
 
-**C. Ship the fact, not the prediction.** The daemon knows the line discipline;
-surface it. a+Terminal can show a subtle indicator when the remote is in raw mode
-so a user who types into a wedged session understands why nothing echoes. Tiny,
-honest, and it uses the §7.1 capability for something that actually pays off.
+So §7 is now **quick actions**: one-tap approve / deny / numeric buttons, driven
+off `AgentProfile`, offered and withdrawn by the daemon on the control stream.
+Zero typing, zero prediction.
 
-**Recommendation: A now, C as a cheap follow-up, B only if Aaron actually wants
-prediction after the §7.3 evening with real mosh.** That evening is still worth
-having — it answers whether prediction is *noticeable* at his RTT, which decides
-whether B is worth its complexity. But it is no longer a question about meshyy's
-design; it is a question about whether to take on mosh's.
+It is strictly better than what it replaces on every axis that motivated §7:
+
+- It works in raw mode with the alternate screen up — the exact case the §7.2
+  gate rules out, and the case the product exists for.
+- It removes a keyboard interaction rather than one RTT of echo.
+- It needs no overlay, so it also retires the SwiftTerm render-layer work below.
+- Agent identity stays data: a new agent is a profile entry, not code.
+
+Two constraints came out of designing it, both security properties rather than
+preferences, and both are in §7.3: the label and the bytes-to-send come from the
+**local** profile and never from remote output (else a remote drawing a convincing
+fake prompt gets a one-tap confused deputy), and the daemon never sends an
+action's bytes without a tap.
+
+The §7.3 evening with real mosh is no longer on the critical path. It would only
+answer whether prediction is noticeable at Aaron's RTT, and prediction is no
+longer the plan.
 
 ## Effect on M0's other conclusion
 
 The SwiftTerm overlay spike concluded that a predicted-cell overlay is feasible
 without a fork, with one piece of replicated font geometry as debt. That
-conclusion stands and is unaffected. It is also now **moot for M1–M5**, and if
-option A is taken it is moot entirely — which retires the item design doc §7.4
-called "the biggest unknown in the project" by making it unnecessary rather than
-by solving it.
+conclusion stands, and is now **moot**: quick actions render in the key accessory
+bar, which is ordinary UIKit, so there is no overlay, no shadow cell model, and no
+replicated font metrics.
+
+That retires the item design doc §7.4 called "the biggest unknown in the project"
+by making it unnecessary rather than by solving it — and it means the replicated-
+metrics debt and the proposed upstream SwiftTerm PR are both cancelled rather than
+deferred.

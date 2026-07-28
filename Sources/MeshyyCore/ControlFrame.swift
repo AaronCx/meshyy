@@ -7,6 +7,24 @@
 
 import Foundation
 
+/// One thing the user can do to the agent in a single tap (design doc §7.3).
+///
+/// The label and the bytes both come from the local `AgentProfile`. Remote output
+/// only selects *which* action matches — it never supplies either field. That
+/// separation is the whole security property: otherwise a remote that draws a
+/// convincing fake permission prompt gets to choose what a tap sends.
+public struct QuickAction: Sendable, Equatable {
+    /// Stable identifier from the profile, so a client can remember placement.
+    public var id: String
+    /// What the button says. From the profile, never from the output stream.
+    public var label: String
+
+    public init(id: String, label: String) {
+        self.id = id
+        self.label = label
+    }
+}
+
 /// Agent status carried on the control stream (design doc §5.3 `AgentEvent`).
 public enum AgentEventKind: String, Sendable, Equatable, CaseIterable {
     case waiting
@@ -23,6 +41,10 @@ public enum ControlFrame: Sendable, Equatable {
     case termios(TermiosState)
     case screenMode(alt: Bool)
     case agentEvent(kind: AgentEventKind, agentID: String?, detail: String?)
+    /// The actions currently answerable in one tap (design doc §7.3). An empty
+    /// list withdraws a previous offer — sent on a full clear, an alt-screen
+    /// transition, or when the matched prompt leaves the output tail.
+    case quickActions([QuickAction])
     case resumeTooOld(ptyID: Int, earliestOffset: UInt64)
     case bye(reason: String)
     case error(code: Int, message: String)
@@ -101,6 +123,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .termios: "termios"
         case .screenMode: "screen"
         case .agentEvent: "agent"
+        case .quickActions: "qa"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
         case .error: "error"
@@ -153,6 +176,10 @@ extension ControlFrame {
             pairs.append((.text("kind"), .text(kind.rawValue)))
             if let agentID { pairs.append((.text("aid"), .text(agentID))) }
             if let detail { pairs.append((.text("detail"), .text(detail))) }
+        case .quickActions(let actions):
+            pairs.append((.text("actions"), .array(actions.map { action in
+                .map([(.text("id"), .text(action.id)), (.text("label"), .text(action.label))])
+            })))
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
@@ -269,6 +296,17 @@ extension ControlFrame {
                 agentID: item["aid"]?.stringValue,
                 detail: item["detail"]?.stringValue
             )
+        case "qa":
+            // A malformed entry drops that action rather than the whole frame: a
+            // partly-understood offer is still safe, because every field a client
+            // acts on comes from its own profile.
+            let actions = (item["actions"]?.arrayValue ?? []).compactMap { entry -> QuickAction? in
+                guard let id = entry["id"]?.stringValue,
+                      let label = entry["label"]?.stringValue
+                else { return nil }
+                return QuickAction(id: id, label: label)
+            }
+            return .quickActions(actions)
         case "tooold":
             return .resumeTooOld(
                 ptyID: try requiredInt("pty"),

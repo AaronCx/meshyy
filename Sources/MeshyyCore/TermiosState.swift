@@ -33,11 +33,18 @@ public struct TermiosState: Sendable, Equatable {
     public static let rawMode = TermiosState(echo: false, icanon: false, raw: true)
 }
 
-/// Everything the client needs to decide whether predicting a keystroke is safe.
+/// Whether predicting a keystroke would be safe.
 ///
-/// Design doc §7.2 requires *all* of: echo, icanon, not alt-screen, and an RTT
-/// above the threshold. Keeping the decision in one place in `MeshyyCore` means
-/// the daemon and the client cannot drift on what "safe" means.
+/// **Not a live feature.** Design doc §7 no longer specifies predictive echo:
+/// measured on a real PTY, every interactive shell and tmux hold the tty in raw
+/// mode, so `shouldPredict` is false in every configuration a+Terminal is used in
+/// (docs/spikes/2026-07-27-line-discipline.md, and the table inline in §7.1).
+///
+/// Kept for two reasons. `reasonPredictionIsOff` is the honest explanation §3.5
+/// wants for a user asking why nothing echoes locally, and
+/// `PTYTests.interactiveShellsAreRawNotCooked` asserts against it so the finding
+/// is pinned by a test rather than only by a document — if someone ever revives
+/// prediction, that test fails and points at the measurement.
 public struct PredictionGate: Sendable, Equatable {
     public var termios: TermiosState
     public var altScreen: Bool
