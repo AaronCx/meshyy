@@ -72,6 +72,13 @@ public final class MeshyyConnection: @unchecked Sendable {
     /// State transitions, for the UI.
     public var onState: (@Sendable (MeshyyConnectionState) -> Void)?
 
+    /// 5s. See the note in `clientOptions`.
+    static let idleTimeoutMilliseconds = 5_000
+    /// Keepalive interval. Well under the idle timeout, so a healthy but quiet
+    /// session is never mistaken for a dead one — which is what makes an idle
+    /// timeout this short safe.
+    static let keepAliveInterval = NWProtocolQUIC.Metadata.KeepAliveBehavior.seconds(2)
+
     public init(host: String, port: UInt16, certificateSHA256: String) {
         self.host = host
         self.port = port
@@ -191,6 +198,7 @@ public final class MeshyyConnection: @unchecked Sendable {
         // Streams can only be created once the group is ready; before that,
         // NWConnection(from:) returns nil.
         try queue.sync { try openStream(for: .control) }
+        enableKeepAlive()
         transition(.connected)
     }
 
@@ -202,7 +210,16 @@ public final class MeshyyConnection: @unchecked Sendable {
         let options = NWProtocolQUIC.Options(alpn: [Meshyy.alpn])
         options.initialMaxStreamsBidirectional = 64
         options.initialMaxStreamsUnidirectional = 64
-        options.idleTimeout = 30_000
+        // Short on purpose, and much shorter than the daemon's.
+        //
+        // Network framework QUIC does NOT do connection migration: a path change
+        // black-holes the connection while the group keeps reporting `.ready`
+        // (measured — see design doc §6.1 and docs/qa/known-debt.md). The idle
+        // timeout is therefore the *only* thing that tells a client its session has
+        // gone deaf, and at the 30s default a user stares at a dead terminal for
+        // half a minute. 5s plus keepalive detects it fast enough to reconnect
+        // before it is worth complaining about.
+        options.idleTimeout = Self.idleTimeoutMilliseconds
 
         // No CA, and chain validation is replaced wholesale. The certificate is
         // trusted iff its SHA-256 matches what SSH already delivered over an
@@ -236,6 +253,22 @@ public final class MeshyyConnection: @unchecked Sendable {
         // a SAN in the daemon's certificate keeps the handshake conventional.
         sec_protocol_options_set_tls_server_name(options.securityProtocolOptions, "meshyyd.local")
         return options
+    }
+
+    /// Turns on QUIC keepalive, which is the one lever that makes a black-holed
+    /// path detectable at all.
+    ///
+    /// Only reachable through per-connection metadata, and only once a connection
+    /// is up — before that the metadata is nil. Deliberately no assertion on the
+    /// getter: it reports `.off` regardless of what was set, so the only honest
+    /// verification is wire behaviour, which the probe that established this did
+    /// and a unit test cannot.
+    private func enableKeepAlive() {
+        queue.async { [weak self] in
+            guard let self, let stream = self.streams[.control] else { return }
+            let metadata = stream.metadata(definition: NWProtocolQUIC.definition)
+            (metadata as? NWProtocolQUIC.Metadata)?.keepAlive = Self.keepAliveInterval
+        }
     }
 
     // MARK: - Streams

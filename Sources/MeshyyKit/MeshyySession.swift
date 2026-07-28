@@ -94,7 +94,7 @@ public actor MeshyySession {
         guard ingressTask == nil else { return }
         ingressTask = Task { [weak self] in
             guard let self else { return }
-            for await frame in await self.ingress {
+            for await frame in self.ingress {
                 await self.handle(frame)
             }
         }

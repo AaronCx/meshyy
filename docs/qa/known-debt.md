@@ -32,12 +32,20 @@ missing feature. Design doc §6.1 has the measurement and the honest replacement
 claim. Do not reach for
 `sec_protocol_options_set_tls_early_data_enabled` — it is SPI, and it buys ~13 ms.
 
-## Connection migration is unverifiable from public API
+## Connection migration does not happen at all
 
-`nw_quic_migration_info_*` is entirely SPI. Whatever migration Network framework
-performs is automatic and unobservable, so the device tests in `device-matrix.md`
-can assert only that a session survived an interface change, never that migration
-is the mechanism that saved it.
+Measured, not inferred: a peer address change silently black-holes a Network
+framework QUIC connection until the idle timeout fires, in either direction, and
+`NWConnectionGroup` exposes no path or viability signal to notice it with.
+`nw_quic_migration_info_*` is entirely SPI, so even where migration does occur it
+is unobservable from public API.
+
+Mitigated rather than worked around: the client sets a 5 s idle timeout instead of
+the 30 s default (the idle timeout is now the *only* deafness signal) and enables
+QUIC keepalive at 2 s, which is what makes a timeout that short safe. See §6.1.
+
+The keepalive getter always reports `.off` whatever was set, so there is nothing to
+assert in a unit test. `MeshyyConnection.enableKeepAlive` says so at the call site.
 
 ## Two undocumented Network framework requirements
 

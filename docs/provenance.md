@@ -250,3 +250,49 @@ for the sec_protocol_options and NWProtocolQUIC surfaces.
 
 Consulted: RFC 9001 §4.6 (0-RTT), Apple Network framework and Security framework
 headers, design doc §6.1, §10 M4, §12.1.
+
+---
+
+## 2026-07-27 Network framework QUIC does not migrate; §12.1 answered "no"
+
+Decision: §6.1 no longer claims connection migration works in the foreground, and
+§12.1 is answered "no" rather than "foreground only". M4's roaming acceptance is
+respecified as reconnect-and-resume with a 300 ms budget instead of "no visible
+interruption via migration".
+
+Rationale: measured. A peer address change silently black-holes a Network
+framework QUIC connection until the idle timeout fires, in either direction, and
+`NWConnectionGroup` exposes no path, viability, or better-path signal to notice it
+with. `nw_quic_migration_info_*` is entirely SPI, so even where migration does
+happen it is unobservable from public API — which means a test could never assert
+migration was the mechanism, only that the session survived.
+
+Two code changes follow directly, and both are the kind of thing that only shows
+up when someone measures rather than reads:
+
+- The client's idle timeout drops from the 30 s default to 5 s. Since migration
+  does not happen, the idle timeout is the *only* thing that tells a client its
+  session has gone deaf — and at 30 s the group keeps reporting `.ready` while the
+  user stares at a dead terminal.
+- QUIC keepalive is enabled at 2 s via `NWProtocolQUIC.Metadata.keepAlive`, which
+  is only reachable per-connection and only once a connection is up. This is what
+  makes a 5 s idle timeout safe rather than trigger-happy: without it a quiet but
+  healthy session would be reaped. Note the getter always reports `.off` whatever
+  was set, so there is no assertion to write — the effect was verified on the wire
+  by the probe, and the code says so rather than pretending a unit test covers it.
+
+Deliberately NOT taken: §12.1's own stated fallback of moving to TCP+TLS. QUIC
+still earns its place on §5.2 multiplexing and a combined transport+crypto
+handshake, and TCP+TLS does not migrate either — so the fallback would cost the
+benefits and fix nothing.
+
+Contradiction noted: the migration probe referred in passing to "0-RTT resume" as
+though it were available. It is not — see the 0-RTT entry above, which comes from
+a probe that tested it directly. The specific measurement wins over the passing
+mention.
+
+Source: empirical probe on macOS 26.4.1 with a userspace UDP relay rotating the
+server-facing 4-tuple; SDK interface inspection of NWProtocolQUIC.Metadata.
+
+Consulted: RFC 9000 §9 (connection migration); Apple Network framework interfaces;
+design doc §6.1, §10 M4, §12.1.
