@@ -426,3 +426,36 @@ client sends one every 250 ms and the daemon files it. The test was renamed to a
 the property that actually protects the client and that a mutation *can* break: the
 replay point is exactly what the client asked for, byte for byte. Making resume ignore
 the stated offset, or shift it by one, both turn it red.
+
+---
+
+# 1c-bis: the corpus, executed at three levels
+
+The shared corpus is written once in `MeshyyTestSupport.ResumeScenario` and now runs
+three ways, each one blinder than the one below it:
+
+| level | where | scenarios | sees |
+|---|---|---|---|
+| model | `ConformanceTests` | 200 | both client implementations in lockstep, compared after every step |
+| framing | `AbruptLossTests` | 200 | real `FrameEnvelope` encode → real `FrameDecoder`, byte at a time |
+| **transport** | `CorpusOverTransportTests` | **8** | a real daemon, PTY and QUIC connection; `disconnect` tears a connection down for real |
+
+**176 tests total.**
+
+**The transport level runs 8 of the 200, deliberately, and that is stated rather than
+inferred.** Each scenario there stands up a daemon, a keychain identity, a QUIC
+listener and a shell, and every `disconnect` closes a live connection and dials a new
+one with a fresh token. At 200 that is minutes of wall clock per CI run for arithmetic
+already asserted twice above. The transport level exists to catch what the other two
+structurally cannot see, not to re-derive the same offsets 200 more times. The seeds
+are fixed rather than sampled, because a subset that changes per run turns a failure
+into an anecdote.
+
+`chosenSeedsAreNotVacuous` asserts the subset actually reconnects, or it would be eight
+slow copies of the happy path. And the mode was mutation-checked: removing the resume
+point (`resumeFrom: nil` on every attach) turns it red.
+
+**One accommodation, from 1f.** Scenario bytes are mapped into printable ASCII before
+being typed at the PTY. A PTY is not transparent to arbitrary bytes even in raw mode —
+1f saw 312 of 700 bytes come back mangled — so this keeps a failure meaning "the
+transport lost something" rather than "the terminal transformed it".
