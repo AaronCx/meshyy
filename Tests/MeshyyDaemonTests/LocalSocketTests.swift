@@ -397,6 +397,52 @@ struct LocalSocketTests {
             }, "a malformed frame must be reported; got \(client.controlFrames)")
         }
     }
+
+    /// Pins the ordering guarantee. `SessionAttachment` used to spawn a separate
+    /// Task per pty write and per resize, and tasks enqueued on an actor run in an
+    /// UNSPECIFIED order — so two keystroke chunks could reach the PTY reversed, and
+    /// a resize could apply after the command that depended on it. CI caught the
+    /// resize case; scrambled input is the one that would have been blamed on the
+    /// network.
+    @Test("Consecutive writes reach the PTY in the order they were sent")
+    func writesAreOrdered() async throws {
+        try await withServer { path, _ in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "order"))))
+            #expect(client.pump { !$0.isEmpty })
+
+            // One command split across many frames, one byte at a time. If the daemon
+            // reorders any of them the shell sees garbage and the marker never
+            // appears — which is a far stronger check than comparing timestamps.
+            let command = Array("printf '%s%s\\n' ORDER ED_OK\n".utf8)
+            for byte in command {
+                client.send(.pty(0, [byte]))
+            }
+            #expect(client.pump { _ in
+                String(decoding: client.ptyStream, as: UTF8.self).contains("ORDERED_OK")
+            }, "input was reordered; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+        }
+    }
+
+    /// The case CI actually caught: a resize immediately followed by a command must
+    /// apply before the command runs.
+    @Test("A resize applies before a command sent immediately after it")
+    func resizeOrderedBeforeCommand() async throws {
+        try await withServer { path, _ in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "rz"))))
+            #expect(client.pump { !$0.isEmpty })
+
+            // No wait between them, on purpose.
+            client.send(.control(.resize(cols: 133, rows: 47)))
+            client.send(.pty(0, Array("stty size\n".utf8)))
+            #expect(client.pump { _ in
+                String(decoding: client.ptyStream, as: UTF8.self).contains("47 133")
+            }, "the resize did not apply before the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+        }
+    }
 }
 
 extension TestClient {
@@ -412,4 +458,5 @@ extension TestClient {
             return
         }
     }
+
 }

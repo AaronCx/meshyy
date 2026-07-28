@@ -75,19 +75,28 @@ public final class SessionAttachment: @unchecked Sendable {
         /// this is what a reconnect resumes from, and the client is the only thing
         /// that knows it — so the daemon records what it is told, never guesses.
         var ackedOffset: UInt64 = 0
-        /// Keystrokes that arrived before the attach finished.
-        ///
-        /// Attaching is asynchronous — it resolves a token, finds the session and
-        /// reads its state — but a client may send Hello and start typing in the
-        /// same breath, and on a fast local transport those bytes overtake the
-        /// attach. Dropping them looked fine in a test that happened to be slow
-        /// enough and silently ate the first keystrokes after every foreground.
-        var pendingInput: [[UInt8]] = []
-        /// Resize that arrived before the attach finished, for the same reason.
-        var pendingResize: TerminalSize?
     }
 
     private let state = Mutex(State())
+
+    /// Ordered work queue for anything that mutates the PTY.
+    ///
+    /// `Task { await session.send(bytes) }` per frame is WRONG: tasks enqueued on an
+    /// actor run in an unspecified order, not FIFO. Two keystroke chunks arriving
+    /// back to back could reach the PTY reversed — scrambled input — and a resize
+    /// followed immediately by a command could apply after it. CI caught the resize
+    /// case; the input case is the one that would have been blamed on the network.
+    ///
+    /// An AsyncStream preserves yield order and has one consumer, so wire order is
+    /// PTY order by construction. Same fix as `MeshyySession.ingress` on the client.
+    private enum PTYWork: Sendable {
+        case write([UInt8])
+        case resize(TerminalSize)
+    }
+
+    private let work: AsyncStream<PTYWork>
+    private let workContinuation: AsyncStream<PTYWork>.Continuation
+    private let workTask = Mutex<Task<Void, Never>?>(nil)
 
     public init(
         store: SessionStore,
@@ -99,6 +108,14 @@ public final class SessionAttachment: @unchecked Sendable {
         self.authority = authority
         self.send = send
         self.closeTransport = close
+
+        let (stream, continuation) = AsyncStream<PTYWork>.makeStream(
+            // Unbounded: dropping a keystroke to relieve backpressure is not a
+            // trade-off, it is data loss the user would attribute to the network.
+            bufferingPolicy: .unbounded
+        )
+        self.work = stream
+        self.workContinuation = continuation
     }
 
     // MARK: - Inbound
@@ -114,13 +131,9 @@ public final class SessionAttachment: @unchecked Sendable {
             handle(frame)
 
         case .pty:
-            let bytes = envelope.payload
-            guard let session = currentSession else {
-                // Not attached yet: hold the keystrokes rather than dropping them.
-                state.withLock { $0.pendingInput.append(bytes) }
-                return
-            }
-            Task { try? await session.send(bytes) }
+            // Straight onto the ordered queue. The queue itself holds work until the
+            // attach completes, so there is no separate pre-attach path to get wrong.
+            workContinuation.yield(.write(envelope.payload))
 
         case .blob:
             // M7. Answered rather than silently dropped, so a client that tries it
@@ -135,14 +148,10 @@ public final class SessionAttachment: @unchecked Sendable {
             attach(hello)
 
         case .resize(let cols, let rows):
-            let size = TerminalSize(cols: cols, rows: rows)
-            guard let session = currentSession else {
-                // Only the latest matters — an intermediate size nobody ever drew at
-                // is not worth replaying.
-                state.withLock { $0.pendingResize = size }
-                return
-            }
-            Task { try? await session.resize(to: size) }
+            // Ordered with input, not raced against it: a resize followed by a
+            // command must apply before the command runs, or a full-screen program
+            // draws at the old size.
+            workContinuation.yield(.resize(TerminalSize(cols: cols, rows: rows)))
 
         case .ack(_, let offset):
             // Monotonic: a client must never be able to walk its own offset
@@ -293,20 +302,25 @@ public final class SessionAttachment: @unchecked Sendable {
         }
         state.withLock { $0.pumpTask = pump }
 
-        // Flush anything that arrived while attaching, in order, before any further
-        // input is accepted.
-        let (queuedInput, queuedResize) = state.withLock { current -> ([[UInt8]], TerminalSize?) in
-            let captured = (current.pendingInput, current.pendingResize)
-            current.pendingInput = []
-            current.pendingResize = nil
-            return captured
+        // Start draining the ordered work queue. Everything that arrived while the
+        // attach was in flight is already sitting in it, in arrival order, so this
+        // both flushes the backlog and serves all future input through one path.
+        //
+        // A client may send Hello and start typing in the same breath, and on a fast
+        // transport those bytes overtake the attach. Dropping them looked fine in a
+        // test that happened to be slow enough and silently ate the first keystrokes
+        // after every foreground.
+        let drain = Task { [work] in
+            for await item in work {
+                switch item {
+                case .write(let bytes):
+                    try? await session.send(bytes)
+                case .resize(let size):
+                    try? await session.resize(to: size)
+                }
+            }
         }
-        if let queuedResize {
-            try? await session.resize(to: queuedResize)
-        }
-        for chunk in queuedInput {
-            try? await session.send(chunk)
-        }
+        workTask.withLock { $0 = drain }
     }
 
     // MARK: - Outbound
@@ -361,6 +375,11 @@ public final class SessionAttachment: @unchecked Sendable {
         guard let teardown else { return }
 
         teardown.0?.cancel()
+        workContinuation.finish()
+        workTask.withLock { task in
+            task?.cancel()
+            task = nil
+        }
         if let session = teardown.1, let subscription = teardown.2 {
             Task { await session.detach(subscription) }
         }
