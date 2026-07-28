@@ -14,19 +14,68 @@ public struct DaemonConfig: Sendable {
     /// Design doc §8: loopback or the Tailscale interface by default. Binding
     /// every interface takes an explicit flag and a startup warning.
     public var bindAllInterfaces: Bool
+    /// Agents the daemon can recognise, and what each can answer in one tap.
+    ///
+    /// Design doc §4 keeps agent identity as DATA: the daemon is handed candidate
+    /// profiles and never names one itself, so supporting a new agent is a profile
+    /// entry rather than a code change.
+    public var agentProfiles: [AgentProfile]
 
     public init(
         shell: String = DaemonConfig.defaultShell,
         shellArguments: [String] = ["-l"],
         environment: [String: String] = DaemonConfig.defaultEnvironment,
         bufferCapacity: Int = RingBuffer.defaultCapacity,
-        bindAllInterfaces: Bool = false
+        bindAllInterfaces: Bool = false,
+        agentProfiles: [AgentProfile] = DaemonConfig.defaultAgentProfiles
     ) {
         self.shell = shell
         self.shellArguments = shellArguments
         self.environment = environment
         self.bufferCapacity = bufferCapacity
         self.bindAllInterfaces = bindAllInterfaces
+        self.agentProfiles = agentProfiles
+    }
+
+    /// Ships with Claude Code and a generic fallback.
+    ///
+    /// The markers are strings the agent puts on screen, observed as a black box.
+    /// The quick actions' `matches` are deliberately narrow: §7.4 warns that a
+    /// loose match offers a button at the wrong moment, which is worse than
+    /// offering none, so each requires the prompt text AND its specific option.
+    public static var defaultAgentProfiles: [AgentProfile] {
+        [
+            AgentProfile(
+                id: "claude-code",
+                displayName: "Claude Code",
+                detectionMarkers: ["esc to interrupt", "claude code"],
+                quickActions: [
+                    QuickActionDefinition(
+                        id: "approve-once",
+                        label: "Yes",
+                        matches: ["do you want", "1. yes"],
+                        sends: Array("1\r".utf8)
+                    ),
+                    QuickActionDefinition(
+                        id: "approve-always",
+                        label: "Yes, always",
+                        matches: ["do you want", "2. yes, and don't ask again"],
+                        sends: Array("2\r".utf8)
+                    ),
+                    QuickActionDefinition(
+                        id: "deny",
+                        label: "No",
+                        // The escape key is what Claude Code itself documents on
+                        // screen, so this is the same keystroke a user would send.
+                        matches: ["do you want", "no, and tell claude"],
+                        sends: Array("\u{1B}".utf8)
+                    ),
+                ]
+            ),
+            // Empty markers: the burst/quiet heuristic runs from the start and
+            // reports status for ANY agent, with no name claimed.
+            AgentProfile.generic,
+        ]
     }
 
     public static var defaultShell: String {
@@ -75,9 +124,13 @@ public actor SessionStore {
 
     private var sessions: [String: PTYSession] = [:]
     private let config: DaemonConfig
+    private let notifier: AgentNotifier?
+    /// One watcher per session, translating agent events into notifications.
+    private var notifyTasks: [String: Task<Void, Never>] = [:]
 
-    public init(config: DaemonConfig = DaemonConfig()) {
+    public init(config: DaemonConfig = DaemonConfig(), notifier: AgentNotifier? = nil) {
         self.config = config
+        self.notifier = notifier
     }
 
     /// Session names reach log lines and, on a Linux port, could reach a path.
@@ -114,10 +167,28 @@ public actor SessionStore {
             arguments: config.shellArguments,
             environment: config.environment,
             size: size,
-            bufferCapacity: config.bufferCapacity
+            bufferCapacity: config.bufferCapacity,
+            agentProfiles: config.agentProfiles
         )
         await session.start()
         sessions[name] = session
+
+        // M5: watch this session's agent status so a permission prompt can reach the
+        // phone. A separate subscription rather than piggybacking on a client's,
+        // because the whole point is to fire when NO client is attached.
+        if let notifier {
+            let (_, events, _) = await session.attach(resumeFrom: session.info.bufferedTo)
+            notifyTasks[name] = Task { [name] in
+                for await event in events {
+                    guard case .agent(let kind, _, let detail) = event else { continue }
+                    await notifier.agentStatusChanged(
+                        session: name,
+                        kind: kind,
+                        agentName: detail
+                    )
+                }
+            }
+        }
         return session
     }
 
@@ -149,10 +220,13 @@ public actor SessionStore {
         guard let session = sessions.removeValue(forKey: name) else {
             throw StoreError.noSuchSession(name)
         }
+        notifyTasks.removeValue(forKey: name)?.cancel()
         await session.close()
     }
 
     public func closeAll() async {
+        for task in notifyTasks.values { task.cancel() }
+        notifyTasks.removeAll()
         for session in sessions.values { await session.close() }
         sessions.removeAll()
     }
@@ -164,6 +238,7 @@ public actor SessionStore {
         // `where` clauses cannot await, so the check is inside the body.
         for (name, session) in sessions {
             guard await !session.isAlive else { continue }
+            notifyTasks.removeValue(forKey: name)?.cancel()
             await session.close()
             sessions.removeValue(forKey: name)
         }

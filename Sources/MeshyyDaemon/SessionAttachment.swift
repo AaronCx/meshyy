@@ -327,6 +327,8 @@ public final class SessionAttachment: @unchecked Sendable {
             send(.control(.screenMode(alt: alt)))
         case .agent(let kind, let agentID, let detail):
             send(.control(.agentEvent(kind: kind, agentID: agentID, detail: detail)))
+        case .quickActions(let actions):
+            send(.control(.quickActions(actions)))
         case .exited(let status):
             send(.control(.bye(reason: "session exited with status \(status)")))
             finish()

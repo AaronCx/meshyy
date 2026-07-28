@@ -17,6 +17,10 @@ public enum SessionEvent: Sendable, Equatable {
     case screenMode(alt: Bool)
     /// Agent status derived from the output stream (design doc §5, M5).
     case agent(kind: AgentEventKind, agentID: String?, detail: String?)
+    /// One-tap actions now answerable, or an empty list withdrawing a previous
+    /// offer (design doc §7.3). Only ids and labels travel; what a tap sends comes
+    /// from the client's own profile.
+    case quickActions([QuickAction])
     /// The child exited. The session is over; the buffer stays readable until
     /// the session is closed so a late client can still see the last output.
     case exited(status: Int32)
@@ -50,6 +54,16 @@ public actor PTYSession {
     private var lastAltScreen = false
     private var exitStatus: Int32?
 
+    /// Derives agent status and quick-action availability from the output stream.
+    /// Never inspects commands, and never names an agent itself — identity is data
+    /// supplied as profiles (design doc §4).
+    private var agentMonitor: AgentActivityMonitor
+    /// Fires while output is quiet, which is how "waiting" is detected.
+    private var agentTimer: DispatchSourceTimer?
+    private let clock = ContinuousClock()
+    /// What the agent monitor last reported, so a frame is only sent on a change.
+    private var lastAgentStatus: AgentActivityMonitor.Status = .none
+
     private var readSource: DispatchSourceRead?
     private var exitSource: DispatchSourceProcess?
     private var termiosTimer: DispatchSourceTimer?
@@ -74,8 +88,10 @@ public actor PTYSession {
         environment: [String: String],
         workingDirectory: String? = nil,
         size: TerminalSize = .default,
-        bufferCapacity: Int = RingBuffer.defaultCapacity
+        bufferCapacity: Int = RingBuffer.defaultCapacity,
+        agentProfiles: [AgentProfile] = []
     ) throws {
+        self.agentMonitor = AgentActivityMonitor(candidates: agentProfiles)
         self.name = name
         self.sessionID = Self.makeSessionID()
         self.size = size
@@ -135,6 +151,58 @@ public actor PTYSession {
         exitSource = exits
 
         scheduleTermiosPoll()
+        scheduleAgentTick()
+    }
+
+    /// The quiet detector. Design doc's heuristic needs a clock that keeps running
+    /// when the PTY has gone silent, because silence is the signal.
+    private func scheduleAgentTick() {
+        agentTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            Task { await self.tickAgent() }
+        }
+        timer.resume()
+        agentTimer = timer
+    }
+
+    private func tickAgent() {
+        applyAgentChanges(agentMonitor.tick(now: clock.now))
+    }
+
+    private func applyAgentChanges(_ changes: AgentActivityMonitor.Changes) {
+        guard !changes.isEmpty else { return }
+
+        if let status = changes.status, status != lastAgentStatus {
+            lastAgentStatus = status
+            let kind: AgentEventKind? = switch status {
+            case .working: .working
+            case .waiting: .waiting
+            case .none: .idle
+            }
+            if let kind {
+                emit(.agent(
+                    kind: kind,
+                    agentID: agentMonitor.detected?.id,
+                    detail: agentMonitor.detected?.displayName
+                ))
+            }
+        } else if changes.detected != nil, lastAgentStatus != .none {
+            // The name resolved without the status moving — "Agent" became
+            // "Claude Code". Worth re-emitting so a label updates.
+            let kind: AgentEventKind = lastAgentStatus == .working ? .working : .waiting
+            emit(.agent(
+                kind: kind,
+                agentID: agentMonitor.detected?.id,
+                detail: agentMonitor.detected?.displayName
+            ))
+        }
+
+        if let actions = changes.actions {
+            emit(.quickActions(actions.map(\.advertised)))
+        }
     }
 
     /// Drains whatever the child wrote before exiting, then reports the exit.
@@ -157,6 +225,8 @@ public actor PTYSession {
         exitSource = nil
         termiosTimer?.cancel()
         termiosTimer = nil
+        agentTimer?.cancel()
+        agentTimer = nil
     }
 
     /// Reads the master until it would block, then ingests what arrived.
@@ -216,6 +286,8 @@ public actor PTYSession {
             let events = buffer.write(chunk)
             emit(.output(offset: offset, bytes: chunk))
 
+            applyAgentChanges(agentMonitor.observe(chunk, now: clock.now))
+
             for event in events {
                 switch event {
                 case .altScreen(let active, _):
@@ -223,9 +295,13 @@ public actor PTYSession {
                         lastAltScreen = active
                         emit(.screenMode(alt: active))
                     }
+                    // Design doc §7.3: withdraw any offer on an alt-screen
+                    // transition. The text a match was based on is gone.
+                    applyAgentChanges(agentMonitor.screenChanged())
                 case .fullClear:
-                    // Anchor bookkeeping only; nothing for a client to act on.
-                    break
+                    // The anchor is buffer bookkeeping, but a clear also means the
+                    // matched prompt has left the screen.
+                    applyAgentChanges(agentMonitor.screenChanged())
                 }
             }
         }
@@ -273,6 +349,7 @@ public actor PTYSession {
         // have to wait for the next change to know whether to predict.
         continuation.yield(.termios(lastTermios))
         continuation.yield(.screenMode(alt: lastAltScreen))
+        continuation.yield(.quickActions(agentMonitor.offeredActions.map(\.advertised)))
         if let exitStatus {
             continuation.yield(.exited(status: exitStatus))
         }
@@ -321,6 +398,8 @@ public actor PTYSession {
         exitSource = nil
         termiosTimer?.cancel()
         termiosTimer = nil
+        agentTimer?.cancel()
+        agentTimer = nil
         pty.terminate()
         for continuation in subscribers.values { continuation.finish() }
         subscribers.removeAll()

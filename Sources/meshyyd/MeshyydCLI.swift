@@ -92,7 +92,11 @@ enum MeshyydCLI {
         if let buffer { config.bufferCapacity = buffer }
         config.bindAllInterfaces = allInterfaces
 
-        let store = SessionStore(config: config)
+        // Design doc §9: meshyy ships NO endpoint. Notifications exist only if the
+        // user wrote ~/.meshyy/notify.json.
+        let notifyConfig = NotifyConfig.load()
+        let notifier = notifyConfig.map { _ in AgentNotifier() }
+        let store = SessionStore(config: config, notifier: notifier)
         let tokens = TokenActor()
         let server = LocalSocketServer(path: socketPath, store: store, tokens: tokens)
         do {
@@ -128,6 +132,10 @@ enum MeshyydCLI {
         print("meshyyd \(Meshyy.version) listening on \(socketPath)")
         print("shell: \(config.shell) \(config.shellArguments.joined(separator: " "))")
         print("ring buffer: \(config.bufferCapacity) bytes per session")
+        print("agents: \(config.agentProfiles.map(\.id).joined(separator: ", "))")
+        // The endpoint itself is never printed: it may carry a token in its path or
+        // headers, and design doc §9 keeps secrets out of logs.
+        print("notifications: \(notifyConfig == nil ? "off (no ~/.meshyy/notify.json)" : "configured")")
         if quicPort != 0 {
             print("quic: port \(quicPort) cert-sha256 \(quicFingerprint)")
             if config.bindAllInterfaces {
