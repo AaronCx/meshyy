@@ -350,3 +350,26 @@ docs/provenance.md.
 
 **Still open.** Radio transitions, jetsam and backgrounding are device-only. M4's
 acceptance list is written against a physical iPhone and this does not discharge it.
+
+---
+
+# Addendum, 2026-07-28: after M6 tier 1
+
+| | before | after |
+|---|---|---|
+| test functions | 161 | **171** |
+| running on merge | 161 | **171** |
+| quick actions | 0 | 10 |
+
+Three of M6's four acceptance clauses are assertions about this code and are tested.
+The fourth — "a tappable palette in the app" — belongs to a+Terminal and is **not**
+claimed here.
+
+The clause carrying the risk is "actions are unavailable when status is not `waiting`.
+No stray sends", and it is asserted at the API rather than in the UI, because a hidden
+button is not a guarantee. `lateTapIsRefused` is the case a hidden button does not
+cover: the view was right when the user tapped and wrong by the time the tap arrived.
+
+**Mutation-checked**: removing the tier-1 gate, offering the palette regardless of
+status, and letting a stale status survive a reattach were each planted and each named
+by a test.
