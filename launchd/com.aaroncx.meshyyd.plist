@@ -24,14 +24,18 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- UNCONDITIONAL. The previous SuccessfulExit=false restarted the daemon only
+         when it exited NON-zero, so any polite termination — a logout script, a
+         `pkill`, a tidy shutdown path — left it dead, and every session it was holding
+         died with it. The entire promise of this daemon is "your shell is still
+         there", and a promise that quietly ends at the first clean SIGTERM is not one.
+         Reported in use as "I'm not seeing this stay alive server side", and correctly.
+
+         Shutting it down deliberately is `scripts/install-agent.sh --uninstall`, or
+         `launchctl bootout`, which is what those commands are for — the daemon should
+         not be stoppable by accident. -->
     <key>KeepAlive</key>
-    <dict>
-        <!-- Restart on a crash, but not on a clean exit: `meshyyd serve` exits 0
-             only when it was asked to stop, and fighting that would make the
-             agent impossible to shut down. -->
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
 
     <!-- Sessions die with the daemon, so a restart is disruptive; back off
          rather than thrashing if something is structurally wrong. -->

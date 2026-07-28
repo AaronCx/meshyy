@@ -304,6 +304,15 @@ final class LocalClient: @unchecked Sendable {
                             handleBootstrap(session: session)
                             continue
                         }
+                        // Same reasoning as bootstrap: enumeration is a local-transport
+                        // concern, not part of a session's protocol, so it is answered
+                        // here rather than inside an attachment.
+                        if frame.kind == .control,
+                           let control = try? ControlFrame.decode(frame.payload),
+                           case .sessionListRequest = control {
+                            handleSessionList()
+                            continue
+                        }
                         attachment?.receive(frame)
                     }
                 } catch {
@@ -320,6 +329,38 @@ final class LocalClient: @unchecked Sendable {
             if errno == EINTR { continue }
             closeConnection()
             return
+        }
+    }
+
+    /// Answers `meshyyd list`: what sessions exist, and are they alive.
+    ///
+    /// Exists because a persistence claim nobody can check is worth nothing. Until
+    /// this landed, `list` printed "not implemented" and there was no way to tell a
+    /// session that had survived from one that had never been created — which is
+    /// exactly the doubt the first user of the feature reported.
+    ///
+    /// Deliberately reports `childPID` and `isAlive`: the interesting failure is not
+    /// "no sessions", it is a session that exists with a dead shell behind it.
+    private func handleSessionList() {
+        Task { [weak self] in
+            guard let self else { return }
+            let infos = await self.store.list()
+            let payload = infos.map { info in
+                [
+                    "name": info.name,
+                    "session_id": info.sessionID,
+                    "cols": info.size.cols,
+                    "rows": info.size.rows,
+                    "buffered_from": info.bufferedFrom,
+                    "buffered_to": info.bufferedTo,
+                    "alt_screen": info.altScreen,
+                    "child_pid": Int(info.childPID),
+                    "alive": info.isAlive,
+                ] as [String: Any]
+            }
+            let json = (try? JSONSerialization.data(withJSONObject: payload))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+            self.write(.control(.sessionListResponse(json: json)))
         }
     }
 

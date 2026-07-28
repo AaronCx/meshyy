@@ -39,6 +39,9 @@ struct ControlFrameTests {
         ]),
         .quickActions([]),
         .resumeTooOld(ptyID: 0, earliestOffset: 4096),
+        .sessionListRequest,
+        .sessionListResponse(json: "[]"),
+        .sessionListResponse(json: "[{\"name\":\"aplus-1\",\"alive\":true}]"),
         .ping(nonce: 0),
         .ping(nonce: .max),
         .pong(nonce: 0x0123_4567_89AB_CDEF),
@@ -172,6 +175,11 @@ struct ControlFrameTests {
          "a361746361636b6370747900636f6666191000"),
         // M4 4b. Deliberately tiny: a heartbeat that costs a full MTU would be a
         // battery decision as well as a latency one.
+        // `meshyyd list`. A frame with no fields at all — the type tag IS the message
+        // — so this fixture is also the proof that a fieldless frame encodes and
+        // decodes rather than being mistaken for a malformed map.
+        ("session_list_request", .sessionListRequest, "a16174626c73"),
+        ("session_list_response", .sessionListResponse(json: "[]"), "a26174636c7372646a736f6e625b5d"),
         ("ping", .ping(nonce: 7), "a261746470696e67616e07"),
         ("pong", .pong(nonce: 7), "a2617464706f6e67616e07"),
         ("termios_cooked", .termios(.cooked),

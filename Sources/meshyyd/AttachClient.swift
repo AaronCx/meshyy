@@ -46,19 +46,82 @@ final class AttachClient: @unchecked Sendable {
     }
 
     /// `meshyyd list` — attaches nothing, just asks and prints.
+    ///
+    /// The point of this command is to make a persistence claim checkable. "Your
+    /// session stays alive on the server" is unfalsifiable without it, and an
+    /// unfalsifiable claim is indistinguishable from a false one — which is precisely
+    /// how it was first reported.
     func list() async {
         guard connect() else { return }
-        // The daemon has no list frame yet; that is M2 work alongside the QUIC
-        // control stream. Report the gap rather than printing an empty table that
-        // reads as "no sessions".
-        FileHandle.standardError.write(Data("""
-            meshyyd: `list` is not implemented yet — the control protocol has no \
-            session-enumeration frame until M2.
-            The daemon is reachable at \(socketPath).
+        defer { Darwin.close(fd) }
 
-            """.utf8))
-        Darwin.close(fd)
+        send(.control(.sessionListRequest))
+
+        var decoder = FrameDecoder()
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 65536) }
+            if count <= 0 {
+                if count < 0, errno == EINTR || errno == EAGAIN { usleep(5_000); continue }
+                break
+            }
+            guard let frames = try? decoder.push(Array(buffer[0..<count])) else { break }
+            for frame in frames where frame.kind == .control {
+                guard let control = try? ControlFrame.decode(frame.payload) else { continue }
+                if case .sessionListResponse(let json) = control {
+                    render(json)
+                    exit(0)
+                }
+                if case .error(let code, let message) = control {
+                    FileHandle.standardError.write(Data("meshyyd: \(code): \(message)\n".utf8))
+                    exit(3)
+                }
+            }
+        }
+        FileHandle.standardError.write(Data("meshyyd: the daemon did not answer within 5s\n".utf8))
         exit(3)
+    }
+
+    /// Prints one line per session. `alive` is the column that matters: a session
+    /// whose shell has died still exists, and saying "1 session" about it would be
+    /// the same kind of unchecked claim this command exists to remove.
+    private func render(_ json: String) {
+        guard let data = json.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else {
+            FileHandle.standardError.write(Data("meshyyd: unreadable session list\n".utf8))
+            exit(3)
+        }
+        if rows.isEmpty {
+            print("no sessions")
+            return
+        }
+        // Padded in Swift rather than with `String(format:"%s")`: passing a Swift
+        // String to a C `%s` conversion needs a manually-bridged C pointer and
+        // segfaulted on the first real session, which is a poor way to learn that a
+        // diagnostic command is itself broken.
+        func pad(_ value: String, _ width: Int) -> String {
+            value.count >= width ? value : value + String(repeating: " ", count: width - value.count)
+        }
+
+        print(pad("NAME", 30) + pad("PID", 9) + pad("BUFFERED", 11) + pad("SIZE", 9) + "STATE")
+        for row in rows {
+            let name = row["name"] as? String ?? "?"
+            let pid = row["child_pid"] as? Int ?? 0
+            let from = (row["buffered_from"] as? NSNumber)?.uint64Value ?? 0
+            let to = (row["buffered_to"] as? NSNumber)?.uint64Value ?? 0
+            let cols = row["cols"] as? Int ?? 0
+            let rowsN = row["rows"] as? Int ?? 0
+            let alive = row["alive"] as? Bool ?? false
+            print(
+                pad(name, 30)
+                    + pad("\(pid)", 9)
+                    + pad("\(to - from)B", 11)
+                    + pad("\(cols)x\(rowsN)", 9)
+                    + (alive ? "alive" : "DEAD SHELL")
+            )
+        }
     }
 
     // MARK: - Socket

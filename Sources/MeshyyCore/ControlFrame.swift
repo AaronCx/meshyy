@@ -75,6 +75,18 @@ public enum ControlFrame: Sendable, Equatable {
     /// step 2). Local transport only — over QUIC the handshake has already
     /// happened, and answering this there would let a connection mint itself a
     /// fresh token, defeating single use.
+    /// Enumerate the daemon's live sessions (`meshyyd list`).
+    ///
+    /// Added because persistence that cannot be observed cannot be trusted: the first
+    /// user of the feature reported "I'm not seeing this stay alive server side", and
+    /// they were right — `list` printed "not implemented" and there was no way to check
+    /// whether a session existed at all. A claim nobody can verify is indistinguishable
+    /// from a false one.
+    case sessionListRequest
+    /// JSON array of live sessions. A JSON payload rather than a CBOR structure for the
+    /// same reason `bootstrapResponse` uses one: this is diagnostic output for a human
+    /// and a script, not a hot path, and a schema change here must not need a new frame.
+    case sessionListResponse(json: String)
     case bootstrapRequest(session: String)
     /// The §5.1 handshake, as the JSON the client parses. Carried as an opaque
     /// string rather than re-modelled so the bytes the client sees are exactly the
@@ -161,6 +173,8 @@ public enum ControlFrame: Sendable, Equatable {
         case .agentEvent: "agent"
         case .quickActions: "qa"
         case .replayBase: "base"
+        case .sessionListRequest: "ls"
+        case .sessionListResponse: "lsr"
         case .bootstrapRequest: "boot"
         case .bootstrapResponse: "booted"
         case .resumeTooOld: "tooold"
@@ -227,6 +241,10 @@ extension ControlFrame {
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
+        case .sessionListRequest:
+            break   // the type tag is the whole message
+        case .sessionListResponse(let json):
+            pairs.append((.text("json"), .text(json)))
         case .bootstrapRequest(let session):
             pairs.append((.text("sess"), .text(session)))
         case .bootstrapResponse(let json):
@@ -366,6 +384,10 @@ extension ControlFrame {
                 ptyID: try requiredInt("pty"),
                 earliestOffset: try requiredOffset("earliest")
             )
+        case "ls":
+            return .sessionListRequest
+        case "lsr":
+            return .sessionListResponse(json: try requiredText("json"))
         case "boot":
             return .bootstrapRequest(session: try requiredText("sess"))
         case "booted":
