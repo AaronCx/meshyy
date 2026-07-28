@@ -1,0 +1,171 @@
+# Test inventory
+
+Audit for hardening PR 1a. **Audit only — nothing was changed.**
+
+Counted from `swift test list` and by reading each test, not from names.
+`make test` (all suites): 127 test functions, 128 reported cases, ~330 runtime
+cases once parameterised tests expand. 12.8 s.
+
+---
+
+## The four questions, answered
+
+### 1. How many tests exercise resume at all?
+
+**23 functions / ~222 runtime cases.** Resume is the single most-tested thing in
+the project, by some distance.
+
+| Layer | Functions | Runtime cases | What it drives |
+|---|---|---|---|
+| Model (`SessionBuffer` directly) | 9 | 208 | `MeshyyCore` resume logic, no transport |
+| Transport (unix socket) | 3 | 3 | real socket, real PTY, real framing |
+| Transport (QUIC) | 1 | 1 | real QUIC, real PTY |
+| Client bookkeeping (`MeshyySession`) | 5 | 5 | real QUIC + client offset arithmetic |
+| Redraw-anchor semantics | 4 | 4 | `ScreenScanner` offsets |
+| Protocol field | 1 | 1 | `resumeFrom` present/absent on the wire |
+
+### 2. How many exercise resume across a real disconnect rather than a clean teardown?
+
+**Nine cross a connection close. Zero cross an abrupt loss.** This is the gap.
+
+Every transport-level resume test disconnects by calling `close()` or `detach()`,
+which cancels the QUIC group or closes the socket — an *orderly* teardown that
+emits `CONNECTION_CLOSE` or a FIN, with nothing in flight.
+
+**The production case is not that.** iOS suspension means packets simply stop:
+no close frame, no FIN, the daemon's peer just goes quiet, and whatever was in
+flight is lost mid-frame. Nothing in the suite reproduces that.
+
+So the honest split is:
+
+| Kind of disconnect | Tests | Notes |
+|---|---|---|
+| Graceful close, then reconnect | 9 | orderly; no bytes in flight |
+| Abrupt loss (no close frame) | **0** | **the actual production case** |
+| Loss mid-control-frame | **0** | framing resync untested under loss |
+| Half-open (one direction dies) | **0** | |
+
+### 3. Does anything inject loss, reorder, duplication, or latency?
+
+**No. Nothing.** Not one test.
+
+Worse than absent — it looks present:
+
+- `MeshyyChaos` exists as a target and **is declared as a dependency of
+  `MeshyyCoreTests` in `Package.swift`**. No test file imports it. It is dead
+  weight in the test graph that reads, from the manifest, like coverage.
+- `ChaosTCPProxy` is real and works, but is `NWParameters.tcp` — it **cannot
+  impair QUIC at all**. Its only consumer is the §1 benchmark script via the
+  `meshyy-chaos` CLI.
+- `ChaosProfile` has `loss`, `reorder`, `jitter` and `severAfter` fields.
+  `ChaosTCPProxy` ignores `loss` and `reorder` by design (dropping bytes from a
+  TCP stream corrupts it rather than emulating anything). So those knobs exist and
+  do nothing anywhere.
+
+A `ChaosUDPProxy` prototype was written during the M4 research and produced the
+2.06-round-trip figure in `docs/benchmarks.md`. **It is not in the tree.**
+
+### 4. Is the §6.4 stream-equality property actually asserted, or is it prose?
+
+**Asserted.** `StreamEqualityTests.streamEqualityUnderChaos(seed:)`, 200 seeded
+scenarios, each a random interleaving of writes, clears, disconnects and
+reconnects. It fails with a reproducible seed. It has caught real bugs.
+
+**But it asserts at the model layer, and that is a narrower claim than §6.4
+makes.** Three limits, in order of how much they matter:
+
+1. **It drives `SessionBuffer` directly.** No framing, no transport, no bytes in
+   flight. Its "disconnect" is `connected = false`. So it proves the *resume
+   decision* is correct, not that the *stack* preserves the byte stream.
+2. **It asserts against a model of the client, not the client.** `ClientModel` in
+   the test file is a second implementation of what `MeshyySession` does. The two
+   can drift, and if they do the property test stays green while the product
+   breaks. That risk did not exist when the test was written — `MeshyySession`
+   came later — and nothing currently pins them together.
+3. **Chunk boundaries are the test's own.** Real PTY reads split where the kernel
+   decides and real QUIC streams deliver where the network decides; neither is
+   modelled.
+
+The nine transport-level resume tests do cover the stack, but each is a single
+hand-written scenario, not a property over a randomised space.
+
+---
+
+## Full inventory by suite
+
+| Suite | Functions | Cases | Needs a real process/socket | What it covers |
+|---|---|---|---|---|
+| `CBORTests` | 17 | 44 | no | RFC 8949 subset, hostile-input rejection |
+| `AgentActivityTests` | 17 | 22 | no | burst/quiet heuristic, markers, quick-action matching |
+| `PTYTests` | 16 | 17 | **yes** | PTY ownership, termios, signals, controlling tty |
+| `ControlFrameTests` | 14 | 60 | no | frame round trips, golden wire fixtures, version skew |
+| `ScreenScannerTests` | 13 | 18 | no | clear/alt-screen detection, split sequences, anchors |
+| `MeshyyKitSuite` (QUIC + session) | 13 | 13 | **yes** | QUIC transport, bootstrap, tokens, client resume |
+| `LocalSocketTests` | 11 | 11 | **yes** | socket transport, resume, ordering, permissions |
+| `AgentNotifierTests` | 11 | 11 | no | notification gating, rate limit, templates |
+| `StreamEqualityTests` | 9 | 208 | no | **§6.4 property test** + named resume cases |
+| `QuickActionResolutionTests` | 2 | 2 | no | local-only action resolution |
+| `VersionTests` | 2 | 2 | no | protocol identity |
+| surface smoke | 2 | 2 | no | version accessors |
+
+40 of 127 functions need a real process or socket and are gated on
+`MESHYY_INTEGRATION_TESTS=1` — so **CI does not run them**
+(`docs/qa/known-debt.md`). That interacts badly with this brief: the transport-level
+resume tests are exactly the ones CI skips.
+
+## Backpressure (PR 1d)
+
+Checked separately because the brief calls it out. **Nothing tests it.**
+
+There is reason to think the design is right — `PTYSession.drain()` reads to EAGAIN
+into the ring buffer and never awaits a network write, and the subscriber streams
+are `.unbounded` — but "reads plausibly" is not "was measured with 50 MB and a
+disconnected client". No test disconnects a client and keeps producing.
+
+## Has any of this ever failed?
+
+Relevant to PR 1e. The §6.4 property test **has** gone red on real defects during
+development, and the transport tests found seven bugs including two ordering faults
+that could scramble input. So these are not tests nobody has seen fail.
+
+But that is history, not a demonstration. There is no *recorded* mutation showing
+the property test catching a deliberately introduced off-by-one, which is what 1e
+asks for.
+
+---
+
+## What this means for the plan
+
+The brief's stated assumption — "mostly happy-path unit tests", §6.4 "currently
+prose in a design doc" — is **wrong in one direction and right in another**, and
+the difference changes PR 1.
+
+**Wrong:** §6.4 is asserted, over 200 seeded scenarios, and resume is the
+best-covered area in the project. PR 1c as written would rebuild something that
+exists.
+
+**Right, and it is the part that matters:** the assertion stops at the model layer.
+Nothing injects impairment, nothing survives an abrupt loss, and `MeshyyChaos` is
+shaped like coverage without being it.
+
+So the useful version of PR 1 is narrower and deeper than the brief assumes:
+
+1. **Lift the existing property test up a layer** rather than writing a new one.
+   Keep `streamEqualityUnderChaos` as the fast model-level check, and add a
+   transport-level variant that drives the same randomised scenarios through a real
+   socket or QUIC connection with impairment.
+2. **Delete `ClientModel` or pin it to `MeshyySession`.** Two implementations of
+   the client's offset arithmetic, with the tested one not being the shipped one,
+   is the sharpest hazard this audit found and it is not on the brief's list.
+3. **Land `ChaosUDPProxy`** — 1b is genuinely missing and is the blocker for
+   everything else. Also either wire `MeshyyChaos` into a test or drop the unused
+   dependency, because a manifest that implies coverage is worse than none.
+4. **1d and 1e as written.** Both are real gaps; neither exists in any form.
+
+The one thing I would add that the brief does not mention: **the abrupt-loss case
+matters more than loss injection.** Every existing disconnect is graceful, and
+production is never graceful. A hard kill with bytes in flight mid-control-frame is
+a single scenario that tests the framing resync path, and it is closer to what
+users actually hit than a 5% loss rate is.
+
+**Stopping here as instructed.** No code changed.
