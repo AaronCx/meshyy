@@ -38,6 +38,19 @@ public enum ControlFrame: Sendable, Equatable {
     case welcome(Welcome)
     case resize(cols: Int, rows: Int)
     case ack(ptyID: Int, offset: UInt64)
+    /// Liveness probe (M4 4b). The client sends `ping`, the daemon echoes the nonce
+    /// back as `pong`.
+    ///
+    /// A round trip on the control stream is the only thing that proves the path is
+    /// still two-way. Measured in 1d-bis: after a NAT rebind the client's transport
+    /// reports `.connected` while nothing at all is arriving, so "my sends succeed"
+    /// is not evidence of anything.
+    ///
+    /// The nonce exists so a late pong cannot satisfy a later ping — without it, one
+    /// straggler arriving after two missed probes would reset the miss count and the
+    /// deadline would never fire.
+    case ping(nonce: UInt64)
+    case pong(nonce: UInt64)
     case termios(TermiosState)
     case screenMode(alt: Bool)
     case agentEvent(kind: AgentEventKind, agentID: String?, detail: String?)
@@ -141,6 +154,8 @@ public enum ControlFrame: Sendable, Equatable {
         case .welcome: "welcome"
         case .resize: "resize"
         case .ack: "ack"
+        case .ping: "ping"
+        case .pong: "pong"
         case .termios: "termios"
         case .screenMode: "screen"
         case .agentEvent: "agent"
@@ -190,6 +205,8 @@ extension ControlFrame {
         case .ack(let ptyID, let offset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("off"), .unsigned(offset)))
+        case .ping(let nonce), .pong(let nonce):
+            pairs.append((.text("n"), .unsigned(nonce)))
         case .termios(let state):
             pairs.append((.text("echo"), .bool(state.echo)))
             pairs.append((.text("icanon"), .bool(state.icanon)))
@@ -307,6 +324,10 @@ extension ControlFrame {
             return .resize(cols: try requiredInt("cols"), rows: try requiredInt("rows"))
         case "ack":
             return .ack(ptyID: try requiredInt("pty"), offset: try requiredOffset("off"))
+        case "ping":
+            return .ping(nonce: try requiredOffset("n"))
+        case "pong":
+            return .pong(nonce: try requiredOffset("n"))
         case "termios":
             return .termios(TermiosState(
                 echo: try requiredBool("echo"),
