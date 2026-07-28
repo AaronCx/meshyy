@@ -70,7 +70,15 @@ private final class EventLog: @unchecked Sendable {
         lock.withLock { events.append(event) }
     }
 
-    func wait(timeout: TimeInterval = 8, until predicate: @Sendable @escaping () -> Bool) async -> Bool {
+    /// Generous on purpose.
+    ///
+    /// These helpers return as soon as the predicate holds, so a large ceiling costs
+    /// nothing when things work — it only changes how long a genuine failure takes to
+    /// report. A tight ceiling, by contrast, turns a slow CI runner into a red build:
+    /// every one of these waits is on a real shell echoing through a real PTY, and a
+    /// loaded two-core runner is several times slower than this Mac. Two different
+    /// tests failed on two consecutive CI runs for exactly this reason.
+    func wait(timeout: TimeInterval = 30, until predicate: @Sendable @escaping () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if predicate() { return true }

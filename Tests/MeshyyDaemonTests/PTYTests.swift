@@ -16,7 +16,7 @@ import Testing
 private func readUntil(
     _ pty: PTY,
     marker: String,
-    timeout: TimeInterval = 5
+    timeout: TimeInterval = 30
 ) throws -> (found: Bool, output: String) {
     var accumulated = [UInt8]()
     let deadline = Date().addingTimeInterval(timeout)

@@ -64,9 +64,16 @@ private final class TestClient {
         }
     }
 
-    /// Pumps until `predicate` is satisfied or the deadline passes.
+    /// Generous on purpose.
+///
+/// These helpers return as soon as the predicate holds, so a large ceiling costs
+/// nothing when things work — it only changes how long a genuine failure takes to
+/// report. A tight ceiling, by contrast, turns a slow CI runner into a red build:
+/// every one of these waits is on a real shell echoing through a real PTY, and a
+/// loaded two-core runner is several times slower than this Mac. Two different
+/// tests failed on two consecutive CI runs for exactly this reason.
     @discardableResult
-    func pump(timeout: TimeInterval = 5, until predicate: ([FrameEnvelope]) -> Bool) -> Bool {
+    func pump(timeout: TimeInterval = 30, until predicate: ([FrameEnvelope]) -> Bool) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         if predicate(received) { return true }
         var buffer = [UInt8](repeating: 0, count: 65536)
