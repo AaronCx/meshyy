@@ -65,6 +65,16 @@ public actor PTYSession {
     private var lastAgentStatus: AgentActivityMonitor.Status = .none
 
     private var readSource: DispatchSourceRead?
+    /// Fires when the PTY will accept more input, draining `pendingWrite`.
+    private var writeSource: DispatchSourceWrite?
+    /// Input the PTY has not accepted yet.
+    ///
+    /// A PTY's input buffer is a few KiB, so anything larger than that — a paste, a
+    /// here-doc — cannot be handed over in one call. It must be queued rather than
+    /// waited on: waiting would block this actor, which also runs the read loop that
+    /// drains the child's output, so the child would block on stdout and stop
+    /// reading stdin. See `PTY.writeSome`.
+    private var pendingWrite: [UInt8] = []
     private var exitSource: DispatchSourceProcess?
     private var termiosTimer: DispatchSourceTimer?
     private let queue: DispatchQueue
@@ -89,7 +99,8 @@ public actor PTYSession {
         workingDirectory: String? = nil,
         size: TerminalSize = .default,
         bufferCapacity: Int = RingBuffer.defaultCapacity,
-        agentProfiles: [AgentProfile] = []
+        agentProfiles: [AgentProfile] = [],
+        rawMode: Bool = false
     ) throws {
         self.agentMonitor = AgentActivityMonitor(candidates: agentProfiles)
         self.name = name
@@ -102,7 +113,8 @@ public actor PTYSession {
             arguments: arguments,
             environment: environment,
             workingDirectory: workingDirectory,
-            size: size
+            size: size,
+            rawMode: rawMode
         )
         self.lastTermios = pty.termios() ?? .cooked
     }
@@ -129,7 +141,21 @@ public actor PTYSession {
         let source = DispatchSource.makeReadSource(fileDescriptor: pty.masterFD, queue: queue)
         source.setEventHandler { [weak self] in
             guard let self else { return }
-            Task { await self.drain() }
+            // Suspend before hopping to the actor, resume after the drain.
+            //
+            // Without this the source is level-triggered against a fd that is
+            // almost always readable, so it fires continuously and enqueues an
+            // unbounded pile of drain tasks on the actor. Every other actor call —
+            // `send`, `resize`, `attach`, `info` — then starves behind them, and a
+            // session with a busy producer becomes unresponsive rather than merely
+            // busy. Measured with `yes` as the child: 47 s at 251% CPU and no
+            // progress. Bounding bytes per drain was not enough on its own; the
+            // queue depth is the thing that has to be bounded.
+            source.suspend()
+            Task {
+                await self.drain()
+                source.resume()
+            }
         }
         source.resume()
         readSource = source
@@ -221,6 +247,8 @@ public actor PTYSession {
 
         readSource?.cancel()
         readSource = nil
+        writeSource?.cancel()
+        writeSource = nil
         exitSource?.cancel()
         exitSource = nil
         termiosTimer?.cancel()
@@ -229,18 +257,28 @@ public actor PTYSession {
         agentTimer = nil
     }
 
-    /// Reads the master until it would block, then ingests what arrived.
+    /// Most bytes read in one pass before yielding the actor.
     ///
-    /// The fd is non-blocking and the source is level-triggered, so this may be
-    /// entered again before it finishes; the actor serialises those, and draining
-    /// to EAGAIN each time means no wake-up is ever lost.
+    /// **Bounded on purpose.** Draining "until EAGAIN" assumes the producer pauses.
+    /// An unbounded one — `yes`, a runaway build, `cat /dev/urandom` — never does, so
+    /// the loop never exits and this actor never returns: input, resizes, attaches and
+    /// exit handling all starve behind it. The read source is level-triggered, so
+    /// returning early costs nothing; it fires again immediately and other actor work
+    /// gets a turn in between.
+    ///
+    /// Found by the 1d firehose test, which hung until this cap existed.
+    private static let maximumBytesPerDrain = 1 << 20  // 1 MiB
+
+    /// Reads what is available, up to `maximumBytesPerDrain`, then ingests it.
     private func drain() {
         var chunks: [[UInt8]] = []
+        var total = 0
         var reachedEOF = false
-        while true {
+        while total < Self.maximumBytesPerDrain {
             do {
                 guard let chunk = try pty.read() else { reachedEOF = true; break }
                 if chunk.isEmpty { break } // EAGAIN: nothing left for now
+                total += chunk.count
                 chunks.append(chunk)
             } catch {
                 reachedEOF = true
@@ -360,11 +398,62 @@ public actor PTYSession {
         subscribers.removeValue(forKey: token)?.finish()
     }
 
-    /// Forwards keystrokes to the child.
+    /// Forwards keystrokes to the child. Returns immediately, always.
+    ///
+    /// Whatever the PTY will not take right now is queued and flushed from a write
+    /// source. Never blocks: this actor also drains the child's output, and blocking
+    /// here deadlocks the session. See `PTY.writeSome`.
     public func send(_ bytes: [UInt8]) throws {
-        guard exitStatus == nil else { return }
-        try pty.write(bytes)
+        guard exitStatus == nil, !bytes.isEmpty else { return }
+
+        if pendingWrite.isEmpty {
+            let accepted = try pty.writeSome(bytes)
+            if accepted == bytes.count { return }
+            pendingWrite = Array(bytes.dropFirst(accepted))
+        } else {
+            // Append rather than attempt: writing now would reorder this chunk ahead
+            // of what is already queued.
+            pendingWrite += bytes
+        }
+        scheduleWriteFlush()
     }
+
+    /// Arms the write source, if it is not already armed.
+    private func scheduleWriteFlush() {
+        guard writeSource == nil, !pendingWrite.isEmpty else { return }
+        let source = DispatchSource.makeWriteSource(fileDescriptor: pty.masterFD, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            Task { await self.flushPendingWrite() }
+        }
+        source.resume()
+        writeSource = source
+    }
+
+    private func flushPendingWrite() {
+        guard !pendingWrite.isEmpty else {
+            // Disarm: a level-triggered write source on a writable fd fires
+            // continuously and would spin a core for nothing.
+            writeSource?.cancel()
+            writeSource = nil
+            return
+        }
+        do {
+            let accepted = try pty.writeSome(pendingWrite)
+            if accepted > 0 { pendingWrite.removeFirst(accepted) }
+        } catch {
+            // The PTY is gone; there is nobody left to write to.
+            pendingWrite = []
+        }
+        if pendingWrite.isEmpty {
+            writeSource?.cancel()
+            writeSource = nil
+        }
+    }
+
+    /// Bytes accepted from clients but not yet handed to the PTY. Exposed so a
+    /// backpressure test can assert the queue drains rather than grows without bound.
+    public var pendingWriteCount: Int { pendingWrite.count }
 
     public func resize(to newSize: TerminalSize) throws {
         guard exitStatus == nil else { return }
@@ -394,6 +483,9 @@ public actor PTYSession {
     public func close() {
         readSource?.cancel()
         readSource = nil
+        writeSource?.cancel()
+        writeSource = nil
+        pendingWrite = []
         exitSource?.cancel()
         exitSource = nil
         termiosTimer?.cancel()

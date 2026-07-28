@@ -66,6 +66,18 @@ public final class PTY {
     private let slaveFD: Int32
 
     private var closed = false
+    /// True once `waitpid` has reaped the child.
+    ///
+    /// **Load-bearing.** Once a child is reaped its pid is free for the OS to
+    /// reuse, so signalling it afterwards can hit an unrelated process — and
+    /// because `terminate()` signals the process *group* (`kill(-pid, …)`), the
+    /// blast radius is a whole group that has nothing to do with meshyy.
+    ///
+    /// Found by a test run that exited non-zero with every assertion passing: the
+    /// test process was killing itself. It only appeared once sessions used a
+    /// `sh -c 'stty …; exec cat'` child, because that forks an extra process per
+    /// session and churns pids fast enough for reuse to happen inside one run.
+    private var reaped = false
 
     /// Opens a PTY and spawns `executable` on the slave side as a session leader
     /// with the PTY as its controlling terminal.
@@ -79,7 +91,8 @@ public final class PTY {
         arguments: [String],
         environment: [String: String],
         workingDirectory: String? = nil,
-        size: TerminalSize = .default
+        size: TerminalSize = .default,
+        rawMode: Bool = false
     ) throws {
         // O_NOCTTY: the *daemon* must not acquire this as its controlling
         // terminal. Only the child should.
@@ -120,6 +133,22 @@ public final class PTY {
             close(slave)
             close(master)
             throw error
+        }
+
+        // Raw mode, applied before the child exists so there is no window in which
+        // it runs in cooked mode.
+        //
+        // Exists so a session can be a transparent byte pipe — `cat` with no line
+        // discipline in the way. The alternative, `sh -c 'stty raw; exec cat'`, forks
+        // an extra process per session; churning pids that fast turned an unrelated
+        // pid-reuse hazard in `terminate()` into an intermittent crash. One process
+        // per session is worth a few lines here.
+        if rawMode {
+            var settings = Darwin.termios()
+            if tcgetattr(master, &settings) == 0 {
+                cfmakeraw(&settings)
+                tcsetattr(master, TCSANOW, &settings)
+            }
         }
 
         var fileActions: posix_spawn_file_actions_t?
@@ -216,28 +245,32 @@ public final class PTY {
         throw PTYError.openFailed(errno: errno)
     }
 
-    /// Writes keystrokes to the child. Loops until the whole buffer is accepted.
-    public func write(_ bytes: [UInt8]) throws {
-        var offset = 0
-        while offset < bytes.count {
-            let written = bytes[offset...].withUnsafeBytes { pointer in
-                Darwin.write(masterFD, pointer.baseAddress, pointer.count)
-            }
-            if written > 0 {
-                offset += written
-                continue
-            }
-            if errno == EINTR { continue }
-            if errno == EAGAIN {
-                // The master is non-blocking, so a full input buffer means the
-                // child has not read yet. Retrying immediately would spin a core
-                // until it does; a short yield costs nothing on a path that only
-                // ever carries keystrokes and pasted text.
-                usleep(1_000)
-                continue
-            }
-            throw PTYError.openFailed(errno: errno)
+    /// Writes what the PTY will accept right now and returns how much that was.
+    /// **Never blocks and never loops.**
+    ///
+    /// The previous version looped until the whole buffer was accepted, sleeping on
+    /// EAGAIN. That deadlocks, and not subtly: a PTY's input buffer is a few KiB, so
+    /// any larger write — a paste, a here-doc, a `ResumeTooOld` probe — fills it and
+    /// waits for the child to drain. But the caller is the session actor, and the
+    /// same actor runs the read loop that drains the child's *output*. So the child
+    /// blocks writing stdout, therefore stops reading stdin, therefore the write
+    /// never completes. The session hangs permanently at 100% CPU.
+    ///
+    /// Measured: a 12 KiB write against a 512-byte ring buffer span 52 s at 159% CPU
+    /// and never finished. No test wrote more than a few hundred bytes at a time
+    /// before, which is why it stayed hidden.
+    ///
+    /// Callers must therefore handle a partial write — `PTYSession` queues the
+    /// remainder and flushes it from a write source.
+    @discardableResult
+    public func writeSome(_ bytes: [UInt8]) throws -> Int {
+        guard !bytes.isEmpty else { return 0 }
+        let written = bytes.withUnsafeBytes { pointer in
+            Darwin.write(masterFD, pointer.baseAddress, pointer.count)
         }
+        if written >= 0 { return written }
+        if errno == EAGAIN || errno == EINTR { return 0 }
+        throw PTYError.openFailed(errno: errno)
     }
 
     // MARK: - Size and line discipline
@@ -292,9 +325,14 @@ public final class PTY {
     public var hasChildExited: Bool { !isChildAlive }
 
     /// Reaps the child if it has exited, returning its exit status.
+    ///
+    /// Records the reap, because from this point the pid must never be signalled
+    /// again — see `reaped`.
     public func reap() -> Int32? {
+        guard !reaped else { return nil }
         var status: Int32 = 0
         guard waitpid(childPID, &status, WNOHANG) == childPID else { return nil }
+        reaped = true
         return status
     }
 
@@ -310,23 +348,31 @@ public final class PTY {
         guard !closed else { return }
         closed = true
 
-        kill(-childPID, SIGHUP)
+        // Signal ONLY while the pid is still ours. Once reaped, the kernel may have
+        // handed that pid to someone else, and `kill(-pid, …)` would take out an
+        // unrelated process group. Skipping the signal is safe: a reaped child is
+        // already gone, and anything it spawned was orphaned when it died.
+        if !reaped {
+            kill(-childPID, SIGHUP)
 
-        // SIGHUP is a request. A process is entitled to ignore it, and some do —
-        // so escalate rather than assume, or `close(session)` becomes a polite
-        // suggestion that leaks processes.
-        let deadline = Date().addingTimeInterval(gracePeriod.timeInterval)
-        while Date() < deadline {
-            if kill(-childPID, 0) != 0 && errno == ESRCH { break }
-            usleep(10_000)
-        }
-        if kill(-childPID, 0) == 0 {
-            kill(-childPID, SIGKILL)
-        }
+            // SIGHUP is a request. A process is entitled to ignore it, and some do —
+            // so escalate rather than assume, or `close(session)` becomes a polite
+            // suggestion that leaks processes.
+            let deadline = Date().addingTimeInterval(gracePeriod.timeInterval)
+            while Date() < deadline {
+                if kill(-childPID, 0) != 0 && errno == ESRCH { break }
+                usleep(10_000)
+            }
+            // Re-check `reaped`: the process source may have reaped concurrently
+            // while this loop was sleeping.
+            if !reaped, kill(-childPID, 0) == 0 {
+                kill(-childPID, SIGKILL)
+            }
 
-        // Reap so the child does not sit as a zombie for the daemon's lifetime.
-        var status: Int32 = 0
-        waitpid(childPID, &status, WNOHANG)
+            // Reap so the child does not sit as a zombie for the daemon's lifetime.
+            var status: Int32 = 0
+            if waitpid(childPID, &status, WNOHANG) == childPID { reaped = true }
+        }
 
         close(slaveFD)
         close(masterFD)

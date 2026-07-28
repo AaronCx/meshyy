@@ -28,23 +28,34 @@ final class TestDaemonHarness: @unchecked Sendable {
     private let socketServer: LocalSocketServer
     private let directory: String
 
-    init(bufferCapacity: Int = RingBuffer.defaultCapacity) throws {
+    /// `bytePipe` gives a session whose child echoes exactly what it is sent — the
+    /// right instrument when the subject is the transport. `shell` is only for tests
+    /// whose subject IS a shell. See `DaemonConfig.deterministicEcho`.
+    enum Child { case bytePipe, shell }
+
+    init(bufferCapacity: Int = RingBuffer.defaultCapacity, child: Child = .bytePipe) throws {
         // sockaddr_un.sun_path is 104 bytes on Darwin, so the path is short by
         // construction rather than by luck.
         let token = UUID().uuidString.prefix(8).lowercased()
         directory = "/tmp/meshyy-q-\(token)"
         socketPath = directory + "/d.sock"
 
-        var config = DaemonConfig()
-        config.shell = "/bin/sh"
-        // Non-login: rc files would make output vary per machine.
-        config.shellArguments = []
-        config.environment = [
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "TERM": "xterm-256color",
-            "HOME": NSHomeDirectory(),
-        ]
-        config.bufferCapacity = bufferCapacity
+        var config: DaemonConfig
+        switch child {
+        case .bytePipe:
+            config = DaemonConfig.deterministicEcho(bufferCapacity: bufferCapacity)
+        case .shell:
+            config = DaemonConfig()
+            config.shell = "/bin/sh"
+            // Non-login: rc files would make output vary per machine.
+            config.shellArguments = []
+            config.environment = [
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "TERM": "xterm-256color",
+                "HOME": NSHomeDirectory(),
+            ]
+            config.bufferCapacity = bufferCapacity
+        }
 
         store = SessionStore(config: config)
         tokens = TokenActor()
@@ -137,11 +148,11 @@ enum IntegrationSupport {
     /// Set by `make test`, unset in CI. Same gate and same reasoning as
     /// `RealProcessTests` in the daemon test target — see the long note there, and
     /// docs/qa/known-debt.md.
-    static var isRequested: Bool {
-        ProcessInfo.processInfo.environment["MESHYY_INTEGRATION_TESTS"] == "1"
-    }
-
-    static let isAvailable: Bool = isRequested && probe()
+    /// UNGATED as of 1b-zero — see `RealProcessTests` in the daemon test target for
+    /// the reasoning. The capability probe stays: it is bounded, and an environment
+    /// that genuinely cannot create an identity should skip with a reason rather than
+    /// hang.
+    static let isAvailable: Bool = probe()
 
     private static func probe() -> Bool {
         let finished = DispatchSemaphore(value: 0)
@@ -193,9 +204,10 @@ struct MeshyyKitSuite {}
 /// classic shape of a test-hygiene bug being mistaken for a product bug.
 func withHarness<T>(
     bufferCapacity: Int = RingBuffer.defaultCapacity,
+    child: TestDaemonHarness.Child = .bytePipe,
     _ body: (TestDaemonHarness) async throws -> T
 ) async throws -> T {
-    let daemon = try TestDaemonHarness(bufferCapacity: bufferCapacity)
+    let daemon = try TestDaemonHarness(bufferCapacity: bufferCapacity, child: child)
     do {
         let result = try await body(daemon)
         await daemon.shutdown()

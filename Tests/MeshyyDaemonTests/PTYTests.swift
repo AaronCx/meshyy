@@ -11,6 +11,22 @@ import Testing
 @testable import MeshyyCore
 @testable import MeshyyDaemon
 
+/// Writes every byte, looping on a partial write.
+///
+/// Deliberately here and not on `PTY`: looping until a PTY accepts everything is
+/// exactly the deadlock `PTY.writeSome` exists to prevent, because the session actor
+/// that would call it also drains the child's output. These tests drive a PTY
+/// directly with a handful of bytes and no actor, so the loop is safe *here* and
+/// nowhere else.
+private func writeAll(_ pty: PTY, _ bytes: [UInt8]) throws {
+    var offset = 0
+    while offset < bytes.count {
+        let accepted = try pty.writeSome(Array(bytes[offset...]))
+        if accepted == 0 { usleep(1_000) }
+        offset += accepted
+    }
+}
+
 /// Reads from a PTY until `marker` appears or the deadline passes.
 /// Returns everything read, so a failure message can show what did arrive.
 private func readUntil(
@@ -83,7 +99,7 @@ struct PTYTests {
     func interactiveRoundTrip() throws {
         let pty = try makeShell()
         defer { pty.terminate() }
-        try pty.write(Array(markerCommand("MESHYY_ROUNDTRIP").utf8))
+        try writeAll(pty, Array(markerCommand("MESHYY_ROUNDTRIP").utf8))
         let (found, output) = try readUntil(pty, marker: "MESHYY_ROUNDTRIP")
         #expect(found, "got \(output.debugDescription)")
     }
@@ -213,7 +229,7 @@ struct PTYTests {
         defer { pty.terminate() }
         // `tty` prints the controlling terminal, or "not a tty" if there is none.
         // Without POSIX_SPAWN_SETSID plus the addopen trick, this fails.
-        try pty.write(Array("tty\n".utf8))
+        try writeAll(pty, Array("tty\n".utf8))
         let (found, output) = try readUntil(pty, marker: "/dev/ttys")
         #expect(found, "child has no controlling terminal; got \(output.debugDescription)")
         #expect(!output.contains("not a tty"))
@@ -232,7 +248,7 @@ struct PTYTests {
     func initialSizeIsVisible() throws {
         let pty = try makeShell(size: TerminalSize(cols: 133, rows: 47))
         defer { pty.terminate() }
-        try pty.write(Array("stty size\n".utf8))
+        try writeAll(pty, Array("stty size\n".utf8))
         let (found, output) = try readUntil(pty, marker: "47 133")
         #expect(found, "expected '47 133'; got \(output.debugDescription)")
     }
@@ -241,11 +257,11 @@ struct PTYTests {
     func resizeIsVisible() throws {
         let pty = try makeShell(size: TerminalSize(cols: 80, rows: 24))
         defer { pty.terminate() }
-        try pty.write(Array(markerCommand("MESHYY_READY").utf8))
+        try writeAll(pty, Array(markerCommand("MESHYY_READY").utf8))
         _ = try readUntil(pty, marker: "MESHYY_READY")
 
         try pty.resize(to: TerminalSize(cols: 100, rows: 30))
-        try pty.write(Array("stty size\n".utf8))
+        try writeAll(pty, Array("stty size\n".utf8))
         let (found, output) = try readUntil(pty, marker: "30 100")
         #expect(found, "expected '30 100'; got \(output.debugDescription)")
     }

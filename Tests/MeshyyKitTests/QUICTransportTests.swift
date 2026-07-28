@@ -24,6 +24,11 @@ private final class FrameSink: @unchecked Sendable {
         return frames
     }
 
+    /// Raw PTY bytes, for byte-exact assertions.
+    var ptyBytes: [UInt8] {
+        all.filter { $0.kind == .pty }.flatMap(\.payload)
+    }
+
     var ptyText: String {
         String(decoding: all.filter { $0.kind == .pty }.flatMap(\.payload), as: UTF8.self)
     }
@@ -60,6 +65,14 @@ private final class FrameSink: @unchecked Sendable {
     }
 }
 
+/// Deterministic printable-ASCII payload; printable only, because a PTY eats
+/// flow-control and signal characters even under `stty raw`.
+private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
+    let printable = Array(0x20...0x7E)
+    return (0..<count).map { UInt8(printable[($0 * 7 + Int(seed) * 31) % printable.count]) }
+}
+
+
 private func markerCommand(_ marker: String) -> [UInt8] {
     // Split so the command's own echo cannot satisfy an assertion about output.
     let midpoint = marker.index(marker.startIndex, offsetBy: marker.count / 2)
@@ -76,7 +89,7 @@ extension MeshyyKitSuite {
 
         @Test("The bootstrap handshake is well-formed and carries a usable pin")
         func bootstrapShape() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 let response = try daemon.bootstrap(session: "boot")
                 #expect(response.port == daemon.quicPort)
@@ -91,7 +104,7 @@ extension MeshyyKitSuite {
 
         @Test("Two bootstraps of the same session give different tokens but one session id")
         func tokensAreFreshPerBootstrap() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 let first = try daemon.bootstrap(session: "same")
                 let second = try daemon.bootstrap(session: "same")
@@ -107,7 +120,7 @@ extension MeshyyKitSuite {
         /// and it resizes.
         @Test("A shell over QUIC renders, accepts input, and resizes")
         func sessionOverQUIC() async throws {
-            try await withHarness() { daemon in
+            try await withHarness(child: .shell) { daemon in
 
                 let response = try daemon.bootstrap(session: "live")
                 let sink = FrameSink()
@@ -161,7 +174,7 @@ extension MeshyyKitSuite {
 
         @Test("A wrong certificate fingerprint is refused with an actionable error")
         func wrongPinIsRefused() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 let response = try daemon.bootstrap(session: "pin")
                 let connection = MeshyyConnection(
@@ -187,7 +200,7 @@ extension MeshyyKitSuite {
 
         @Test("A token is single-use: the second connection with it is refused")
         func tokenIsSingleUse() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 let response = try daemon.bootstrap(session: "once")
 
@@ -224,7 +237,7 @@ extension MeshyyKitSuite {
 
         @Test("A fabricated token is refused")
         func fabricatedTokenIsRefused() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 let response = try daemon.bootstrap(session: "forge")
                 let connection = MeshyyConnection(bootstrap: response, sshHost: "127.0.0.1")
@@ -246,7 +259,7 @@ extension MeshyyKitSuite {
         /// which session is in scope.
         @Test("Naming a different session in Hello does not escape the token's binding")
         func tokenBindingCannotBeOverridden() async throws {
-            try await withHarness() { daemon in
+            try await withHarness { daemon in
 
                 // Two sessions exist, each with its own id.
                 let mine = try daemon.bootstrap(session: "mine")
@@ -289,62 +302,55 @@ extension MeshyyKitSuite {
         // MARK: - Resume over QUIC (M3's payoff on M2's transport)
 
         @Test("Reconnecting over QUIC with an offset replays byte-exactly")
-        func resumeOverQUIC() async throws {
-            try await withHarness() { daemon in
+    func resumeOverQUIC() async throws {
+        try await withHarness { daemon in
+            let first = try daemon.bootstrap(session: "resume")
+            let firstSink = FrameSink()
+            let firstConnection = MeshyyConnection(bootstrap: first, sshHost: "127.0.0.1")
+            firstConnection.onFrame = { firstSink.append($0) }
+            try await firstConnection.connect()
+            try firstConnection.send(.hello(.init(token: first.token, cols: 80, rows: 24)))
+            #expect(await firstSink.wait { !firstSink.all.isEmpty }, "no Welcome")
+            let handshake = 0
 
-                let first = try daemon.bootstrap(session: "resume")
-                let firstSink = FrameSink()
-                let firstConnection = MeshyyConnection(bootstrap: first, sshHost: "127.0.0.1")
-                firstConnection.onFrame = { firstSink.append($0) }
-                try await firstConnection.connect()
-                try firstConnection.send(.hello(.init(token: first.token, cols: 80, rows: 24)))
-                // A fresh attach replays the buffer, so the shell's prompt arrives without
-                // anything being typed.
-                #expect(await firstSink.wait { !firstSink.ptyText.isEmpty },
-                        "a fresh attach must show the current screen, not a blank one")
+            let before = payload(400, seed: 1)
+            try firstConnection.sendKeystrokes(before)
+            #expect(await firstSink.wait { firstSink.ptyBytes.count >= handshake + before.count })
+            let absoluteOffset = firstSink.ptyBytes.count
 
-                try firstConnection.sendKeystrokes(markerCommand("BEFORE_SUSPEND"))
-                #expect(await firstSink.wait { firstSink.ptyText.contains("BEFORE_SUSPEND") })
-                let consumed = firstSink.all.filter { $0.kind == .pty }.flatMap(\.payload)
+            // iOS suspends: the connection dies without warning.
+            firstConnection.close()
 
-                // iOS suspends: the connection dies without warning.
-                firstConnection.close()
+            let away = payload(300, seed: 2)
+            try await (await daemon.store.session(named: "resume"))?.send(away)
+            try await Task.sleep(for: .milliseconds(400))
 
-                // Output continues while nobody is attached.
-                let session = await daemon.store.session(named: "resume")
-                try await session?.send(markerCommand("WHILE_SUSPENDED"))
-                try await Task.sleep(for: .milliseconds(500))
+            let second = try daemon.bootstrap(session: "resume")
+            #expect(second.sessionID == first.sessionID)
+            let secondSink = FrameSink()
+            let secondConnection = MeshyyConnection(bootstrap: second, sshHost: "127.0.0.1")
+            secondConnection.onFrame = { secondSink.append($0) }
+            try await secondConnection.connect()
+            defer { secondConnection.close() }
 
-                // Foreground: a fresh bootstrap (the SSH channel is cheap) and a resume.
-                let second = try daemon.bootstrap(session: "resume")
-                #expect(second.sessionID == first.sessionID)
-                let secondSink = FrameSink()
-                let secondConnection = MeshyyConnection(bootstrap: second, sshHost: "127.0.0.1")
-                secondConnection.onFrame = { secondSink.append($0) }
-                try await secondConnection.connect()
-                defer { secondConnection.close() }
+            try secondConnection.send(.hello(.init(
+                token: second.token, cols: 80, rows: 24,
+                resumeFrom: UInt64(absoluteOffset)
+            )))
+            #expect(await secondSink.wait { secondSink.ptyBytes.count >= away.count },
+                    "the replay did not contain what happened while suspended")
 
-                try secondConnection.send(.hello(.init(
-                    token: second.token,
-                    cols: 80,
-                    rows: 24,
-                    resumeFrom: UInt64(consumed.count)
-                )))
-
-                #expect(await secondSink.wait { secondSink.ptyText.contains("WHILE_SUSPENDED") },
-                        "the replay must contain what happened while suspended")
-
-                // §6.4: no gaps, no duplicates. A duplicated replay would show the
-                // pre-suspend marker twice across the two clients' streams.
-                let combined = String(decoding: consumed, as: UTF8.self) + secondSink.ptyText
-                let occurrences = combined.components(separatedBy: "BEFORE_SUSPEND").count - 1
-                #expect(occurrences == 1,
-                        "resume duplicated bytes the client already had (\(occurrences) copies)")
-                #expect(!secondSink.controlFrames.contains { frame in
-                    if case .resumeTooOld = frame { return true }
-                    return false
-                }, "the 4MB default should have covered this easily")
-            }
+            // §6.4, exactly: the two clients' post-handshake streams concatenated must
+            // equal what the PTY produced, with no gap and no overlap.
+            let delivered = Array(firstSink.ptyBytes.dropFirst(handshake)) + secondSink.ptyBytes
+            #expect(delivered.count == before.count + away.count,
+                    "expected \(before.count + away.count) bytes, got \(delivered.count)")
+            #expect(delivered == before + away, "the byte stream across the seam is not exact")
+            #expect(!secondSink.controlFrames.contains { frame in
+                if case .resumeTooOld = frame { return true }
+                return false
+            }, "the 4MB default should have covered this easily")
         }
     }
+}
 }

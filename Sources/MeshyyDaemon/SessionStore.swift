@@ -20,6 +20,9 @@ public struct DaemonConfig: Sendable {
     /// profiles and never names one itself, so supporting a new agent is a profile
     /// entry rather than a code change.
     public var agentProfiles: [AgentProfile]
+    /// Put the PTY in raw mode before the child starts, so the session is a
+    /// transparent byte pipe. See `deterministicEcho`.
+    public var rawMode: Bool
 
     public init(
         shell: String = DaemonConfig.defaultShell,
@@ -27,7 +30,8 @@ public struct DaemonConfig: Sendable {
         environment: [String: String] = DaemonConfig.defaultEnvironment,
         bufferCapacity: Int = RingBuffer.defaultCapacity,
         bindAllInterfaces: Bool = false,
-        agentProfiles: [AgentProfile] = DaemonConfig.defaultAgentProfiles
+        agentProfiles: [AgentProfile] = DaemonConfig.defaultAgentProfiles,
+        rawMode: Bool = false
     ) {
         self.shell = shell
         self.shellArguments = shellArguments
@@ -35,6 +39,49 @@ public struct DaemonConfig: Sendable {
         self.bufferCapacity = bufferCapacity
         self.bindAllInterfaces = bindAllInterfaces
         self.agentProfiles = agentProfiles
+        self.rawMode = rawMode
+    }
+
+    /// A session whose child is a pure byte pipe: whatever is written to the PTY
+    /// comes back byte for byte, with no prompt, no echo and no line editing.
+    ///
+    /// `stty raw -echo` then `exec cat`. Intended for tests whose subject is the
+    /// **transport** rather than the shell. An interactive shell is the wrong
+    /// instrument there for two reasons, both of which bit this project:
+    ///
+    ///  * Its timing is not ours. Prompt, readline and job control make "did the
+    ///    bytes arrive" depend on how loaded the machine is, which turned a 13 s
+    ///    local suite into four different CI failures.
+    ///  * Its output is not exact. Assertions had to look for a marker *substring*,
+    ///    and `docs/qa/mutation-log.md` records a duplicating mutant that slipped
+    ///    past a test whose stated job was "no duplicates" because the duplication
+    ///    did not overlap the marker.
+    ///
+    /// With a byte pipe an assertion can be `received == sent`, which is both
+    /// deterministic and strictly stronger.
+    ///
+    /// ONE CONSTRAINT a caller must respect, measured rather than assumed:
+    /// **send printable ASCII only.** Even in raw mode a PTY is not transparent to
+    /// arbitrary bytes — flow-control and signal characters are consumed by the line
+    /// discipline rather than delivered. A first attempt with payloads over 0…250
+    /// returned 312 of 700 bytes, with a `^\` in the stream and a duplicated run.
+    /// Restricting to 0x20…0x7E keeps the pipe exact.
+    public static func deterministicEcho(
+        bufferCapacity: Int = RingBuffer.defaultCapacity
+    ) -> DaemonConfig {
+        DaemonConfig(
+            // `cat` directly — no shell, no `stty`, one process per session. Raw mode
+            // is applied to the PTY before the child starts, so there is no cooked
+            // window and no readiness handshake to wait for.
+            shell: "/bin/cat",
+            shellArguments: [],
+            environment: ["PATH": "/usr/bin:/bin"],
+            bufferCapacity: bufferCapacity,
+            // No agent profiles: the burst/quiet heuristic and quick-action matching
+            // have their own deterministic tests and would only add noise here.
+            agentProfiles: [],
+            rawMode: true
+        )
     }
 
     /// Ships with Claude Code and a generic fallback.
@@ -168,7 +215,8 @@ public actor SessionStore {
             environment: config.environment,
             size: size,
             bufferCapacity: config.bufferCapacity,
-            agentProfiles: config.agentProfiles
+            agentProfiles: config.agentProfiles,
+            rawMode: config.rawMode
         )
         await session.start()
         sessions[name] = session

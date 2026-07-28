@@ -53,55 +53,32 @@ repeated here because they cost an afternoon each and will again:
 And one more: a listener's `newConnectionHandler` and `newConnectionGroupHandler`
 are mutually exclusive. Setting both fails it with `EINVAL`.
 
-## CI does not gate the QUIC or client-session suites — deliberate, and debt
+## ~~CI does not gate the QUIC or client-session suites~~ — RESOLVED (1b-zero)
 
-Removing the keychain made these suites *able* to run on a GitHub runner, and they
-did pass there twice. They also failed there three times, with a **different test
-timing out each run**, while the same suite passed six consecutive times locally in
-13 s. Three attempts to stabilise them on the runner each moved the failure instead
-of removing it: raising the wait ceilings to 30 s, replacing the detached event
-consumer with a caller-task pull (which made CI *hang* — `await iterator.next()`
-has no deadline), and serialising the suites under one parent.
+**Everything runs on merge.** 130 tests, no gate, no env var, ~13 s.
 
-They assert on a real shell echoing through a real PTY over a real QUIC connection.
-That is exactly what makes them worth having, and exactly what a shared two-core
-runner cannot schedule predictably. Loosening the assertions until CI agreed would
-have weakened the tests where their value is.
+The gate existed because those suites were flaky on a shared runner. The cause was
+never the runner: it was **asserting on a real interactive shell**, whose prompt,
+readline and job control made "did the bytes arrive" depend on machine load. Three
+earlier attempts treated the symptom — raising ceilings to 30 s, reordering the event
+consumer (which made CI *hang*), serialising the suites — and each moved the failure
+rather than removing it.
 
-The same proved true of the **local-socket** suite once CI was actually exercising
-everything: "Two clients on the same session both see live output" burned 90 s on a
-runner and passes here in under a second. The boundary is not QUIC — it is
-**anything that spawns a real process or binds a real socket**.
+The fix was to change the instrument. Any test whose subject is the **transport**
+now runs against `DaemonConfig.deterministicEcho`: `cat` on a PTY put in raw mode
+before the child starts, so the session is a transparent byte pipe. A real shell is
+kept only where the subject *is* the shell (`stty size` reaching the kernel, M1's
+"attach gives a working shell").
 
-**So the split is explicit.** CI gates the deterministic suites: the §6.4 property
-test (200 seeded scenarios), CBOR, control frames and golden fixtures, the screen
-scanner, agent activity and quick-action matching, the notifier, DER/X.509, and the
-protocol identity. Everything that needs a real shell, PTY or socket — the PTY
-suite, the local-socket suite, the QUIC transport suite and the client-session suite
-— is gated on `MESHYY_INTEGRATION_TESTS=1`, which `make test` sets.
+That made the assertions **stronger**, not weaker. They compare whole byte arrays
+instead of searching for a marker substring — which matters, because
+`docs/qa/mutation-log.md` records a duplicating defect that slipped past a
+substring-based "no duplicates" check.
 
-**Read a green CI badge accordingly.** It covers the protocol and the resume logic.
-It does not cover the PTY layer, the local socket, the QUIC handshake, the
-bootstrap, the token rules, or the client's resume bookkeeping. Those are covered by
-`make check` before a push — which is why CLAUDE.md says that is not optional.
-
-Worth being clear about what is lost: those suites are where the real bugs were
-found. ENOTTY before the slave is opened, inherited SIG_IGN leaking processes,
-discarded output at child exit, SIGPIPE killing the daemon, unordered writes
-scrambling input, a reset stream discarding its own error frame — none of it was
-reachable without a real process. Losing them as a *gate* is a real cost, not a
-tidy-up.
-
-Ways to close it, best first:
-
-1. **Self-hosted runner** on this Mac. The tests are stable here; the variable is
-   the runner, so change the runner rather than the tests.
-2. **Make the assertions independent of shell timing** — drive a program with
-   deterministic output instead of a shell, and assert on transport-level facts
-   rather than on `stty size` round trips. More work, and it would lose some of
-   what these tests are for.
-3. Accept a retry wrapper on the integration step. Cheapest, and the worst: it
-   trains everyone to re-run red builds.
+`scripts/check-test-coverage.sh` now fails the build if a job narrows the test run,
+if a suite is gated on an environment variable, or if a test target declares a
+dependency nothing imports. All three are ways of looking covered without being
+covered, and meshyy had shipped two of them.
 
 ## Tests are not parallel-safe
 

@@ -11,7 +11,7 @@ export DEVELOPER_DIR
 
 SWIFT := swift
 
-.PHONY: all check build test lint licences privacy headers cleanroom clean bench
+.PHONY: all check build test lint licences privacy headers cleanroom testcoverage clean bench
 
 all: check
 
@@ -21,18 +21,11 @@ check: lint build test
 build:
 	$(SWIFT) build
 
-## Runs EVERYTHING, including the real-shell/PTY/QUIC integration suites.
-## Those are gated on MESHYY_INTEGRATION_TESTS because they are not stable on a
-## shared CI runner; see docs/qa/known-debt.md. `make check` before every push is
-## what actually covers them.
+## Everything. Same set CI runs — there is no longer a gated bucket (1b-zero).
 test:
-	MESHYY_INTEGRATION_TESTS=1 $(SWIFT) test
-
-## What CI runs: the deterministic suites only.
-test-ci:
 	$(SWIFT) test
 
-lint: licences privacy headers cleanroom
+lint: licences privacy headers cleanroom testcoverage
 
 ## Design doc §0.3: fail on any dependency outside the allowlist.
 licences:
@@ -49,6 +42,10 @@ headers:
 ## Design doc §0.1: structural proof no mosh source entered the tree.
 cleanroom:
 	@scripts/check-clean-room.sh
+
+## Every test target runs on merge; no unimported test dependencies.
+testcoverage:
+	@scripts/check-test-coverage.sh
 
 ## Design doc §1 benchmark. Needs an ssh key in authorized_keys; see docs/benchmarks.md.
 bench:

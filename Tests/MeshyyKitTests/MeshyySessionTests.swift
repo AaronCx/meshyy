@@ -104,6 +104,8 @@ private final class EventLog: @unchecked Sendable {
 /// Without this, `printf '%s\n' BEFORE_DROP` makes the marker appear twice — once
 /// echoed, once printed — and a duplicate-detection assertion reads that as a
 /// resume bug.
+/// Splits a marker across printf arguments so a shell's echo of the command cannot
+/// satisfy an assertion about its output. Only needed by the `.shell` tests.
 private func markerCommand(_ marker: String) -> [UInt8] {
     let midpoint = marker.index(marker.startIndex, offsetBy: marker.count / 2)
     let command = "printf '%s%s\\n' '\(marker[marker.startIndex..<midpoint])' "
@@ -111,13 +113,22 @@ private func markerCommand(_ marker: String) -> [UInt8] {
     return Array(command.utf8)
 }
 
+/// Deterministic printable-ASCII payload. Printable only, because even under
+/// `stty raw` a PTY eats flow-control and signal characters — see
+/// `DaemonConfig.deterministicEcho`.
+private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
+    let printable = Array(0x20...0x7E)
+    return (0..<count).map { UInt8(printable[($0 * 7 + Int(seed) * 31) % printable.count]) }
+}
+
+
 extension MeshyyKitSuite {
     @Suite("Client session bookkeeping")
     struct MeshyySessionTests {
 
         @Test("consumedOffset counts exactly the bytes delivered, starting at the replay base")
         func offsetTracksDeliveredBytes() async throws {
-            try await withHarness() { daemon in
+            try await withHarness(child: .shell) { daemon in
 
                 let session = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
                 let log = EventLog()
@@ -140,57 +151,67 @@ extension MeshyyKitSuite {
             }
         }
 
-        /// The M3 payoff, end to end through the real client API.
-        @Test("A reattach after a dropped connection resumes byte-exactly")
-        func reattachResumesExactly() async throws {
-            try await withHarness() { daemon in
+        /// The M3 payoff, end to end through the real client API, asserted byte-exactly.
+    ///
+    /// Substring assertions used to hide real defects here:
+    /// `docs/qa/mutation-log.md` records a duplicating off-by-one in
+    /// `MeshyySession.deliver` that a "no duplicates" marker check missed because the
+    /// duplication did not overlap the marker. Whole-array comparison catches it.
+    @Test("A reattach after a dropped connection resumes byte-exactly")
+    func reattachResumesExactly() async throws {
+        try await withHarness { daemon in
+            let session = MeshyySession()
+            let log = EventLog()
+            await log.attach(to: session)
 
-                let session = MeshyySession()
-                let log = EventLog()
-                await log.attach(to: session)
+            try await session.attach(
+                bootstrap: try daemon.bootstrap(session: "reattach"),
+                sshHost: "127.0.0.1"
+            )
+            #expect(await log.wait { !log.all.isEmpty }, "no Welcome")
+            let handshake = 0
 
-                try await session.attach(
-                    bootstrap: try daemon.bootstrap(session: "reattach"),
-                    sshHost: "127.0.0.1"
-                )
-                try await session.send(markerCommand("BEFORE_DROP"))
-                #expect(await log.wait { log.text.contains("BEFORE_DROP") },
-                        "events: \(log.summary) | text: \(log.text.debugDescription)")
-                let offsetAtDrop = await session.consumedOffset
+            let before = payload(400, seed: 1)
+            try await session.send(before)
+            #expect(await log.wait { log.outputBytes.count >= handshake + before.count },
+                    "byte pipe did not return the first payload")
+            let offsetAtDrop = await session.consumedOffset
 
-                // iOS suspends: the socket dies with no warning and no Bye.
-                await session.detach(reason: "suspended")
+            // iOS suspends: the socket dies with no warning and no Bye.
+            await session.detach(reason: "suspended")
 
-                let daemonSession = await daemon.store.session(named: "reattach")
-                try await daemonSession?.send(markerCommand("WHILE_AWAY"))
-                try await Task.sleep(for: .milliseconds(400))
+            let away = payload(300, seed: 2)
+            try await (await daemon.store.session(named: "reattach"))?.send(away)
+            try await Task.sleep(for: .milliseconds(400))
 
-                // Foreground: fresh bootstrap (tokens are single-use), resume from the
-                // offset the client itself recorded.
-                try await session.attach(
-                    bootstrap: try daemon.bootstrap(session: "reattach"),
-                    sshHost: "127.0.0.1"
-                )
-                #expect(await log.wait { log.text.contains("WHILE_AWAY") },
-                        "the replay must contain what happened while away")
+            // Foreground: fresh bootstrap (tokens are single-use), resume from the
+            // offset the client itself recorded.
+            try await session.attach(
+                bootstrap: try daemon.bootstrap(session: "reattach"),
+                sshHost: "127.0.0.1"
+            )
+            #expect(await log.wait {
+                log.outputBytes.count >= handshake + before.count + away.count
+            }, "the replay did not contain what happened while away")
 
-                // §6.4: no duplicates. The pre-drop marker must appear exactly once across
-                // the whole delivered stream.
-                let occurrences = log.text.components(separatedBy: "BEFORE_DROP").count - 1
-                #expect(occurrences == 1,
-                        "resume duplicated bytes the client already had (\(occurrences) copies)")
-                #expect(log.rebuilds.isEmpty,
-                        "a 4MB buffer should not have needed a rebuild; got \(log.rebuilds)")
-                #expect(await session.consumedOffset > offsetAtDrop)
-            }
+            // §6.4, exactly: everything after the handshake must equal what the PTY
+            // produced, in order, with no gap and no duplicate across the seam.
+            let delivered = Array(log.outputBytes.dropFirst(handshake))
+            #expect(delivered.count == before.count + away.count,
+                    "expected \(before.count + away.count) bytes, delivered \(delivered.count)")
+            #expect(delivered == before + away, "the byte stream across the seam is not exact")
+
+            #expect(log.rebuilds.isEmpty, "a 4MB buffer should not have needed a rebuild")
+            #expect(await session.consumedOffset > offsetAtDrop)
         }
+    }
 
-        /// Design doc §3.5: an overrun must be announced. The client's contract is that
+    /// Design doc §3.5: an overrun must be announced. The client's contract is that
         /// it hears about it as `screenRebuilt`, with the offsets, so a UI can clear.
         @Test("An overrun is surfaced as screenRebuilt with the offsets, not spliced")
         func overrunIsSurfaced() async throws {
             // Small buffer so a modest burst evicts the client's offset.
-            try await withHarness(bufferCapacity: 512) { daemon in
+            try await withHarness(bufferCapacity: 512, child: .shell) { daemon in
 
                 let session = MeshyySession()
                 let log = EventLog()
@@ -239,7 +260,7 @@ extension MeshyyKitSuite {
 
         @Test("Acks are throttled to at most one per interval (design doc §6.2)")
         func acksAreThrottled() async throws {
-            try await withHarness() { daemon in
+            try await withHarness(child: .shell) { daemon in
 
                 let session = MeshyySession()
                 let log = EventLog()
@@ -268,7 +289,7 @@ extension MeshyyKitSuite {
 
         @Test("A first attach resumes from nothing, so the daemon shows the current screen")
         func firstAttachIsFresh() async throws {
-            try await withHarness() { daemon in
+            try await withHarness(child: .shell) { daemon in
 
                 // Give the session output BEFORE any client attaches.
                 let boot = try daemon.bootstrap(session: "pre-existing")
