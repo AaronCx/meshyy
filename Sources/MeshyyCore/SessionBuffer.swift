@@ -53,6 +53,20 @@ public enum ResumeDecision: Sendable, Equatable {
         }
     }
 
+    /// Absolute offset the replayed bytes begin at, which is what the client needs
+    /// to keep its own offset arithmetic exact. Sent as `replayBase`.
+    public var replayBase: UInt64 {
+        switch self {
+        case .replay(let from, _): from
+        case .replayFromAnchor(let anchor, _, _): anchor
+        case .fresh(let from, _): from
+        // Nothing is replayed, so the client restarts from the oldest byte the
+        // daemon can still vouch for.
+        case .mustRedraw(let earliest, _): earliest
+        case .impossible(let latest): latest
+        }
+    }
+
     /// True when the client's byte stream remains exactly equal to the PTY's —
     /// the §6.4 invariant. False means the client must be told the screen was
     /// rebuilt rather than continued.

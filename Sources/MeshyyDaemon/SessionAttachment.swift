@@ -75,6 +75,16 @@ public final class SessionAttachment: @unchecked Sendable {
         /// this is what a reconnect resumes from, and the client is the only thing
         /// that knows it — so the daemon records what it is told, never guesses.
         var ackedOffset: UInt64 = 0
+        /// Keystrokes that arrived before the attach finished.
+        ///
+        /// Attaching is asynchronous — it resolves a token, finds the session and
+        /// reads its state — but a client may send Hello and start typing in the
+        /// same breath, and on a fast local transport those bytes overtake the
+        /// attach. Dropping them looked fine in a test that happened to be slow
+        /// enough and silently ate the first keystrokes after every foreground.
+        var pendingInput: [[UInt8]] = []
+        /// Resize that arrived before the attach finished, for the same reason.
+        var pendingResize: TerminalSize?
     }
 
     private let state = Mutex(State())
@@ -105,7 +115,11 @@ public final class SessionAttachment: @unchecked Sendable {
 
         case .pty:
             let bytes = envelope.payload
-            guard let session = currentSession else { return }
+            guard let session = currentSession else {
+                // Not attached yet: hold the keystrokes rather than dropping them.
+                state.withLock { $0.pendingInput.append(bytes) }
+                return
+            }
             Task { try? await session.send(bytes) }
 
         case .blob:
@@ -121,8 +135,13 @@ public final class SessionAttachment: @unchecked Sendable {
             attach(hello)
 
         case .resize(let cols, let rows):
-            guard let session = currentSession else { return }
             let size = TerminalSize(cols: cols, rows: rows)
+            guard let session = currentSession else {
+                // Only the latest matters — an intermediate size nobody ever drew at
+                // is not worth replaying.
+                state.withLock { $0.pendingResize = size }
+                return
+            }
             Task { try? await session.resize(to: size) }
 
         case .ack(_, let offset):
@@ -249,6 +268,12 @@ public final class SessionAttachment: @unchecked Sendable {
             )))
         }
 
+        // Always state where the replay starts, even when it is empty and even when
+        // it is exactly what the client asked for. A client that has to infer the
+        // base gets it wrong on a fresh or anchored attach, and an offset that is
+        // wrong by a rewind is worse than no offset at all.
+        send(.control(.replayBase(ptyID: 0, offset: decision.replayBase)))
+
         if !decision.bytes.isEmpty {
             for chunk in decision.bytes.chunked(into: FrameEnvelope.maximumPayload) {
                 send(.pty(0, chunk))
@@ -267,6 +292,21 @@ public final class SessionAttachment: @unchecked Sendable {
             }
         }
         state.withLock { $0.pumpTask = pump }
+
+        // Flush anything that arrived while attaching, in order, before any further
+        // input is accepted.
+        let (queuedInput, queuedResize) = state.withLock { current -> ([[UInt8]], TerminalSize?) in
+            let captured = (current.pendingInput, current.pendingResize)
+            current.pendingInput = []
+            current.pendingResize = nil
+            return captured
+        }
+        if let queuedResize {
+            try? await session.resize(to: queuedResize)
+        }
+        for chunk in queuedInput {
+            try? await session.send(chunk)
+        }
     }
 
     // MARK: - Outbound
