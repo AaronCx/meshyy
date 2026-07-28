@@ -14,31 +14,44 @@ import Testing
 @testable import MeshyyKit
 
 /// Collects a session's events for assertions.
-private final class EventLog: @unchecked Sendable {
-    private let lock = NSLock()
+///
+/// Events are pulled on the **caller's** task, not a detached one.
+///
+/// The detached-consumer version of this looked fine and failed on CI: the
+/// assertions read a snapshot that only fills as a background task is scheduled,
+/// so on a loaded two-core runner the test could time out while the session had
+/// long since delivered everything. The symptom was a client offset of 16 against
+/// a daemon offset of 69 — not a transport bug, a test that was measuring its own
+/// scheduler.
+private final class EventLog {
     private var events: [MeshyySessionEvent] = []
+    private var iterator: AsyncStream<MeshyySessionEvent>.AsyncIterator?
 
-    var all: [MeshyySessionEvent] {
-        lock.lock(); defer { lock.unlock() }
-        return events
+    func attach(to session: MeshyySession) async {
+        iterator = await session.events.makeAsyncIterator()
     }
 
+    var all: [MeshyySessionEvent] { events }
+
     var outputBytes: [UInt8] {
-        all.compactMap { if case .output(let bytes) = $0 { return bytes } else { return nil } }
+        events.compactMap { if case .output(let bytes) = $0 { return bytes } else { return nil } }
             .flatMap { $0 }
     }
 
     var text: String { String(decoding: outputBytes, as: UTF8.self) }
 
     var rebuilds: [(UInt64, UInt64)] {
-        all.compactMap {
+        events.compactMap {
             if case .screenRebuilt(let from, let at) = $0 { return (from, at) } else { return nil }
         }
     }
 
-    /// A compact dump for failure messages, so a red test says what it saw.
+    var failures: [String] {
+        events.compactMap { if case .failed(let reason) = $0 { return reason } else { return nil } }
+    }
+
     var summary: String {
-        all.map { event in
+        events.map { event in
             switch event {
             case .output(let bytes): "output(\(bytes.count)B)"
             case .screenRebuilt(let from, let at): "rebuilt(\(from)->\(at))"
@@ -52,37 +65,22 @@ private final class EventLog: @unchecked Sendable {
         }.joined(separator: " ")
     }
 
-    var failures: [String] {
-        all.compactMap { if case .failed(let reason) = $0 { return reason } else { return nil } }
-    }
-
-    func start(_ session: MeshyySession) {
-        Task { [weak self] in
-            for await event in await session.events {
-                // withLock, not lock()/unlock(): Swift 6 forbids the latter from an
-                // async context.
-                self?.append(event)
-            }
-        }
-    }
-
-    private func append(_ event: MeshyySessionEvent) {
-        lock.withLock { events.append(event) }
-    }
-
-    /// Generous on purpose.
+    /// Pulls events until `predicate` holds or the deadline passes.
     ///
-    /// These helpers return as soon as the predicate holds, so a large ceiling costs
-    /// nothing when things work — it only changes how long a genuine failure takes to
-    /// report. A tight ceiling, by contrast, turns a slow CI runner into a red build:
-    /// every one of these waits is on a real shell echoing through a real PTY, and a
-    /// loaded two-core runner is several times slower than this Mac. Two different
-    /// tests failed on two consecutive CI runs for exactly this reason.
-    func wait(timeout: TimeInterval = 30, until predicate: @Sendable @escaping () -> Bool) async -> Bool {
+    /// Generous ceiling on purpose: it returns the moment the predicate holds, so a
+    /// large limit only changes how long a genuine failure takes to report, while a
+    /// tight one turns runner load into a red build.
+    @discardableResult
+    func wait(
+        timeout: TimeInterval = 30,
+        until predicate: () -> Bool
+    ) async -> Bool {
+        if predicate() { return true }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            guard let next = await iterator?.next() else { return predicate() }
+            events.append(next)
             if predicate() { return true }
-            try? await Task.sleep(for: .milliseconds(25))
         }
         return predicate()
     }
@@ -111,7 +109,7 @@ extension MeshyyKitSuite {
 
                 let session = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
                 let log = EventLog()
-                log.start(session)
+                await log.attach(to: session)
 
                 let boot = try daemon.bootstrap(session: "offsets")
                 try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
@@ -137,7 +135,7 @@ extension MeshyyKitSuite {
 
                 let session = MeshyySession()
                 let log = EventLog()
-                log.start(session)
+                await log.attach(to: session)
 
                 try await session.attach(
                     bootstrap: try daemon.bootstrap(session: "reattach"),
@@ -184,7 +182,7 @@ extension MeshyyKitSuite {
 
                 let session = MeshyySession()
                 let log = EventLog()
-                log.start(session)
+                await log.attach(to: session)
 
                 try await session.attach(
                     bootstrap: try daemon.bootstrap(session: "overrun"),
@@ -233,7 +231,7 @@ extension MeshyyKitSuite {
 
                 let session = MeshyySession()
                 let log = EventLog()
-                log.start(session)
+                await log.attach(to: session)
                 try await session.attach(
                     bootstrap: try daemon.bootstrap(session: "acks"),
                     sshHost: "127.0.0.1"
@@ -268,7 +266,7 @@ extension MeshyyKitSuite {
 
                 let session = MeshyySession()
                 let log = EventLog()
-                log.start(session)
+                await log.attach(to: session)
                 try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
 
                 #expect(await log.wait { log.text.contains("ALREADY_HERE") },
