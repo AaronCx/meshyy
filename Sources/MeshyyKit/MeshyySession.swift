@@ -21,6 +21,10 @@ public enum MeshyySessionEvent: Sendable {
     /// surfaced rather than swallowed, because a spliced hole shows up as corrupt
     /// scrollback that nobody can explain later.
     case screenRebuilt(skippedFrom: UInt64, resumedAt: UInt64)
+    /// A reconnect was triggered (M4). Carries the trigger so a diagnostics screen —
+    /// and a bug report — can say *why* the session dropped rather than only that it
+    /// did. §3.5: fail visible.
+    case reconnecting(trigger: String)
     /// Line discipline changed (design doc §7.1). Retained because §7's rewrite
     /// keeps the fact useful even though prediction is gone: a UI can explain why
     /// nothing echoes locally.
@@ -72,6 +76,23 @@ public actor MeshyySession {
     private let clock = ContinuousClock()
     private var size: TerminalSize
 
+    // MARK: - M4 reconnect
+
+    /// How to obtain a fresh bootstrap. Every reconnect needs one: tokens are
+    /// single-use, so a stored bootstrap cannot be replayed.
+    ///
+    /// Supplied by the app because only the app knows how to reach the host —
+    /// running `meshyyd attach --json` over its SSH channel. A library that tried to
+    /// own this would have to own SSH.
+    public typealias BootstrapProvider = @Sendable () async throws -> (BootstrapResponse, String)
+    private var bootstrapProvider: BootstrapProvider?
+    private let reconnects = ReconnectCoordinator()
+    private let pathWatcher = PathWatcher()
+    private var heartbeat = HeartbeatMonitor()
+    private var heartbeatTask: Task<Void, Never>?
+    /// False until the daemon proves it answers pings. See `startHeartbeat`.
+    private var heartbeatConfirmed = false
+
     public init(size: TerminalSize = .default) {
         self.size = size
         let (stream, continuation) = AsyncStream<MeshyySessionEvent>.makeStream(
@@ -87,6 +108,51 @@ public actor MeshyySession {
         )
         self.ingress = frames
         self.ingressContinuation = frameContinuation
+    }
+
+    /// Turns on automatic reconnect (M4).
+    ///
+    /// Opt-in rather than automatic on `attach`, because a caller that has no way to
+    /// mint a fresh bootstrap cannot reconnect at all, and silently doing nothing
+    /// would be worse than never having offered.
+    public func enableAutomaticReconnect(bootstrap provider: @escaping BootstrapProvider) {
+        bootstrapProvider = provider
+        // 4a. The path callback is the trigger, not a failed write.
+        pathWatcher.start { [weak self] change in
+            guard let self else { return }
+            Task { await self.reconnect(because: .pathChanged(change)) }
+        }
+    }
+
+    /// 4c. Call from `willEnterForeground`.
+    ///
+    /// A `public` entry point rather than a `UIApplication` observer inside the
+    /// library: MeshyyKit builds for macOS too, and a library that reaches for UIKit
+    /// cannot. It also keeps the trigger explicit — the app decides what counts as
+    /// coming back, which for a terminal is not always the same as the OS's idea.
+    ///
+    /// This is the most common reconnect in real use and it should be in flight
+    /// before the user's thumb reaches the screen, so it does not wait for a
+    /// keystroke or a failed probe.
+    public func applicationWillEnterForeground() {
+        Task { await reconnect(because: .foreground) }
+    }
+
+    /// Requests a reconnect. Every trigger funnels through here and therefore through
+    /// the coordinator, which is what makes "one in flight" true rather than hoped.
+    public func reconnect(because trigger: ReconnectTrigger) async {
+        guard let provider = bootstrapProvider else { return }
+        emit(.reconnecting(trigger: "\(trigger)"))
+        await reconnects.request(trigger) { [weak self] in
+            guard let self else { return }
+            let (bootstrap, host) = try await provider()
+            try await self.attach(bootstrap: bootstrap, sshHost: host)
+        }
+    }
+
+    /// Reconnect counters, for tests and for a diagnostics screen.
+    public func reconnectCounters() async -> ReconnectCoordinator.Counters {
+        await reconnects.snapshot()
     }
 
     /// Starts the single ordered consumer. Idempotent.
@@ -118,13 +184,21 @@ public actor MeshyySession {
         connection.onFrame = { envelope in continuation.yield(envelope) }
         connection.onState = { [weak self] state in
             guard let self, case .failed(let reason) = state else { return }
-            Task { await self.emit(.failed(reason: reason)) }
+            Task {
+                await self.emit(.failed(reason: reason))
+                // `.failed` now means the transport gave up on a path that went
+                // silent, not that the daemon ended the session — the two were
+                // conflated until 1d-bis measured the difference. A dead path is
+                // exactly what a redial fixes, so this is a trigger.
+                await self.reconnect(because: .transportFailed(reason))
+            }
         }
         self.connection = connection
 
         try await connection.connect()
 
         resetForAttach(resumeFrom: nil)
+        startHeartbeat()
         try connection.send(.hello(.init(
             token: bootstrap.token,
             cols: size.cols,
@@ -200,6 +274,14 @@ public actor MeshyySession {
             }
             return flushed
 
+        case .pong(let nonce):
+            heartbeat.received(nonce: nonce)
+            // The first answer is the proof that this daemon speaks ping at all. Until
+            // one arrives the monitor cannot declare anything dead, or a client talking
+            // to an older daemon would redial every few seconds forever — the classic
+            // way an additive frame stops being additive.
+            heartbeatConfirmed = true
+
         case .resumeTooOld:
             // Already reported through screenRebuilt when the base arrives, which
             // carries the offsets. Nothing to add here.
@@ -229,6 +311,60 @@ public actor MeshyySession {
             break
         }
         return []
+    }
+
+    /// Probes the path once per interval, and asks for a reconnect when enough go
+    /// unanswered (M4 4b).
+    ///
+    /// Restarted on every attach: probes sent down a connection that no longer exists
+    /// can never be answered, and carrying them across would declare the fresh
+    /// connection dead on arrival.
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeat.reset()
+        heartbeatConfirmed = false
+        guard bootstrapProvider != nil else { return }   // nothing to reconnect with
+
+        let interval = heartbeat.interval
+        heartbeatTask = Task { [weak self] in
+            // The FIRST probe goes out immediately, not after one interval.
+            //
+            // Found by the M4 acceptance test, and it was a real hole rather than a
+            // test artefact: `heartbeatConfirmed` gates the whole mechanism on having
+            // seen at least one pong, so if the path died inside the first interval
+            // the confirmation never arrived and the heartbeat stayed disabled for the
+            // life of the session — exactly when it was needed. Probing at once closes
+            // the window: a pong comes back in ~1ms even under a firehose (measured,
+            // see docs/provenance.md), so confirmation is established long before any
+            // realistic failure.
+            // `self` is re-read from the weak capture on EVERY iteration rather than
+            // bound once. Binding it once outside the loop would have the task hold the
+            // session strongly for the loop's life while the session holds the task —
+            // a cycle that leaks a live transport and its PTY.
+            guard let first = self, await first.probeOnce() else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard let session = self, await session.probeOnce() else { return }
+            }
+        }
+    }
+
+    /// One heartbeat tick. Returns false when the loop should stop.
+    private func probeOnce() -> Bool {
+        guard let connection, heartbeatTask?.isCancelled == false else { return false }
+
+        if heartbeat.isDead, heartbeatConfirmed {
+            let misses = heartbeat.missed
+            heartbeat.reset()
+            Task { await self.reconnect(because: .heartbeatLost(misses: misses)) }
+            return false   // the attach that follows starts a fresh loop
+        }
+
+        let nonce = heartbeat.nextPing()
+        // A send failure is itself evidence, but not conclusive: measured in 1d-bis,
+        // sends keep succeeding long after the path is dead. The pong is the evidence.
+        try? connection.send(.ping(nonce: nonce.value))
+        return true
     }
 
     /// Resets the protocol state for a new attach.
@@ -338,6 +474,9 @@ public actor MeshyySession {
 
     /// Ends the session for good and stops the ingress consumer.
     public func shutdown(reason: String = "client shut down") {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        pathWatcher.stop()
         detach(reason: reason)
         ingressContinuation.finish()
         ingressTask?.cancel()

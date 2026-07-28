@@ -311,3 +311,42 @@ likely to notice.
 **Still open.** Every impairment here is synthesised on loopback. Real radio
 transitions, jetsam and backgrounding remain device-only, which is why the rewritten
 M4 requires a physical iPhone for its acceptance.
+
+---
+
+# Addendum, 2026-07-28: after M4
+
+| | before M4 | after |
+|---|---|---|
+| test functions | 149 | **161** |
+| running on merge | 149 | **161** |
+| reconnect triggering | **0** | 11 unit + 1 end-to-end |
+
+`ReconnectTests` is deterministic and needs no network, which is the point: M4's
+acceptance says "exactly one reconnect in flight — **asserted, not observed**", and a
+concurrency rule checked by reading log lines is a test of the logging.
+`ReconnectCoordinator` therefore knows nothing about QUIC, tokens or sessions.
+
+**Mutation-checked before being kept.** Four defects were planted in the coordinator
+and each had to be named by a test:
+
+| mutant | caught by |
+|---|---|
+| single-flight removed (concurrent redials) | the burst test, immediately |
+| stray pong accepted as an answer | the straggler test |
+| a queued trigger silently dropped | the new-information retry test |
+| backoff wait removed entirely | **nothing** — hole found and closed |
+
+The last one is why the battery was worth running. `successResetsBackoff` asserts a
+*fast* path and so cannot tell "the failure count was reset" from "there is no backoff
+at all". `failuresBackOff` asserts the slow path, and kills the mutant.
+
+**The end-to-end acceptance** (`blackHoleRecoversWithoutUserAction`) black-holes a live
+QUIC session in both directions and requires it to come back with no user action and
+the stream intact across the seam. A black hole is the right instrument because it
+announces nothing — no error, no close, no path callback — so only the heartbeat can
+notice it. That test found a real hole in the confirmation gate; see
+docs/provenance.md.
+
+**Still open.** Radio transitions, jetsam and backgrounding are device-only. M4's
+acceptance list is written against a physical iPhone and this does not discharge it.

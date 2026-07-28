@@ -22,6 +22,7 @@
 // that means for a rebind is not something to guess at, so the test records it.
 
 import Foundation
+import Synchronization
 @testable import MeshyyChaos
 import MeshyyCore
 import Testing
@@ -346,6 +347,101 @@ extension MeshyyKitSuite {
             }
         }
 
+        // MARK: - M4 acceptance: the reconnect fires on its own
+
+        /// THE M4 ACCEPTANCE TEST. A path goes silent, and the session comes back
+        /// without the user touching anything — with the §6.4 stream-equality property
+        /// holding across the seam, not just "it looked fine".
+        ///
+        /// The black hole is what makes this an M4 test rather than an M3 one. M3
+        /// proved a session can be resumed when something asks it to. M4's whole job
+        /// is that something asking, and a black hole announces nothing: no error, no
+        /// close, no path callback. Only the heartbeat can notice it.
+        @Test("A black-holed session reconnects on its own, with the stream intact")
+        func blackHoleRecoversWithoutUserAction() async throws {
+            try await withHarness(child: .bytePipe) { daemon in
+                let relay = ChaosUDPProxy(
+                    targetHost: "127.0.0.1", targetPort: daemon.quicPort,
+                    profile: ChaosProfile(seed: 23)
+                )
+                let relayPort = try relay.start()
+                defer { relay.stop() }
+
+                let session = MeshyySession()
+                // Every reconnect needs a fresh bootstrap: tokens are single-use, so a
+                // stored one cannot be replayed. This is the app's job in production —
+                // here it is the test daemon's unix socket.
+                let harness = daemon
+                await session.enableAutomaticReconnect {
+                    var fresh = try harness.bootstrap(session: "m4")
+                    fresh.port = relayPort
+                    return (fresh, "127.0.0.1")
+                }
+
+                var first = try daemon.bootstrap(session: "m4")
+                first.port = relayPort
+                try await session.attach(bootstrap: first, sshHost: "127.0.0.1")
+
+                let delivered = Mutex<[UInt8]>([])
+                let reconnects = Mutex<[String]>([])
+                let events = await session.events
+                let collector = Task {
+                    for await event in events {
+                        switch event {
+                        case .output(let bytes): delivered.withLock { $0 += bytes }
+                        case .reconnecting(let trigger): reconnects.withLock { $0.append(trigger) }
+                        default: break
+                        }
+                    }
+                }
+                defer { collector.cancel() }
+
+                // Get bytes flowing so there is a stream to be equal to.
+                let before = Array("before the silence\n".utf8)
+                try await session.send(before)
+                var deadline = Date().addingTimeInterval(20)
+                while Date() < deadline, !delivered.withLock({ $0 }).contains(before) {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                #expect(delivered.withLock { $0 }.contains(before), "no echo before the black hole")
+
+                // Go deaf. Long enough for the heartbeat (1s x 3) to notice, and with
+                // no error, no close and no path change to help it.
+                relay.blackHole(.both, for: .seconds(4))
+
+                // The recovery must happen with NOTHING further from the user.
+                deadline = Date().addingTimeInterval(45)
+                while Date() < deadline, reconnects.withLock({ $0 }).isEmpty {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                let triggers = reconnects.withLock { $0 }
+                #expect(!triggers.isEmpty,
+                        "the session never noticed it had gone deaf — \(relay.snapshot().summary)")
+
+                // And it works again afterwards, with the stream intact across the seam.
+                let after = Array("after the silence\n".utf8)
+                deadline = Date().addingTimeInterval(45)
+                var echoed = false
+                while Date() < deadline, !echoed {
+                    try? await session.send(after)
+                    try? await Task.sleep(for: .milliseconds(250))
+                    echoed = delivered.withLock { $0 }.contains(after)
+                }
+                #expect(echoed, "the session never recovered — triggers \(triggers), \(relay.snapshot().summary)")
+
+                // §6.4: what arrived is a prefix-preserving stream, not a scramble.
+                let final = delivered.withLock { $0 }
+                let beforeIndex = final.firstRange(of: before)?.lowerBound
+                let afterIndex = final.firstRange(of: after)?.lowerBound
+                #expect(beforeIndex != nil && afterIndex != nil)
+                if let beforeIndex, let afterIndex {
+                    #expect(beforeIndex < afterIndex,
+                            "the reconnect delivered the resumed bytes out of order")
+                }
+                await session.shutdown()
+            }
+        }
+
         // MARK: - NAT rebind: a measurement, not a requirement
 
         /// The relay changes its own source port mid-session, which is exactly what a
@@ -419,23 +515,36 @@ extension MeshyyKitSuite {
                     ports \(portsBefore) -> \(portsAfter), \(relay.snapshot().summary)
                     """)
 
-                // What the CLIENT knows about it is the part M4 has to live with, and it
-                // is worse than a clean failure. Across runs the state was sometimes
-                // `.connected` and sometimes `.closed("the daemon closed the control
-                // stream")` — the difference being whether the daemon happened to give
-                // up within the window. Either way the client's own transport never
-                // reported a network problem: it either believes it is fine, or it is
-                // told second-hand by a peer it can no longer reach.
+                // What the CLIENT knows is the part M4 has to live with, and measuring
+                // it is what exposed the defect this PR fixes.
                 //
-                // So the assertion is the invariant behind both: the client never
-                // detects this itself. A `.failed` state here would mean the transport
-                // has liveness detection, and 4b could lean on it instead of a heartbeat.
-                if case .failed(let reason) = connection.currentState {
+                // BEFORE the fix, a rebind produced `.closed("the daemon closed the
+                // control stream")` — the daemon could not possibly have said that,
+                // both directions being black-holed. `pump` reported a transport
+                // ERROR and a clean peer FIN as the same event. So the client was told
+                // its session had ended, when its network had dropped: the wrong
+                // message to the user, and the wrong recovery, since a session the
+                // peer ended must not be redialled.
+                //
+                // AFTER the fix it reports `.failed(POSIX 60: Operation timed out)` —
+                // the QUIC idle timeout, at ~4.5s. That is a real signal M4 can and
+                // does trigger on. It is also the SLOW path, which is what justifies
+                // 4a and 4b rather than leaning on it: see docs/provenance.md.
+                switch connection.currentState {
+                case .failed:
+                    break   // expected: the idle timeout noticed
+                case .connected:
+                    // Possible if the idle timeout has not yet elapsed inside the
+                    // window. Not a failure — just a slower machine.
+                    break
+                case .closed(let reason):
                     Issue.record("""
-                        FINDING CHANGED: the transport now detects a rebind on its own \
-                        (failed: \(reason)). 4b could use that instead of a heartbeat. \
-                        Re-open the M4 design.
+                        REGRESSION: a dead path is being reported as a peer close again \
+                        (\(reason)). That misattribution drives the wrong recovery and \
+                        tells the user their session ended when their network dropped.
                         """)
+                default:
+                    break
                 }
             }
         }

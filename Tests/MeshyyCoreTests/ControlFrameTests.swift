@@ -39,6 +39,9 @@ struct ControlFrameTests {
         ]),
         .quickActions([]),
         .resumeTooOld(ptyID: 0, earliestOffset: 4096),
+        .ping(nonce: 0),
+        .ping(nonce: .max),
+        .pong(nonce: 0x0123_4567_89AB_CDEF),
         .bye(reason: "client requested"),
         .error(code: 7, message: "token expired"),
     ]
@@ -167,6 +170,10 @@ struct ControlFrameTests {
          "a3617466726573697a6564636f6c73185064726f77731819"),
         ("ack", .ack(ptyID: 0, offset: 4096),
          "a361746361636b6370747900636f6666191000"),
+        // M4 4b. Deliberately tiny: a heartbeat that costs a full MTU would be a
+        // battery decision as well as a latency one.
+        ("ping", .ping(nonce: 7), "a261746470696e67616e07"),
+        ("pong", .pong(nonce: 7), "a2617464706f6e67616e07"),
         ("termios_cooked", .termios(.cooked),
          "a46174677465726d696f73646563686ff5666963616e6f6ef563726177f4"),
         ("termios_raw", .termios(.rawMode),

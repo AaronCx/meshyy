@@ -319,7 +319,25 @@ public final class MeshyyConnection: @unchecked Sendable {
             }
             if isComplete || error != nil {
                 if kind == .control {
-                    self.close(reason: "the daemon closed the control stream")
+                    // These are NOT the same event, and M4 has to tell them apart.
+                    //
+                    // `isComplete` is a clean FIN: the daemon really did end the
+                    // stream, and redialling would resurrect a session its owner
+                    // closed. `error` is the transport giving up — an idle timeout
+                    // after the path went silent — where the daemon said nothing and
+                    // may not even know. That one must redial.
+                    //
+                    // Reporting both as "the daemon closed the control stream" was
+                    // wrong twice over: it drove the wrong recovery, and it told the
+                    // user their session had ended when their network had dropped.
+                    // Measured with the 1d-bis relay, where black-holing BOTH
+                    // directions still produced "the daemon closed the control
+                    // stream" — a message the daemon could not possibly have sent.
+                    if let error {
+                        self.fail(reason: "the connection to the daemon failed: \(error)")
+                    } else {
+                        self.close(reason: "the daemon closed the control stream")
+                    }
                 }
                 return
             }
@@ -363,6 +381,20 @@ public final class MeshyyConnection: @unchecked Sendable {
     }
 
     public func close(reason: String = "client closed the connection") {
+        teardown(to: .closed(reason: reason))
+    }
+
+    /// Tears down and reports `.failed` rather than `.closed`.
+    ///
+    /// The distinction is what M4 dispatches on: `.failed` means the path died and a
+    /// redial is the right answer, `.closed` means the peer or the user ended the
+    /// session and redialling would resurrect it. Design doc §3.5 — fail visible, and
+    /// visibly the *right* failure.
+    func fail(reason: String) {
+        teardown(to: .failed(reason: reason))
+    }
+
+    private func teardown(to end: MeshyyConnectionState) {
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
             self.closed = true
@@ -371,8 +403,8 @@ public final class MeshyyConnection: @unchecked Sendable {
             self.decoders.removeAll()
             self.group?.cancel()
             self.group = nil
-            self.state = .closed(reason: reason)
-            self.onState?(.closed(reason: reason))
+            self.state = end
+            self.onState?(end)
         }
     }
 }

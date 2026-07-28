@@ -392,22 +392,41 @@ confirms M0's finding — Network framework QUIC exposes no migration API — at
 that actually matters, which is whether the implementation tolerates it anyway. It
 does not.
 
-**The part that shapes M4.** What the *client* knows is worse than a clean failure.
-Across runs `currentState` was sometimes `.connected` and sometimes
-`.closed("the daemon closed the control stream")`, the difference being whether the
-daemon happened to give up inside the observation window. The client's own transport
-never reported a network problem in either case: it either believes it is fine, or it
-is told second-hand by a peer it can no longer reach.
+**The part that shapes M4 — corrected the same day, after the fix it prompted.**
 
-So the rewritten M4's premise is now measured rather than assumed —
+The first version of this entry said the client is never told. That was an accurate
+reading of the behaviour and a wrong reading of the cause, and the difference matters
+enough to record rather than quietly edit.
 
-> A NAT rebind looks identical to a dead network from the client side: packets leave,
-> nothing returns.
+What was observed: after a rebind, `currentState` was sometimes `.connected` and
+sometimes `.closed("the daemon closed the control stream")` — a message the daemon
+could not possibly have sent, both directions being black-holed. The conclusion drawn
+was "the transport never detects this."
 
-— and 4b's heartbeat is not one option among several. It is the only mechanism that
-can notice this. The test asserts the invariant behind both observed states (the
-client never detects it itself) rather than either state individually, and records a
-finding if a future OS changes that, since it would re-open the M4 design.
+What was actually happening: `MeshyyConnection.pump` treated `isComplete` (a clean
+peer FIN) and `error != nil` (the transport giving up) as the same event and reported
+both as a peer close. The transport *had* detected it. The client was told the wrong
+thing about it — that its session had ended, when its network had dropped.
+
+That is a defect in two directions at once, which is why it survived: the user gets a
+wrong diagnosis, and M4 gets the wrong recovery, since a session the peer deliberately
+ended must NOT be redialled while a dead path must be. Fixed by splitting the two, with
+`.failed` reserved for the transport giving up. Re-measured after the fix, a rebind now
+reports `.failed(POSIX 60: Operation timed out)` at ~4.5s — the QUIC idle timeout.
+
+**What that means for 4a and 4b.** The idle timeout is a real backstop, so the
+heartbeat is not the only mechanism that can notice a rebind, as this entry first
+claimed. Its value is speed:
+
+| mechanism | detects a silent path in | notes |
+|---|---|---|
+| QUIC idle timeout (existing) | **4.45s measured** | backstop; no cost |
+| heartbeat, 1s × 3 misses (4b) | ~3s | one tiny frame per second |
+| `NWPathMonitor` (4a) | immediate | only for *announced* changes — never fires on a rebind |
+
+4a remains the cheapest signal and covers the common case (WiFi↔LTE). 4b covers the
+case 4a structurally cannot see, and beats the backstop by ~1.5s. Neither is
+redundant, and neither is as dramatic as the first draft of this entry implied.
 
 **Clean-room note.** The relay never inspects a payload. It knows nothing about QUIC
 beyond "these are datagrams", which is what makes it both correct and safe to have
@@ -425,3 +444,52 @@ by — drives `ssh` through the TCP proxy to synthesise RTT. SSH does not run ov
 relay. Deleting the TCP proxy would delete the reproduction of
 `attach: total = 187.4 ms + 8.31 x RTT`, which is the number meshyy is measured
 against. UDP for impairing QUIC, TCP for the SSH baseline it is compared to.
+
+## 2026-07-28 — M4 4b: why 1 second and 3 misses
+
+**Decision.** The heartbeat ships at a 1s interval, declaring the path dead after 3
+unanswered probes — a ~3s detection. The amendment proposed these as a starting point
+and asked for them to be tuned against the chaos harness and the reasoning recorded.
+They survived tuning. Here is what the numbers are actually resting on.
+
+**What it has to beat.** The QUIC idle timeout already notices total silence, measured
+at **4.45s** with the 1d-bis relay black-holing both directions. So the heartbeat is
+not the only mechanism; it is the faster one, by about 1.5s, and it is the only one
+that works when the path is *selectively* dead.
+
+**What could make it fire wrongly.** A false positive costs one redial — ~160ms, plus
+a single-use token. The risk is the daemon being too busy to answer while the path is
+fine, so that was measured directly: probe latency idle, and probe latency while the
+daemon streams a 200,000-line firehose through the same connection.
+
+| condition | probes | missed | median | max |
+|---|---|---|---|---|
+| idle | 12 | 0 | 1.0 ms | 1.1 ms |
+| under a 200k-line firehose | 12 | **0** | 0.1 ms | **2.0 ms** |
+
+Not one probe was late, and the worst case under maximum load was 2 ms — three orders
+of magnitude inside the 1s interval. That is not luck: `SessionAttachment` answers a
+ping ahead of any session state, deliberately, so a probe measures the path rather
+than the daemon's backlog. Without that ordering this table would look completely
+different and the interval would have to be defensive.
+
+**So why 3 misses rather than 2?** Because the margin above is against *daemon*
+latency, not *path* latency. A cellular RTT spike can plausibly eat a single 1s
+window on a path that is alive. Three consecutive misses is three independent losses
+at 1s spacing, which a live path essentially does not produce. 2 misses would save a
+second and spend tokens on bad-but-working networks; the amendment flags concurrent
+redials against one session as security-relevant, and tokens minted and abandoned are
+the same smell. 3 it is.
+
+**A hole this tuning exposed.** `heartbeatConfirmed` gates the whole mechanism on
+having seen at least one pong, so that a client talking to an older daemon that
+ignores `ping` does not redial every three seconds forever. As first written the first
+probe went out one interval *after* attach — so a path that died inside the first
+second never produced the confirming pong, and the heartbeat stayed disabled for the
+life of the session, precisely when it was needed. Found by the M4 acceptance test,
+not by reasoning. The first probe now goes out immediately; at 1 ms round trip the
+confirmation is established long before any realistic failure.
+
+**Sources.** Measurements are this repo's own, via `ChaosUDPProxy` (1d-bis) and the
+`TestDaemonHarness` byte pipe. No external material consulted; nothing here derives
+from any other implementation's design.

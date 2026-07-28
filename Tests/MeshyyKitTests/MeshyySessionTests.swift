@@ -75,6 +75,7 @@ private final class EventLog: @unchecked Sendable {
             case .quickActions(let actions): "qa(\(actions.count))"
             case .ended(let reason): "ended(\(reason))"
             case .failed(let reason): "FAILED(\(reason))"
+            case .reconnecting(let trigger): "reconnecting(\(trigger))"
             }
         }.joined(separator: " ")
     }

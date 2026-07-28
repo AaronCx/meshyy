@@ -159,6 +159,16 @@ public final class SessionAttachment: @unchecked Sendable {
             // re-send bytes it already had and duplicate them on screen.
             state.withLock { $0.ackedOffset = max($0.ackedOffset, offset) }
 
+        case .ping(let nonce):
+            // Answered immediately and unconditionally, ahead of any session state.
+            // A ping that queued behind PTY work would measure the daemon's backlog
+            // rather than the path, and M4 would then redial a healthy session
+            // precisely when it is busiest.
+            //
+            // Echoing the client's nonce rather than minting one is what lets the
+            // client tell a fresh answer from a straggler.
+            send(.control(.pong(nonce: nonce)))
+
         case .bye:
             finish()
 
