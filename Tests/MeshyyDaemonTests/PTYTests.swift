@@ -258,22 +258,52 @@ struct PTYTests {
         #expect(huge.rows == TerminalSize.maximumDimension)
     }
 
-    @Test("read returns nil once the child exits")
-    func endOfFileOnChildExit() throws {
+    /// The requirement is that a short-lived child's output is never lost, not
+    /// that end of file arrives.
+    ///
+    /// The daemon holds a slave descriptor precisely so a child that prints and
+    /// exits in the same breath does not have its output discarded — on Darwin,
+    /// once the last slave closes, a read on the master returns EIO and throws
+    /// away whatever was buffered. This test failed on CI (and passed locally on
+    /// timing) before that fix. See the note on `PTY.slaveFD`.
+    @Test("A child that prints and exits immediately does not lose its output")
+    func shortLivedChildOutputSurvives() throws {
+        for attempt in 1...10 {
+            let pty = try PTY(
+                executable: "/bin/echo",
+                arguments: ["MESHYY_LAST_WORDS"],
+                environment: ["PATH": "/usr/bin:/bin"]
+            )
+            defer { pty.terminate() }
+
+            // Wait for the child to be gone *first*, so the read races exit as
+            // badly as possible — which is what CI does on a slow runner.
+            let exitDeadline = Date().addingTimeInterval(3)
+            while pty.isChildAlive && Date() < exitDeadline { usleep(5_000) }
+
+            let (found, output) = try readUntil(pty, marker: "MESHYY_LAST_WORDS", timeout: 3)
+            #expect(found,
+                    "attempt \(attempt): output was discarded at child exit; got \(output.debugDescription)")
+            if !found { return }
+        }
+    }
+
+    @Test("Child exit is observable through waitpid rather than end of file")
+    func childExitIsObservable() throws {
         let pty = try PTY(
             executable: "/bin/echo",
-            arguments: ["bye"],
+            arguments: ["done"],
             environment: ["PATH": "/usr/bin:/bin"]
         )
         defer { pty.terminate() }
 
-        var sawEOF = false
-        let deadline = Date().addingTimeInterval(10)
+        var exited = false
+        let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
-            guard let chunk = try pty.read() else { sawEOF = true; break }
-            if chunk.isEmpty { usleep(5_000) }
+            if !pty.isChildAlive { exited = true; break }
+            usleep(10_000)
         }
-        #expect(sawEOF, "reading a master whose child has exited must report end of file")
+        #expect(exited, "the child's exit must be visible to waitpid")
     }
 
     @Test("The child's environment is exactly what was passed")

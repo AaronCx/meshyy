@@ -51,6 +51,7 @@ public actor PTYSession {
     private var exitStatus: Int32?
 
     private var readSource: DispatchSourceRead?
+    private var exitSource: DispatchSourceProcess?
     private var termiosTimer: DispatchSourceTimer?
     private let queue: DispatchQueue
 
@@ -117,7 +118,45 @@ public actor PTYSession {
         source.resume()
         readSource = source
 
+        // Child exit arrives from a process source, not from end of file on the
+        // master: the daemon holds a slave descriptor so that a short-lived
+        // child's output is not discarded (see PTY.slaveFD), which means EOF never
+        // comes. waitpid is the better signal regardless — it carries the status.
+        let exits = DispatchSource.makeProcessSource(
+            identifier: pty.childPID,
+            eventMask: .exit,
+            queue: queue
+        )
+        exits.setEventHandler { [weak self] in
+            guard let self else { return }
+            Task { await self.childExited() }
+        }
+        exits.resume()
+        exitSource = exits
+
         scheduleTermiosPoll()
+    }
+
+    /// Drains whatever the child wrote before exiting, then reports the exit.
+    ///
+    /// The drain has to come first. A child that prints and exits in the same
+    /// breath has its output sitting in the tty buffer when the process source
+    /// fires, and reporting the exit before reading it would lose the last thing
+    /// the session ever said.
+    private func childExited() {
+        guard exitStatus == nil else { return }
+        drain()
+
+        let status = pty.reap() ?? 0
+        exitStatus = status
+        emit(.exited(status: status))
+
+        readSource?.cancel()
+        readSource = nil
+        exitSource?.cancel()
+        exitSource = nil
+        termiosTimer?.cancel()
+        termiosTimer = nil
     }
 
     /// Reads the master until it would block, then ingests what arrived.
@@ -191,16 +230,11 @@ public actor PTYSession {
             }
         }
 
+        // EOF on the master should be unreachable while the daemon holds a slave
+        // descriptor, so if it happens the PTY has been torn down under us. Treat
+        // it as exit rather than looping on a dead fd.
         if reachedEOF, exitStatus == nil {
-            // The child closed the last slave fd. Reap it so the status is real
-            // rather than assumed.
-            let status = pty.reap() ?? 0
-            exitStatus = status
-            emit(.exited(status: status))
-            readSource?.cancel()
-            readSource = nil
-            termiosTimer?.cancel()
-            termiosTimer = nil
+            childExited()
         }
     }
 
@@ -283,6 +317,8 @@ public actor PTYSession {
     public func close() {
         readSource?.cancel()
         readSource = nil
+        exitSource?.cancel()
+        exitSource = nil
         termiosTimer?.cancel()
         termiosTimer = nil
         pty.terminate()

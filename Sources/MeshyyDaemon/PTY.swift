@@ -48,6 +48,23 @@ public final class PTY {
     public let childPID: pid_t
     public let slavePath: String
 
+    /// The daemon's own slave descriptor, held for the session's lifetime.
+    ///
+    /// Not an oversight. If the daemon releases it, then when the child exits the
+    /// last slave closes, and on Darwin a read on the master returns EIO and
+    /// **discards whatever was still buffered**. A command that prints and exits
+    /// immediately loses its output — a shell's parting "logout", a script's last
+    /// line, the error message from something that died on startup.
+    ///
+    /// Found by CI: the test for a short-lived child passed locally on timing and
+    /// failed on a slower runner with an empty read.
+    ///
+    /// The cost is that end of file never arrives on the master, so child exit is
+    /// detected with waitpid instead (see `hasChildExited`, and the process source
+    /// in `PTYSession`). That is the right signal anyway: it carries the exit
+    /// status, which EOF does not.
+    private let slaveFD: Int32
+
     private var closed = false
 
     /// Opens a PTY and spawns `executable` on the slave side as a session leader
@@ -85,11 +102,10 @@ public final class PTY {
 
         // On Darwin the master fd rejects every termios and winsize ioctl with
         // ENOTTY until the slave has been opened at least once — measured, not
-        // documented. So the slave is opened here, before the size is set, and
-        // released after the spawn once the child holds its own descriptor.
+        // documented. This is what makes design doc §7.1 work at all: `tcgetattr`
+        // on the master is only meaningful while some slave fd exists.
         //
-        // This is what makes design doc §7.1 work at all: `tcgetattr` on the
-        // master is only meaningful while some slave fd exists.
+        // The descriptor is kept for the session's lifetime; see `slaveFD`.
         let slave = open(slavePath, O_RDWR | O_NOCTTY)
         guard slave >= 0 else {
             close(master)
@@ -168,20 +184,17 @@ public final class PTY {
         // and without it a quiet shell hangs the caller forever.
         _ = fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK)
 
-        // posix_spawn on Darwin reports exec failures, so by the time it returns
-        // successfully the child has run its file actions and exec'd — it holds
-        // its own slave descriptor. Releasing ours now is what makes a read on
-        // the master report end of file when the child later exits; holding it
-        // would keep the tty alive forever and the read would simply block.
-        close(slave)
-
         self.masterFD = master
+        self.slaveFD = slave
         self.childPID = pid
         self.slavePath = slavePath
     }
 
     deinit {
-        if !closed { close(masterFD) }
+        if !closed {
+            close(slaveFD)
+            close(masterFD)
+        }
     }
 
     // MARK: - I/O
@@ -195,8 +208,9 @@ public final class PTY {
         }
         if count > 0 { return Array(buffer[0..<count]) }
         if count == 0 { return nil }
-        // On macOS, reading a master whose child has exited gives EIO rather
-        // than 0. That is end of file, not a fault worth reporting.
+        // EIO means every slave descriptor is gone. While this object holds one
+        // that cannot happen, so reaching here means `terminate()` ran — treat it
+        // as end of file rather than a fault.
         if errno == EIO { return nil }
         if errno == EAGAIN || errno == EINTR { return [] }
         throw PTYError.openFailed(errno: errno)
@@ -266,10 +280,16 @@ public final class PTY {
     // MARK: - Lifetime
 
     /// True while the child is still running.
+    ///
+    /// This, not end of file on the master, is how session exit is detected —
+    /// see the note on `slaveFD`.
     public var isChildAlive: Bool {
         var status: Int32 = 0
         return waitpid(childPID, &status, WNOHANG) == 0
     }
+
+    /// The child's exit status once it has exited, else nil.
+    public var hasChildExited: Bool { !isChildAlive }
 
     /// Reaps the child if it has exited, returning its exit status.
     public func reap() -> Int32? {
@@ -308,6 +328,7 @@ public final class PTY {
         var status: Int32 = 0
         waitpid(childPID, &status, WNOHANG)
 
+        close(slaveFD)
         close(masterFD)
     }
 }
