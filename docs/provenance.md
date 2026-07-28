@@ -338,3 +338,40 @@ macOS 26.4.1.
 
 Consulted: design doc §5.1, §8; docs/spikes/2026-07-27-quic-network-framework.md
 (now annotated as superseded).
+
+---
+
+## 2026-07-28 Integration gate: a+Terminal does NOT speak meshyy yet
+
+Question posed by the revised-milestones amendment, to be answered before M4
+starts: does the shipping a+Terminal target actually speak meshyy today, or was
+M2 accepted against a test harness?
+
+**Answer: harness only.** `AaronCx/a-plus-terminal` contains no reference to
+meshyy anywhere — no source, no manifest entry, no documentation. Its Swift
+package dependencies are Citadel, SwiftTerm and RoyalVNCKit, and the shipping app
+connects over Citadel SSH exactly as it did before meshyy existed.
+
+M2's acceptance — "a session over meshyy is indistinguishable from a session over
+SSH" — was demonstrated against `TestDaemonHarness` and `MeshyyConnection` inside
+meshyy's own test suite: a real daemon, a real QUIC connection, a real PTY, a real
+pinned certificate, but no a+Terminal. That was a fair reading of the milestone as
+written, and it is not what the milestone's wording implies to a later reader.
+`docs/DESIGN.md` §10 M2 should be corrected to say what was actually proven.
+
+**Consequence, per the amendment: integration is now a gate rather than a later
+step.** M4's acceptance criteria are phone-lifecycle criteria — background,
+foreground, radio switch, jetsam — and none of them can be measured anywhere except
+the real app on a real device. Tuning a heartbeat window against a simulator that
+has no radio and no jetsam would produce numbers that mean nothing.
+
+Two further consequences worth stating now rather than discovering in M4:
+
+- The client half of M6 tier 1 also lands in a+Terminal, so the same integration
+  work gates both remaining milestones.
+- a+Terminal's dependency policy is explicit and short (`CLAUDE.md`: SwiftTerm,
+  Citadel, swift-crypto, XcodeGen, RoyalVNCKit — "nothing else"). Adding MeshyyKit
+  is a deliberate amendment to that policy, not a routine dependency bump, and
+  meshyy is currently a **private** repo which SwiftPM must be able to resolve.
+
+Source: direct inspection of `AaronCx/a-plus-terminal` at commit 40e9279.

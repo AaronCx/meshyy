@@ -220,3 +220,49 @@ control frame truncated mid-header by an abrupt disconnect is untested — that 
    `scripts/check-test-coverage.sh` fails the build on a recurrence, on a job that
    narrows the test run, or on a suite gated behind an environment variable.
 4. **Every disconnect graceful** → still true. 1h.
+
+---
+
+# Addendum, 2026-07-28: after 1h
+
+The row that read "resume across abrupt loss | 0 | 0 — still nothing, until 1h"
+is closed.
+
+| | before 1h | after |
+|---|---|---|
+| test functions | 133 | **142** |
+| running on merge | 133 | **142** |
+| gated out of CI | 0 | 0 |
+| resume across abrupt loss | **0** | 9 tests, ~1,600 truncation points |
+| inject impairment | 0 | 0 — still nothing, until 1d-bis |
+
+`Tests/MeshyyKitTests/AbruptLossTests.swift` covers, against the shipping
+`MeshyySession` rather than the reference model:
+
+| case | how |
+|---|---|
+| kill at any byte of a live burst | exhaustive sweep, every offset 0…n |
+| kill at any byte of a replay | exhaustive sweep, every offset 0…n |
+| kill before any replay base exists | sweep across the whole handshake prefix |
+| kill mid-control-frame | every truncation of a `resize`, 1…n-1 |
+| the 200-scenario corpus, abruptly | truncation at a seed-derived offset before **every** reconnect |
+| ack lost in flight | named case |
+| resize lost in flight | named case |
+| pty arriving before its replay base | named case — found by mutation, see below |
+| a queue orphaned by the disconnect | named case — found by mutation, see below |
+
+**Sweeps, not samples.** Off-by-ones live at frame headers, ring-buffer wrap, and
+replay chunk edges; sampling walks past them. Each sweep kills at every byte
+offset in its window rather than at a chosen few.
+
+**What 1h found that was not in its brief.** The mutation battery
+(`docs/qa/mutation-log.md`) showed the pty-before-base queue was uncovered by all
+400 scenario-runs across both execution modes — a real out-of-order race, since
+`pty` and `control` ride separate QUIC streams. Two named tests close it. This is
+the second time a coverage claim in this project was vacuous until a planted
+defect was used to check it, after the privacy gate that silently ate the `//` in
+`https://`.
+
+**Still open.** Nothing here impairs a live connection; every byte is delivered
+by the harness. Loss, reordering, and NAT rebind against a real QUIC session
+remain 1d-bis.
