@@ -134,25 +134,9 @@ final class TestDaemonHarness: @unchecked Sendable {
 /// environment that cannot support these suites SKIPS them with a reason, which is
 /// honest, instead of hanging for the job's timeout, which is not.
 enum IntegrationSupport {
-    /// Set by `make test`. Unset in CI — deliberately, and the reason is worth
-    /// stating rather than hiding behind a flag.
-    ///
-    /// These two suites assert on a REAL shell echoing through a REAL PTY over a
-    /// REAL QUIC connection. That is what makes them worth having, and it is also
-    /// what makes them unsuitable as a gate on a shared two-core runner: across
-    /// several CI runs a different test timed out each time while the same suite
-    /// passed six consecutive times locally in 13s. Three attempts to make them
-    /// robust on the runner (raising ceilings, reordering the event consumer,
-    /// serialising the suites) each moved the failure rather than removing it.
-    ///
-    /// Loosening the assertions until CI agreed would have made the tests weaker
-    /// exactly where the value is. So the honest split is: CI gates the 100+
-    /// deterministic tests — the §6.4 property test, CBOR, frames, the scanner, the
-    /// notifier, the PTY suite, the local-socket suite — and these two are a local
-    /// pre-merge gate via `make check`.
-    ///
-    /// This is recorded as debt in docs/qa/known-debt.md with the ways to close it,
-    /// not as a decision anyone should be comfortable with.
+    /// Set by `make test`, unset in CI. Same gate and same reasoning as
+    /// `RealProcessTests` in the daemon test target — see the long note there, and
+    /// docs/qa/known-debt.md.
     static var isRequested: Bool {
         ProcessInfo.processInfo.environment["MESHYY_INTEGRATION_TESTS"] == "1"
     }

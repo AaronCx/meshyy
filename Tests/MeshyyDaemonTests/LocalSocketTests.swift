@@ -148,7 +148,8 @@ private func markerCommand(_ marker: String) -> [UInt8] {
     return Array(command.utf8)
 }
 
-@Suite("Local socket transport", .serialized)
+@Suite("Local socket transport", .serialized,
+       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
 struct LocalSocketTests {
 
     @Test("The socket and its directory are private (design doc §8)")

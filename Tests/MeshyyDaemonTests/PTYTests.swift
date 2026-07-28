@@ -63,7 +63,8 @@ private func markerCommand(_ marker: String) -> String {
         + "'\(marker[midpoint...])'\n"
 }
 
-@Suite("PTY", .serialized)
+@Suite("PTY", .serialized,
+       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
 struct PTYTests {
 
     @Test("A spawned command's output arrives on the master")

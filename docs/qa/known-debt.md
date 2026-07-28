@@ -68,15 +68,29 @@ That is exactly what makes them worth having, and exactly what a shared two-core
 runner cannot schedule predictably. Loosening the assertions until CI agreed would
 have weakened the tests where their value is.
 
-**So the split is explicit.** CI gates the 100+ deterministic tests: the §6.4
-property test (200 seeded scenarios), CBOR, control frames and golden fixtures, the
-screen scanner, agent activity, the notifier, the PTY suite, and the local-socket
-suite. The QUIC transport and client-session suites are gated on
-`MESHYY_INTEGRATION_TESTS=1`, which `make test` sets — so `make check` before a push
-covers them, and CI does not.
+The same proved true of the **local-socket** suite once CI was actually exercising
+everything: "Two clients on the same session both see live output" burned 90 s on a
+runner and passes here in under a second. The boundary is not QUIC — it is
+**anything that spawns a real process or binds a real socket**.
 
-**Read a green CI badge accordingly.** It does not cover the QUIC handshake, the
-bootstrap, the token rules, or the client's resume bookkeeping.
+**So the split is explicit.** CI gates the deterministic suites: the §6.4 property
+test (200 seeded scenarios), CBOR, control frames and golden fixtures, the screen
+scanner, agent activity and quick-action matching, the notifier, DER/X.509, and the
+protocol identity. Everything that needs a real shell, PTY or socket — the PTY
+suite, the local-socket suite, the QUIC transport suite and the client-session suite
+— is gated on `MESHYY_INTEGRATION_TESTS=1`, which `make test` sets.
+
+**Read a green CI badge accordingly.** It covers the protocol and the resume logic.
+It does not cover the PTY layer, the local socket, the QUIC handshake, the
+bootstrap, the token rules, or the client's resume bookkeeping. Those are covered by
+`make check` before a push — which is why CLAUDE.md says that is not optional.
+
+Worth being clear about what is lost: those suites are where the real bugs were
+found. ENOTTY before the slave is opened, inherited SIG_IGN leaking processes,
+discarded output at child exit, SIGPIPE killing the daemon, unordered writes
+scrambling input, a reset stream discarding its own error frame — none of it was
+reachable without a real process. Losing them as a *gate* is a real cost, not a
+tidy-up.
 
 Ways to close it, best first:
 
