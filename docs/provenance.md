@@ -493,3 +493,58 @@ confirmation is established long before any realistic failure.
 **Sources.** Measurements are this repo's own, via `ChaosUDPProxy` (1d-bis) and the
 `TestDaemonHarness` byte pipe. No external material consulted; nothing here derives
 from any other implementation's design.
+
+## 2026-07-28 — M6 tier 1: a fixed palette, and where the gate lives
+
+**Decision.** Tier 1 is eight fixed keystrokes — y, n, Enter, Esc, 1, 2, 3, Ctrl-C —
+offered whenever the agent is waiting, with no screen parsing of any kind. Tier 2
+(labelled actions from declared prompt patterns) is **not** built.
+
+**Source.** The milestone amendment, which is explicit that tier 2 must not come
+first: "Screen-scraping an alt-screen TUI to extract options is exactly the kind of
+work that feels tractable, demos well once, and then breaks silently on the next
+upstream release." The `matches` machinery for tier 2 already exists on
+`QuickActionDefinition` and nothing in tier 1 uses it.
+
+**Why these eight, and why that is not agent knowledge.** They are terminal
+universals — the keystrokes a user would type at any prompt in any program of the last
+forty years. Nothing encodes what an agent asks or how it phrases it, which is the
+acceptance criterion "no agent name and no prompt string is hardcoded anywhere in
+Swift". `paletteIsAgentAgnostic` asserts that construction rather than trusting it: it
+requires every action to be a single byte (a multi-byte send would be a canned phrase,
+which is a prompt string by another name), to carry no match rules, and to have no
+prose label.
+
+Ordered by expected frequency, not keyboard layout: y and n first, because answering a
+permission prompt is the interaction this feature exists for and a phone row is
+scanned left to right. Ctrl-C last and separable — it is the only one that interrupts
+rather than answers, and a mis-tap costs the agent's work.
+
+Enter sends **CR (0x0D), not LF**. A PTY in canonical mode expects carriage return
+from the terminal and translates it; LF submits nothing in some programs and a stray
+blank line in others.
+
+**Where the gate lives, and why not in the UI.** "Actions are unavailable when status
+is not `waiting`. No stray sends." is enforced in `MeshyySession`, not by hiding a
+button. A hidden button is not a guarantee: a stale view, a tap queued behind a status
+change, or a keyboard shortcut all reach the API with the button gone from the screen.
+A tap that arrives late must fail rather than land in the middle of whatever the agent
+went on to do. Profile-declared actions carry the same gate — they are no less a
+one-tap send into a live PTY.
+
+A reattach clears the status. One from before a disconnect is a guess, since the agent
+may have finished while the client was away, and the failure directions are not
+symmetric: a missing button costs a keyboard tap, a stale one sends a keystroke into a
+running agent.
+
+**Checked by mutation.** Removing the gate from the tier-1 path, offering the palette
+regardless of status, and letting a stale status survive a reattach were each planted
+and each named by a test before the tests were kept.
+
+**Not built, deliberately.** Actionable ntfy notifications (a lock-screen "Approve"
+reaching the daemon over the tailnet) are technically within reach and are **not** in
+this milestone. The amendment's own read is the right one: the daemon is §8's most
+security-sensitive component, and this would add an inbound HTTP surface that executes
+input into a live PTY. It needs a per-session capability token, tailnet-only binding,
+and a fixed keystroke allowlist — its own separately-reviewed milestone, not a clause
+inside M6.

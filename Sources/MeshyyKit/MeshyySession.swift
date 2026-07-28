@@ -93,6 +93,26 @@ public actor MeshyySession {
     /// False until the daemon proves it answers pings. See `startHeartbeat`.
     private var heartbeatConfirmed = false
 
+    // MARK: - M6 quick actions
+
+    /// Last status the daemon reported. `nil` means it has said nothing yet, which is
+    /// not the same as `.idle` — one is "no agent here", the other is "we do not know".
+    /// Actions are refused in both, but only one of them is worth telling a user about.
+    private var agentStatus: AgentEventKind?
+
+    /// The tier-1 palette, offered only while the agent is waiting (M6).
+    ///
+    /// Empty at every other moment, which is the acceptance criterion "actions are
+    /// unavailable when status is not `waiting`. No stray sends." A client can bind a
+    /// row of buttons straight to this and get the gating for free rather than
+    /// reimplementing it, which is the whole reason it lives here and not in the app.
+    public var availableQuickActions: [QuickActionDefinition] {
+        agentStatus == .waiting ? QuickActionPalette.tier1 : []
+    }
+
+    /// Whether the agent is waiting on a human right now.
+    public var isAwaitingInput: Bool { agentStatus == .waiting }
+
     public init(size: TerminalSize = .default) {
         self.size = size
         let (stream, continuation) = AsyncStream<MeshyySessionEvent>.makeStream(
@@ -294,6 +314,10 @@ public actor MeshyySession {
             emit(.screenMode(alt: alt))
 
         case .agentEvent(let kind, let agentID, let detail):
+            // Retained, not merely forwarded: the quick-action gate below is defined
+            // against the CURRENT status, and a client that only passes the event on
+            // has no way to answer "is this tap allowed right now".
+            agentStatus = kind
             emit(.agent(kind: kind, agentID: agentID, detail: detail))
 
         case .quickActions(let actions):
@@ -372,6 +396,12 @@ public actor MeshyySession {
     /// Called by `attach` and by the conformance harness, so the harness exercises
     /// the same reset the shipping path does rather than a test-only imitation.
     func resetForAttach(resumeFrom: UInt64?) {
+        // The agent may have finished while the client was away, so a status from
+        // before the disconnect is a guess. Clearing it means the palette is hidden
+        // until the daemon says otherwise, which is the safe direction: a missing
+        // button costs a keyboard tap, a stale one sends a keystroke into a running
+        // agent.
+        agentStatus = nil
         baseEstablished = false
         pendingOutput.removeAll()
         if let resumeFrom { consumedOffset = resumeFrom }
@@ -441,11 +471,18 @@ public actor MeshyySession {
         guard let definition = definitions.first(where: { $0.id == id }) else {
             throw QuickActionError.unknownAction(id: id)
         }
+        // Same gate as the tier-1 path. A profile-declared action is no less a
+        // one-tap send into a live PTY.
+        guard agentStatus == .waiting else {
+            throw QuickActionError.notAwaitingInput(status: agentStatus?.rawValue ?? "unknown")
+        }
         try send(definition.sends)
     }
 
     public enum QuickActionError: Error, Equatable, CustomStringConvertible {
         case unknownAction(id: String)
+        /// The agent is not waiting, so nothing may be sent on its behalf.
+        case notAwaitingInput(status: String)
 
         public var description: String {
             switch self {
@@ -453,6 +490,11 @@ public actor MeshyySession {
                 "meshyy: no local definition for quick action \(id.debugDescription). "
                     + "Actions are resolved from local profiles, never from the wire, "
                     + "so an id this client does not know is refused rather than guessed."
+            case .notAwaitingInput(let status):
+                "meshyy: refused a quick action while the agent is \(status). A one-tap "
+                    + "send is only ever an answer to a question that was asked; firing "
+                    + "one at a working agent injects a keystroke into whatever it is "
+                    + "doing."
             }
         }
     }
@@ -463,6 +505,23 @@ public actor MeshyySession {
     /// be handed bytes that came off the wire.
     public func performQuickAction(sending bytes: [UInt8]) throws {
         try send(bytes)
+    }
+
+    /// Performs one of the fixed tier-1 actions (M6).
+    ///
+    /// Gated on the agent actually waiting. The gate is here rather than in the UI
+    /// because "the button was hidden" is not a guarantee: a stale view, a queued tap
+    /// delivered after the status moved, or a keyboard shortcut all reach this method
+    /// with the button gone from the screen. A tap that arrives late must fail, not
+    /// land in the middle of whatever the agent went on to do.
+    public func performTier1Action(id: String) throws {
+        guard let definition = QuickActionPalette.tier1.first(where: { $0.id == id }) else {
+            throw QuickActionError.unknownAction(id: id)
+        }
+        guard agentStatus == .waiting else {
+            throw QuickActionError.notAwaitingInput(status: agentStatus?.rawValue ?? "unknown")
+        }
+        try send(definition.sends)
     }
 
     public func detach(reason: String = "client detached") {
