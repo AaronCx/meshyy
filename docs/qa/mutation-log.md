@@ -102,3 +102,62 @@ scenarios either reconnect too early or resume inside a window where a one-byte
 drift still lands on the same replay. That is the honest number, and it is worth
 knowing: a single scenario would have been a coin flip, which is the argument for
 keeping all 200 rather than sampling.
+
+---
+
+## 2026-07-28 — 1h: re-scored against abrupt disconnects
+
+The milestone amendment asks for this directly: the 137-of-200 above was earned
+entirely on graceful closes, so it says nothing about the disconnect users
+actually get. The same corpus now runs a second way, with every reconnect
+preceded by a truncation at a seed-derived byte offset — a link that stopped
+mid-frame rather than one that said goodbye.
+
+Four mutants, each scored as the number of the 200 seeds that turn red:
+
+| mutant | graceful corpus | abrupt corpus |
+|---|---|---|
+| A `consumedOffset += count + 1` (offset runs ahead, loses bytes) | 137 | **189** |
+| B `consumedOffset += count - 1` (offset lags, duplicates bytes) | 165 | **189** |
+| C queued bytes dropped when the base arrives | **0** | **0** |
+| D queue survives a reattach instead of being cleared | **0** | 2 |
+
+**A moved 137 → 189, and that is the headline.** Truncation puts the resume
+offset on a boundary that is not a frame boundary, so a one-byte drift changes
+what the daemon replays far more often than it does on a clean seam. The 11
+seeds that still survive reconnect too early for any drift to have accumulated.
+
+**C survived both, and that is the finding worth more than the score.** PTY bytes
+that arrive before the replay base are queued and flushed when it lands. Emptying
+that queue at flush time — losing the first burst of the reconnect — was invisible
+to 400 scenario-runs across both modes. `pty` and `control` ride separate QUIC
+streams and QUIC orders bytes only *within* a stream, so the out-of-order arrival
+is a real race, not a hypothetical: rare, load-dependent, and presenting as the
+shell having said nothing. D, the mirror defect, was caught by 2 seeds, which is
+close enough to luck to count as uncovered.
+
+Neither is a defect in the shipping code. Both are defects the shipping tests
+could not have seen. `ptyBeforeBaseIsQueuedNotLost` and
+`staleQueueDoesNotSurviveReattach` in `AbruptLossTests` close them, and each was
+confirmed to name its mutant before being kept:
+
+```
+C: RED -> "PTY bytes arriving before the replay base are queued, then delivered"
+D: RED -> "A queue orphaned by an abrupt disconnect does not survive the reattach"
+```
+
+**On the harness's own first draft.** The amendment states the property
+directionally — never resume past what was delivered — and this file asserted
+exactly that to begin with. It failed 113 times against correct code, because
+there *is* a licensed skip: on eviction the daemon states a higher replay base and
+the client emits `screenRebuilt` carrying the range. The bytes are gone, but the
+user is told. The invariant that holds is an equality over a balanced account:
+
+```
+consumedOffset == bytes delivered to the renderer + bytes reported as skipped
+```
+
+Stronger in both directions than the inequality, which would have waved through
+every defect that makes the offset read *low* — mutant B among them.
+
+Reverted after each run; `git diff` clean; full suite green at 142 tests.
