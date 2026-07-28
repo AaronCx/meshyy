@@ -206,3 +206,135 @@ as a black box; design doc §5.3, §6.3, §7, §10, §11, §13.
 
 Decided by: Aaron, on being shown the measurement — "the answer was never
 per-keystroke prediction."
+
+---
+
+## 2026-07-27 QUIC 0-RTT is unreachable; §6.1 and M4 corrected
+
+Decision: meshyy does not use QUIC 0-RTT, and the design doc no longer claims it.
+§6.1's "first byte in roughly one round trip instead of five or six" is replaced
+by the measured "about 2 round trips to the server, 2.7 to output back, with no
+process spawn". M4's acceptance criterion is rewritten accordingly and split into
+a transport measurement and a device-only roaming test.
+
+Rationale: measured, not assumed. Network framework exposes no path — public or
+private — that puts application bytes in QUIC's first flight.
+`sec_protocol_options_set_tls_resumption_enabled` is inert for QUIC.
+`NWParameters.allowFastOpen` with an `.idempotent` send is accepted and then never
+sends early. The only symbol that engages resumption at all,
+`sec_protocol_options_set_tls_early_data_enabled`, is SPI and worth ~13 ms of CPU
+— a fraction of a round trip. Using SPI in a launchd daemon on a
+privacy-branded product is not a trade worth making for that.
+
+The win survives the correction: 2 round trips against SSH's measured 8.3
+(docs/benchmarks.md) plus a shell and multiplexer start. It comes from QUIC
+combining the transport and crypto handshakes and from resuming an already-running
+session, not from 0-RTT.
+
+A second correction fell out of the same review, and it is the more useful one:
+§6.1 implied the *screen* costs a round trip to restore. It does not. iOS suspends
+rather than kills, so the emulator still holds the frame and first paint on
+foreground is free. What costs round trips is the session going live again. That
+distinction matters because it is the difference between a latency the user sees
+and one they do not — and it means the perceived-latency work is already done.
+
+Deliberately NOT taken: persisting session content on the client so a jetsammed
+app could repaint without the network. That is the only case where first paint
+genuinely costs a round trip, and fixing it means writing terminal scrollback to
+disk. §9 is emphatic about session content, and while it constrains the daemon
+rather than the app, extending it is Aaron's call rather than an implementation
+detail. Recorded as an open question instead.
+
+Source: empirical probe of the macOS 26.4.1 SDK and runtime; SDK header inspection
+for the sec_protocol_options and NWProtocolQUIC surfaces.
+
+Consulted: RFC 9001 §4.6 (0-RTT), Apple Network framework and Security framework
+headers, design doc §6.1, §10 M4, §12.1.
+
+---
+
+## 2026-07-27 Network framework QUIC does not migrate; §12.1 answered "no"
+
+Decision: §6.1 no longer claims connection migration works in the foreground, and
+§12.1 is answered "no" rather than "foreground only". M4's roaming acceptance is
+respecified as reconnect-and-resume with a 300 ms budget instead of "no visible
+interruption via migration".
+
+Rationale: measured. A peer address change silently black-holes a Network
+framework QUIC connection until the idle timeout fires, in either direction, and
+`NWConnectionGroup` exposes no path, viability, or better-path signal to notice it
+with. `nw_quic_migration_info_*` is entirely SPI, so even where migration does
+happen it is unobservable from public API — which means a test could never assert
+migration was the mechanism, only that the session survived.
+
+Two code changes follow directly, and both are the kind of thing that only shows
+up when someone measures rather than reads:
+
+- The client's idle timeout drops from the 30 s default to 5 s. Since migration
+  does not happen, the idle timeout is the *only* thing that tells a client its
+  session has gone deaf — and at 30 s the group keeps reporting `.ready` while the
+  user stares at a dead terminal.
+- QUIC keepalive is enabled at 2 s via `NWProtocolQUIC.Metadata.keepAlive`, which
+  is only reachable per-connection and only once a connection is up. This is what
+  makes a 5 s idle timeout safe rather than trigger-happy: without it a quiet but
+  healthy session would be reaped. Note the getter always reports `.off` whatever
+  was set, so there is no assertion to write — the effect was verified on the wire
+  by the probe, and the code says so rather than pretending a unit test covers it.
+
+Deliberately NOT taken: §12.1's own stated fallback of moving to TCP+TLS. QUIC
+still earns its place on §5.2 multiplexing and a combined transport+crypto
+handshake, and TCP+TLS does not migrate either — so the fallback would cost the
+benefits and fix nothing.
+
+Contradiction noted: the migration probe referred in passing to "0-RTT resume" as
+though it were available. It is not — see the 0-RTT entry above, which comes from
+a probe that tested it directly. The specific measurement wins over the passing
+mention.
+
+Source: empirical probe on macOS 26.4.1 with a userspace UDP relay rotating the
+server-facing 4-tuple; SDK interface inspection of NWProtocolQUIC.Metadata.
+
+Consulted: RFC 9000 §9 (connection migration); Apple Network framework interfaces;
+design doc §6.1, §10 M4, §12.1.
+
+---
+
+## 2026-07-27 SecIdentityCreate: no keychain, and a latent hang avoided
+
+Decision: `DaemonIdentity` obtains its `SecIdentity` from
+`SecIdentityCreate(nil, certificate, privateKey)` and touches no keychain. The key
+is generated transient (`kSecAttrIsPermanent: false`) and persisted as a raw P-256
+representation in a 0600 file beside the certificate DER.
+
+This **supersedes** the M0 spike's conclusion that a dedicated file keychain was
+the only working route. That conclusion rested on an assumption I did not check —
+that `SecIdentityCreate` was private SPI. It is not: it is in
+`Security.framework/Headers/SecIdentity.h`, `API_AVAILABLE(macos(10.12))`, and not
+deprecated.
+
+Three things the mistake would have cost, and only the first was known at the time:
+
+1. Deprecated API (`SecKeychainCreate` et al, deprecated since 10.10) carried for
+   no reason.
+2. **A latent hang after every update.** Keys in a file keychain are ACL-bound to
+   the binary that created them. meshyyd would have loaded its own key happily
+   until the next time it was rebuilt, and then blocked on a Security prompt no
+   headless process can answer. A failure that appears only after an update, in a
+   launchd agent, is close to the worst shape a bug can have.
+3. **No CI coverage.** A file keychain needs a Security session, which a GitHub
+   runner lacks, so the QUIC integration suites skipped there. Removing the
+   keychain removes the gate.
+
+Verified rather than assumed: two separate `meshyyd` processes over the same
+directory report an identical certificate fingerprint, and the stored files are
+0600 in a 0700 directory.
+
+The lesson worth keeping is not about Security framework. It is that "this API is
+private" was an assumption that felt like knowledge, and it went unchecked through
+a whole spike and into shipping code. The header was one grep away.
+
+Source: `Security.framework/Headers/SecIdentity.h`; empirical verification on
+macOS 26.4.1.
+
+Consulted: design doc §5.1, §8; docs/spikes/2026-07-27-quic-network-framework.md
+(now annotated as superseded).

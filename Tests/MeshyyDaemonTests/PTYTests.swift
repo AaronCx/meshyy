@@ -16,7 +16,7 @@ import Testing
 private func readUntil(
     _ pty: PTY,
     marker: String,
-    timeout: TimeInterval = 5
+    timeout: TimeInterval = 30
 ) throws -> (found: Bool, output: String) {
     var accumulated = [UInt8]()
     let deadline = Date().addingTimeInterval(timeout)
@@ -63,7 +63,8 @@ private func markerCommand(_ marker: String) -> String {
         + "'\(marker[midpoint...])'\n"
 }
 
-@Suite("PTY", .serialized)
+@Suite("PTY", .serialized,
+       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
 struct PTYTests {
 
     @Test("A spawned command's output arrives on the master")

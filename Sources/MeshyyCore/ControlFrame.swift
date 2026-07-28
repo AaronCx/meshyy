@@ -41,11 +41,32 @@ public enum ControlFrame: Sendable, Equatable {
     case termios(TermiosState)
     case screenMode(alt: Bool)
     case agentEvent(kind: AgentEventKind, agentID: String?, detail: String?)
+    /// The absolute offset the bytes that follow begin at.
+    ///
+    /// Always sent immediately before a replay, on every attach. Without it a
+    /// client cannot do its own offset arithmetic in the `fresh` and
+    /// `replayFromAnchor` cases: it knows how many bytes it received but not where
+    /// they started, so its next `Ack` — and therefore its next resume — would be
+    /// wrong by however much the daemon chose to rewind.
+    ///
+    /// Deliberately separate from `resumeTooOld`: that frame is the *warning* that
+    /// a gap occurred, this one is the *arithmetic*. Overloading one to mean both
+    /// made the fresh-attach case unrepresentable.
+    case replayBase(ptyID: Int, offset: UInt64)
     /// The actions currently answerable in one tap (design doc §7.3). An empty
     /// list withdraws a previous offer — sent on a full clear, an alt-screen
     /// transition, or when the matched prompt leaves the output tail.
     case quickActions([QuickAction])
     case resumeTooOld(ptyID: Int, earliestOffset: UInt64)
+    /// Asks the daemon for a session and a single-use token (design doc §5.1
+    /// step 2). Local transport only — over QUIC the handshake has already
+    /// happened, and answering this there would let a connection mint itself a
+    /// fresh token, defeating single use.
+    case bootstrapRequest(session: String)
+    /// The §5.1 handshake, as the JSON the client parses. Carried as an opaque
+    /// string rather than re-modelled so the bytes the client sees are exactly the
+    /// bytes the daemon produced.
+    case bootstrapResponse(json: String)
     case bye(reason: String)
     case error(code: Int, message: String)
     /// A frame this build does not know. Design doc §5.3: ignore it, but keep it
@@ -124,6 +145,9 @@ public enum ControlFrame: Sendable, Equatable {
         case .screenMode: "screen"
         case .agentEvent: "agent"
         case .quickActions: "qa"
+        case .replayBase: "base"
+        case .bootstrapRequest: "boot"
+        case .bootstrapResponse: "booted"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
         case .error: "error"
@@ -176,6 +200,9 @@ extension ControlFrame {
             pairs.append((.text("kind"), .text(kind.rawValue)))
             if let agentID { pairs.append((.text("aid"), .text(agentID))) }
             if let detail { pairs.append((.text("detail"), .text(detail))) }
+        case .replayBase(let ptyID, let offset):
+            pairs.append((.text("pty"), .int(ptyID)))
+            pairs.append((.text("off"), .unsigned(offset)))
         case .quickActions(let actions):
             pairs.append((.text("actions"), .array(actions.map { action in
                 .map([(.text("id"), .text(action.id)), (.text("label"), .text(action.label))])
@@ -183,6 +210,10 @@ extension ControlFrame {
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
+        case .bootstrapRequest(let session):
+            pairs.append((.text("sess"), .text(session)))
+        case .bootstrapResponse(let json):
+            pairs.append((.text("json"), .text(json)))
         case .bye(let reason):
             pairs.append((.text("reason"), .text(reason)))
         case .error(let code, let message):
@@ -296,6 +327,8 @@ extension ControlFrame {
                 agentID: item["aid"]?.stringValue,
                 detail: item["detail"]?.stringValue
             )
+        case "base":
+            return .replayBase(ptyID: try requiredInt("pty"), offset: try requiredOffset("off"))
         case "qa":
             // A malformed entry drops that action rather than the whole frame: a
             // partly-understood offer is still safe, because every field a client
@@ -312,6 +345,10 @@ extension ControlFrame {
                 ptyID: try requiredInt("pty"),
                 earliestOffset: try requiredOffset("earliest")
             )
+        case "boot":
+            return .bootstrapRequest(session: try requiredText("sess"))
+        case "booted":
+            return .bootstrapResponse(json: try requiredText("json"))
         case "bye":
             return .bye(reason: item["reason"]?.stringValue ?? "")
         case "error":

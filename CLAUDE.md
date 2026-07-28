@@ -30,16 +30,22 @@ Reading how it works is not.
   which makes this easy to get wrong — `swift test` is the one that breaks.)
 - Platforms: macOS 26+, iOS 26+. `meshyyd` and the `meshyy` CLI are macOS only;
   `MeshyyCore` and `MeshyyKit` build for both.
-- `make check` runs everything CI runs. Do this before every push.
+- `make check` runs MORE than CI does. Do it before every push — see below.
 
 ## CI-gated commands (pre-flight these locally)
 
 ```
-make lint      # licence allowlist + privacy grep + MIT header check
+make lint      # licence allowlist + privacy grep + MIT header + clean-room check
 make build     # swift build
-make test      # swift test
-make check     # all three
+make test      # EVERYTHING, incl. the real-shell/PTY/QUIC integration suites
+make test-ci   # what CI runs: deterministic suites only
+make check     # lint + build + test
 ```
+
+**`make check` before every push is not optional here.** CI does not gate the QUIC
+transport or client-session suites — they are not stable on a shared runner, so they
+are gated on `MESHYY_INTEGRATION_TESTS=1`, which only `make test` sets. A green CI
+badge does not cover them. See docs/qa/known-debt.md.
 
 Baseline: all green, zero known-flaky tests. If something is red, it is a real
 regression — do not push past it.

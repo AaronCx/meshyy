@@ -223,16 +223,62 @@ This is the core of the project. Get it right before anything else.
 
 ### 6.1 The honest constraint
 
-iOS suspension kills the connection. Nothing prevents that. QUIC connection
-migration handles WiFi to LTE **while the app is in the foreground**. It does
-not survive suspension.
+iOS suspension kills the connection. Nothing prevents that.
+
+**Corrected 2026-07-27: Network framework QUIC does not do connection migration
+at all.** This section originally said migration "handles WiFi to LTE while the
+app is in the foreground". Measured: a peer address change silently black-holes
+the connection until the idle timeout fires, and the multiplex-group API exposes
+no path, viability, or better-path signal to notice it with. §12.1's question is
+answered **no**, not "foreground only".
+
+Two consequences, both acted on:
+
+- The idle timeout is the *only* signal that a session has gone deaf, so the
+  client sets it to 5 s rather than leaving the 30 s default — at the default a
+  user stares at a dead terminal for half a minute while the group still reports
+  `.ready`.
+- QUIC keepalive is enabled (2 s) on the client, which is what makes an idle
+  timeout that short safe: without it a quiet-but-healthy session would be
+  mistaken for a dead one.
+
+Do **not** take §12.1's stated fallback of moving to TCP+TLS. QUIC is still the
+right transport for §5.2's multiplexing and for a handshake that combines
+transport and crypto. Only the migration assumption dies.
 
 So meshyy reconnects every time the app returns. What it saves is the SSH
-handshake, the tmux attach, and the redraw. QUIC 0-RTT plus a resume token gets
-first byte in roughly one round trip instead of five or six.
+handshake and the process spawn behind it.
 
-State this plainly in the README. Do not imply the connection survives
-backgrounding, because it does not, and users will notice.
+**Corrected 2026-07-27: QUIC 0-RTT is not reachable through Network framework.**
+This section originally claimed "QUIC 0-RTT plus a resume token gets first byte in
+roughly one round trip instead of five or six". Measured, that is wrong on both
+halves. There is no public or private path that gets application bytes into
+QUIC's first flight: `sec_protocol_options_set_tls_resumption_enabled` is inert
+for QUIC, `allowFastOpen` with an `.idempotent` send is accepted and then never
+sends early, and the only symbol that engages resumption at all is SPI and buys
+about 13 ms of CPU — a fraction of a round trip, never a whole one.
+
+The honest claim, which is still the headline win:
+
+> A QUIC reconnect puts the first byte at the server in about 2 round trips and
+> gets output back in about 2.7, with no process spawn. A cold SSH attach costs
+> 8.3 round trips (docs/benchmarks.md) plus a shell and multiplexer start.
+
+That win comes from QUIC combining the transport and crypto handshakes, and from
+resuming a session that is already running, rather than from 0-RTT. Do not put
+0-RTT in the README.
+
+Also state plainly that the connection does not survive backgrounding, because it
+does not, and users will notice.
+
+One thing this section used to imply and should not: that the *screen* takes a
+round trip to come back. It does not. iOS suspends the app rather than killing it,
+so the emulator still holds the frame and first paint on foreground is
+effectively free. What costs round trips is the session becoming *live* again —
+new output arriving and keystrokes landing. If the app is jetsammed rather than
+suspended the screen is genuinely gone, and recovering it without a network round
+trip would mean persisting session content to disk, which is a privacy decision
+(§9) and not currently taken.
 
 ### 6.2 Ring buffer
 
@@ -435,10 +481,17 @@ client, SSH bootstrap, a+Terminal renders a live session. No resume yet.
   injects loss, latency, and hard disconnects. Background the app for 5 minutes,
   foreground, and the session resumes with correct scrollback.
 
-**M4. Roaming and fast reconnect.** QUIC 0-RTT, path change handling, connection
-migration in foreground.
-- Acceptance: WiFi to cellular switch mid-session with no visible interruption.
-  Foreground-from-suspended shows first byte in under one RTT plus 50ms.
+**M4. Roaming and fast reconnect.** Path change handling and connection migration
+in foreground. **Not 0-RTT** — §6.1 records why it is unreachable.
+- Acceptance, transport: foreground-from-suspended reaches `.ready` within 1.5 RTT
+  and delivers the first resumed output byte within 2.2 RTT + 30 ms, measured
+  against injected delay rather than on loopback (loopback RTT is ~0 and proves
+  nothing). `NWConnection.requestEstablishmentReport` is the instrumentation hook.
+- Acceptance, roaming: a WiFi-to-cellular switch mid-session produces no visible
+  corruption, and the first byte arrives within 300 ms of the new path becoming
+  satisfied. Framed as **reconnect-and-resume, not migration**, because migration
+  does not exist here — the §6.2 ring buffer is what makes the reconnect
+  invisible. **Device-only**: one Mac has one usable interface.
 
 **M5. Agent events.** Termios watcher, alt-screen scanner, agent status on the
 control stream, and the daemon pushing notifications to the user's own ntfy or
@@ -476,9 +529,13 @@ stream.
 
 ## 12. Open questions
 
-1. Does Network framework's QUIC actually do connection migration on iOS? M0
-   decides. If not, fall back to TCP+TLS and rely on 0-RTT resume alone, which
-   costs little given section 6.1.
+1. ~~Does Network framework's QUIC actually do connection migration on iOS?~~
+   **Answered: no.** Not on macOS 26, in either direction — a peer address change
+   black-holes the connection until the idle timeout, and no path or viability
+   signal is exposed to detect it. §6.1 has the correction and the two mitigations
+   (short idle timeout, keepalive). The stated fallback of moving to TCP+TLS was
+   **not** taken: QUIC still earns its place on multiplexing and a combined
+   handshake, and TCP+TLS would not migrate either.
 2. ~~Can SwiftTerm render an overlay without a fork?~~ **Resolved and now moot.**
    M0 found it feasible without a fork (`docs/spikes/2026-07-27-swiftterm-overlay.md`),
    and §7's move to quick actions removes the need for an overlay at all.

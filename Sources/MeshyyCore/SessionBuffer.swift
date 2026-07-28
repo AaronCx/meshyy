@@ -29,8 +29,15 @@ public enum ResumeDecision: Sendable, Equatable {
     /// docs/benchmarks.md — not a path worth engineering around.
     case mustRedraw(earliestAvailable: UInt64, skipped: UInt64)
 
-    /// A fresh session with no prior offset: nothing to replay.
-    case fresh
+    /// No prior offset: the client has never seen this session.
+    ///
+    /// Replays from the most recent full-redraw anchor if one survives, else from
+    /// the oldest byte still held. Sending nothing would be defensible — the client
+    /// asked for nothing — but it leaves a real terminal blank until the next
+    /// keystroke, which reads as a broken attach. Anchoring bounds the replay in
+    /// the common case (any clear or alt-screen entry) and falls back to the whole
+    /// buffer only for a session that has never redrawn.
+    case fresh(from: UInt64, bytes: [UInt8])
 
     /// The client claimed an offset the daemon never produced. A session-id
     /// mix-up or a client bug. Design doc §3.5: never silently degrade.
@@ -41,7 +48,22 @@ public enum ResumeDecision: Sendable, Equatable {
         switch self {
         case .replay(_, let bytes): bytes
         case .replayFromAnchor(_, let bytes, _): bytes
-        case .mustRedraw, .fresh, .impossible: []
+        case .fresh(_, let bytes): bytes
+        case .mustRedraw, .impossible: []
+        }
+    }
+
+    /// Absolute offset the replayed bytes begin at, which is what the client needs
+    /// to keep its own offset arithmetic exact. Sent as `replayBase`.
+    public var replayBase: UInt64 {
+        switch self {
+        case .replay(let from, _): from
+        case .replayFromAnchor(let anchor, _, _): anchor
+        case .fresh(let from, _): from
+        // Nothing is replayed, so the client restarts from the oldest byte the
+        // daemon can still vouch for.
+        case .mustRedraw(let earliest, _): earliest
+        case .impossible(let latest): latest
         }
     }
 
@@ -80,13 +102,20 @@ public struct SessionBuffer: Sendable {
         return scanner.scan(bytes, startingAt: offset)
     }
 
+    /// What a client that has never seen this session gets.
+    private func freshAttach() -> ResumeDecision {
+        let window = ring.window
+        let from = scanner.replayAnchor(notOlderThan: window.from) ?? window.from
+        return .fresh(from: from, bytes: (try? ring.replay(from: from)) ?? [])
+    }
+
     /// Decides what a (re)connecting client gets.
     ///
     /// `resumeFrom` is nil for a fresh attach. The ordering here matters: an
     /// offset ahead of the buffer is a different failure from one behind it, and
     /// collapsing them would hide a client bug behind a routine cache miss.
     public func resume(from resumeFrom: UInt64?) -> ResumeDecision {
-        guard let offset = resumeFrom else { return .fresh }
+        guard let offset = resumeFrom else { return freshAttach() }
 
         do {
             return .replay(from: offset, bytes: try ring.replay(from: offset))

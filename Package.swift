@@ -75,7 +75,11 @@ let package = Package(
         ),
         .testTarget(
             name: "MeshyyKitTests",
-            dependencies: ["MeshyyKit", "MeshyyCore"],
+            // Depends on the daemon too: the M2 acceptance test drives a real
+            // daemon over a real QUIC connection rather than a stub, because a
+            // client tested against a stub only proves the two agree with
+            // each other.
+            dependencies: ["MeshyyKit", "MeshyyCore", "MeshyyDaemon"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

@@ -64,9 +64,16 @@ private final class TestClient {
         }
     }
 
-    /// Pumps until `predicate` is satisfied or the deadline passes.
+    /// Generous on purpose.
+///
+/// These helpers return as soon as the predicate holds, so a large ceiling costs
+/// nothing when things work — it only changes how long a genuine failure takes to
+/// report. A tight ceiling, by contrast, turns a slow CI runner into a red build:
+/// every one of these waits is on a real shell echoing through a real PTY, and a
+/// loaded two-core runner is several times slower than this Mac. Two different
+/// tests failed on two consecutive CI runs for exactly this reason.
     @discardableResult
-    func pump(timeout: TimeInterval = 5, until predicate: ([FrameEnvelope]) -> Bool) -> Bool {
+    func pump(timeout: TimeInterval = 30, until predicate: ([FrameEnvelope]) -> Bool) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         if predicate(received) { return true }
         var buffer = [UInt8](repeating: 0, count: 65536)
@@ -141,7 +148,8 @@ private func markerCommand(_ marker: String) -> [UInt8] {
     return Array(command.utf8)
 }
 
-@Suite("Local socket transport", .serialized)
+@Suite("Local socket transport", .serialized,
+       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
 struct LocalSocketTests {
 
     @Test("The socket and its directory are private (design doc §8)")
@@ -397,6 +405,52 @@ struct LocalSocketTests {
             }, "a malformed frame must be reported; got \(client.controlFrames)")
         }
     }
+
+    /// Pins the ordering guarantee. `SessionAttachment` used to spawn a separate
+    /// Task per pty write and per resize, and tasks enqueued on an actor run in an
+    /// UNSPECIFIED order — so two keystroke chunks could reach the PTY reversed, and
+    /// a resize could apply after the command that depended on it. CI caught the
+    /// resize case; scrambled input is the one that would have been blamed on the
+    /// network.
+    @Test("Consecutive writes reach the PTY in the order they were sent")
+    func writesAreOrdered() async throws {
+        try await withServer { path, _ in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "order"))))
+            #expect(client.pump { !$0.isEmpty })
+
+            // One command split across many frames, one byte at a time. If the daemon
+            // reorders any of them the shell sees garbage and the marker never
+            // appears — which is a far stronger check than comparing timestamps.
+            let command = Array("printf '%s%s\\n' ORDER ED_OK\n".utf8)
+            for byte in command {
+                client.send(.pty(0, [byte]))
+            }
+            #expect(client.pump { _ in
+                String(decoding: client.ptyStream, as: UTF8.self).contains("ORDERED_OK")
+            }, "input was reordered; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+        }
+    }
+
+    /// The case CI actually caught: a resize immediately followed by a command must
+    /// apply before the command runs.
+    @Test("A resize applies before a command sent immediately after it")
+    func resizeOrderedBeforeCommand() async throws {
+        try await withServer { path, _ in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "rz"))))
+            #expect(client.pump { !$0.isEmpty })
+
+            // No wait between them, on purpose.
+            client.send(.control(.resize(cols: 133, rows: 47)))
+            client.send(.pty(0, Array("stty size\n".utf8)))
+            #expect(client.pump { _ in
+                String(decoding: client.ptyStream, as: UTF8.self).contains("47 133")
+            }, "the resize did not apply before the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+        }
+    }
 }
 
 extension TestClient {
@@ -412,4 +466,5 @@ extension TestClient {
             return
         }
     }
+
 }

@@ -15,7 +15,30 @@ consumed by the spike, so nothing correct got thrown away.
 
 ---
 
-## 1. Can an unsigned daemon get a `sec_identity_t`? Yes — one route of three.
+## 1. Can an unsigned daemon get a `sec_identity_t`? Yes — and this section's
+## original answer was WRONG.
+
+> **Superseded 2026-07-27, later the same day.** This section concluded that a
+> dedicated file keychain was the only working route, on the assumption that
+> `SecIdentityCreate` was private SPI. **It is not.** It is public,
+> `API_AVAILABLE(macos(10.12))`, not deprecated, and it pairs a certificate with a
+> key touching no keychain at all.
+>
+> The mistake was not free. Besides carrying deprecated API for no reason, a file
+> keychain binds its keys by ACL to the binary that created them — so the daemon
+> would have loaded its own key happily until the next time `meshyyd` was rebuilt,
+> and then **hung** on a Security prompt no headless process can answer. A bug that
+> appears only after an update is the worst kind to ship. It also needed a Security
+> session, which a CI runner lacks, which is why the QUIC suites could not run in CI.
+>
+> `DaemonIdentity` now uses `SecIdentityCreate` with a transient key and persists the
+> raw P-256 key and certificate DER as two 0600 files. Verified: the fingerprint is
+> stable across separate processes. See docs/provenance.md.
+>
+> The measurements below are still accurate about the *keychain* routes. They were
+> just answering a question that did not need to be asked.
+
+
 
 `sec_protocol_options_set_local_identity` needs a `SecIdentity`, which needs a
 private key and a certificate that the keychain can pair. Three routes tried:

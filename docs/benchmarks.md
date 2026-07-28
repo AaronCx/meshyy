@@ -108,8 +108,11 @@ doc's two thresholds rather than above the upper one. Three qualifications:
   It is not a blocker: the RTT-scaling model above answers the gate question
   more generally than a single-point measurement would, and it predicts any RTT.
   Take the single point when convenient and check it against the table.
-- QUIC 0-RTT resume cost is asserted at 1 RTT + 50 ms from RFC 9001 §4.6, not
-  measured. M0 measures it; this file gets a second section then.
+- ~~QUIC 0-RTT resume cost is asserted at 1 RTT + 50 ms, not measured.~~
+  **Measured — see the second section below.** The answer is 2.06 round trips, and
+  0-RTT turned out to be unreachable through Network framework entirely (design
+  doc §6.1). The "1 RTT + 50 ms" target column in the gate table above was
+  therefore optimistic; the honest comparison is in the second section.
 
 ### Reproducing
 
@@ -125,3 +128,103 @@ scripts/bench-attach.py --key ~/.ssh/meshyy_bench_ed25519 \
 
 Raw JSON: `docs/bench/attach-2026-07-27.json`.
 Remove the bench key from `~/.ssh/authorized_keys` afterwards.
+
+---
+
+## 2026-07-27 — QUIC round trips, measured through a UDP relay
+
+**Result: a meshyy reconnect costs 2.06 round trips to the first application byte,
+against SSH's 8.31. A 4x reduction in round trips, and no process spawn.**
+
+### Method
+
+The §1 harness could not do this: `ChaosTCPProxy` is TCP-only and QUIC is UDP. A
+userspace UDP relay was written and validated first, because a relay that breaks
+QUIC would produce numbers that mean nothing.
+
+**The relay is sound.** Floor cost 0.3 ms (7.8 ms through it vs 7.5 ms direct) —
+inside noise, so nothing is subtracted. Six concurrent QUIC connections each got
+only their own payload back (`only-own=true`, 0 dropped, 0 rx errors). 4 MiB
+echoed byte-identical at 5.5 MB/s with no truncation. And critically, a
+**mismatched pin still fails through it** — TLS remains end-to-end, so the relay
+is a delay line and not a middlebox.
+
+7 trials per cell.
+
+### Results (median, milliseconds)
+
+| Injected RTT | QUIC handshake | + stream round trip |
+|---|---|---|
+| 0 (direct) | 7.5 | — |
+| 0 (via relay) | 7.8 | 0.5 |
+| 20 | 44.0 | 27.0 |
+| 40 | 71.7 | 51.8 |
+| 80 | 111.2 | 87.9 |
+| 120 | 153.6 | 133.9 |
+| 160 | 195.8 | 175.8 |
+| 240 | 274.2 | 250.7 |
+
+### The fits
+
+```
+handshake         = 27.6 ms + 1.038 x RTT
+stream round trip =  9.1 ms + 1.019 x RTT
+first app byte    = 36.7 ms + 2.06  x RTT
+```
+
+The relay saw an identical flight pattern at every RTT — C→S 2 packets/2400 B,
+S→C 3/3090 B, C→S 4/1368 B, S→C 4/340 B, C→S 1/31 B — which is what makes the
+1.04 and 1.02 coefficients trustworthy rather than curve-fitting noise.
+
+### Against SSH
+
+| | round trips to first byte | fixed cost |
+|---|---|---|
+| SSH + tmux attach (§1) | **8.31** | 187 ms |
+| meshyy over QUIC | **2.06** | 37 ms |
+
+| RTT | SSH + attach | meshyy | saved |
+|---|---|---|---|
+| 40 ms | 520 ms | 119 ms | 401 ms |
+| 60 ms | 686 ms | 160 ms | 526 ms |
+| 80 ms | 852 ms | 202 ms | 650 ms |
+| 120 ms | 1185 ms | 284 ms | 901 ms |
+
+**This is the project's central claim, now measured rather than assumed.** Note it
+is a 4x reduction in round trips, not the 8x that "one round trip instead of five
+or six" would have implied — see design doc §6.1, where the 0-RTT assumption that
+produced that figure is corrected. 2.06 is what a combined transport+crypto
+handshake actually costs.
+
+### Loss tolerance
+
+40 ms RTT, 8 trials per cell, median handshake:
+
+| Loss | Median | Note |
+|---|---|---|
+| 0 | 62.1 ms | |
+| 5% | 70.0 ms | |
+| 10% | 68.7 ms | |
+| 20% | 77.8 ms | still graceful |
+| 30% | 393.0 ms | worst single trial 7078 ms |
+
+**Every handshake completed at every level; nothing hung.** Up to 20% loss the
+degradation is mild, which is the property that matters on a bad cell. At 30% the
+tail explodes — worth knowing, not worth engineering for.
+
+### Idle timeout, confirmed on the wire
+
+Severing the path mid-session failed the connection after 30011 ms with
+`POSIXErrorCode 60 (ETIMEDOUT)` — exactly `options.idleTimeout = 30000`, and
+nothing sooner. That is the measurement behind the client dropping to a 5 s idle
+timeout with keepalive: since Network framework QUIC does not migrate (design doc
+§6.1), the idle timeout is the *only* thing that tells a client its session has
+gone deaf, and 30 s of a frozen terminal is not acceptable.
+
+### Reproducing
+
+The relay prototype lives outside the tree, in the session scratchpad under
+`udp-chaos/`. **Bringing it into `MeshyyChaos` as `ChaosUDPProxy` is outstanding
+work** — it is what design doc §11's chaos harness needs, and until it lands the
+§6.4 property test runs against injected disconnects in-process rather than
+against a genuinely lossy path.

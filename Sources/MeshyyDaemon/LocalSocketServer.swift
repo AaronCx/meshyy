@@ -55,14 +55,30 @@ public final class LocalSocketServer: @unchecked Sendable {
 
     private let path: String
     private let store: SessionStore
+    private let tokens: TokenActor?
     private let queue = DispatchQueue(label: "meshyy.local.accept")
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var clients: [ObjectIdentifier: LocalClient] = [:]
+    private var quic: QUICServer?
+    private var fingerprint: String?
 
-    public init(path: String, store: SessionStore) {
+    public init(path: String, store: SessionStore, tokens: TokenActor? = nil) {
         self.path = path
         self.store = store
+        self.tokens = tokens
+    }
+
+    /// Lets the local socket answer §5.1 bootstrap requests once a QUIC listener
+    /// exists. A separate call rather than an init parameter because the QUIC
+    /// listener may fail to start and the local socket must still work — a daemon
+    /// that refuses to run because one of two transports is unavailable is worse
+    /// than one that says so and carries on.
+    public func attachQUIC(_ server: QUICServer, fingerprint: String) {
+        queue.sync {
+            quic = server
+            self.fingerprint = fingerprint
+        }
     }
 
     /// Default socket location. Under the user's own directory rather than
@@ -178,7 +194,15 @@ public final class LocalSocketServer: @unchecked Sendable {
             if fd < 0 { return } // EAGAIN: no more pending
             let accepted = fd
             silenceSIGPIPE(on: accepted)
-            let client = LocalClient(fd: accepted, store: store) { [weak self] finished in
+            let client = LocalClient(
+                fd: accepted,
+                store: store,
+                bootstrap: BootstrapProvider(
+                    tokens: tokens,
+                    port: { [weak self] in self?.queue.sync { self?.quic?.boundPort } ?? nil },
+                    fingerprint: { [weak self] in self?.queue.sync { self?.fingerprint } ?? nil }
+                )
+            ) { [weak self] finished in
                 guard let self else { return }
                 self.queue.async { [weak self] in
                     self?.clients.removeValue(forKey: ObjectIdentifier(finished))
@@ -201,26 +225,56 @@ public final class LocalSocketServer: @unchecked Sendable {
     }
 }
 
+/// Everything needed to answer a §5.1 bootstrap request.
+///
+/// The port and fingerprint are read through closures rather than captured,
+/// because the QUIC listener is attached after the socket server starts and may
+/// never be attached at all.
+struct BootstrapProvider: Sendable {
+    let tokens: TokenActor?
+    let port: @Sendable () -> UInt16?
+    let fingerprint: @Sendable () -> String?
+}
+
 /// One attached client on the local socket.
+///
+/// Deliberately thin: it moves bytes between the socket and `FrameDecoder`, and
+/// hands every frame to `SessionAttachment`, which owns the protocol. The QUIC
+/// transport is the same shape — that is what makes design doc §3.3's
+/// "transport is replaceable" true rather than aspirational.
 final class LocalClient: @unchecked Sendable {
     private let fd: Int32
-    private let store: SessionStore
     private let queue: DispatchQueue
     private let onFinish: (LocalClient) -> Void
 
+    private let store: SessionStore
+    private let bootstrap: BootstrapProvider
     private var readSource: DispatchSourceRead?
     private var decoder = FrameDecoder()
-    private var session: PTYSession?
-    private var subscription: UUID?
-    private var pumpTask: Task<Void, Never>?
+    private var attachment: SessionAttachment?
     private var closed = false
 
-    init(fd: Int32, store: SessionStore, onFinish: @escaping (LocalClient) -> Void) {
+    init(
+        fd: Int32,
+        store: SessionStore,
+        bootstrap: BootstrapProvider,
+        onFinish: @escaping (LocalClient) -> Void
+    ) {
         self.fd = fd
         self.store = store
+        self.bootstrap = bootstrap
         self.onFinish = onFinish
         self.queue = DispatchQueue(label: "meshyy.local.client.\(fd)")
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+
+        self.attachment = SessionAttachment(
+            store: store,
+            // Opening a 0600 socket in a 0700 directory already proved the caller
+            // is this user, so there is nothing for a token to add here.
+            authority: .localSocket,
+            send: { [weak self] envelope in self?.write(envelope) },
+            close: { [weak self] in self?.closeConnection() }
+        )
     }
 
     func start() {
@@ -241,12 +295,21 @@ final class LocalClient: @unchecked Sendable {
             if count > 0 {
                 do {
                     for frame in try decoder.push(Array(buffer[0..<count])) {
-                        handle(frame)
+                        // Bootstrap is a local-transport concern, not part of the
+                        // session protocol, so it is answered here rather than
+                        // inside SessionAttachment.
+                        if frame.kind == .control,
+                           let control = try? ControlFrame.decode(frame.payload),
+                           case .bootstrapRequest(let session) = control {
+                            handleBootstrap(session: session)
+                            continue
+                        }
+                        attachment?.receive(frame)
                     }
                 } catch {
                     // A length-prefixed stream cannot resynchronise, so a
                     // malformed frame is terminal. Say so rather than guessing.
-                    send(.control(.error(code: 400, message: "\(error)")))
+                    write(.control(.error(code: 400, message: "\(error)")))
                     closeConnection()
                     return
                 }
@@ -260,134 +323,60 @@ final class LocalClient: @unchecked Sendable {
         }
     }
 
-    private func handle(_ frame: FrameEnvelope) {
-        switch frame.kind {
-        case .control:
-            guard let control = try? ControlFrame.decode(frame.payload) else {
-                // Design doc §5.3: an undecodable control frame from a newer peer
-                // is ignored, not fatal.
-                return
-            }
-            handle(control)
-        case .pty:
-            let bytes = frame.payload
-            Task { [weak self] in
-                guard let session = self?.currentSession else { return }
-                try? await session.send(bytes)
-            }
-        case .blob:
-            // M7. Acknowledged as unimplemented rather than silently dropped.
-            send(.control(.error(code: 501, message: "blob channels are not implemented (M7)")))
-        }
-    }
-
-    private var currentSession: PTYSession? {
-        queue.sync { session }
-    }
-
-    private func handle(_ control: ControlFrame) {
-        switch control {
-        case .hello(let hello):
-            attach(hello)
-        case .resize(let cols, let rows):
-            let size = TerminalSize(cols: cols, rows: rows)
-            Task { [weak self] in
-                guard let session = self?.currentSession else { return }
-                try? await session.resize(to: size)
-            }
-        case .ack:
-            // The local socket cannot drop bytes, so an ack carries no
-            // information here. It matters on QUIC (M3), where the client's
-            // acked offset is what a reconnect resumes from.
-            break
-        case .bye:
-            closeConnection()
-        default:
-            break
-        }
-    }
-
-    private func attach(_ hello: ControlFrame.Hello) {
-        let name = hello.session ?? "default"
-        let size = TerminalSize(cols: hello.cols, rows: hello.rows)
-
+    /// Answers a §5.1 bootstrap request: ensure the session exists, mint a
+    /// single-use token bound to its id, and hand back the JSON verbatim.
+    private func handleBootstrap(session name: String) {
         Task { [weak self] in
             guard let self else { return }
+            guard let tokens = self.bootstrap.tokens else {
+                self.write(.control(.error(code: 503, message: "no token store configured")))
+                return
+            }
+            guard let port = self.bootstrap.port(), port != 0 else {
+                self.write(.control(.error(
+                    code: 503,
+                    message: "the QUIC listener is not running; use the unix socket directly"
+                )))
+                return
+            }
+            guard let fingerprint = self.bootstrap.fingerprint() else {
+                self.write(.control(.error(code: 503, message: "no certificate fingerprint")))
+                return
+            }
+            guard SessionStore.isValidName(name) else {
+                self.write(.control(.error(
+                    code: 400,
+                    message: "session name \(name.debugDescription) is not allowed"
+                )))
+                return
+            }
+
             do {
-                let session = try await self.store.attachOrCreate(name: name, size: size)
-                let (decision, events, token) = await session.attach(resumeFrom: hello.resumeFrom)
+                // Created here rather than on QUIC attach, because the token has to
+                // be bound to a session id that already exists.
+                let session = try await self.store.attachOrCreate(name: name, size: .default)
                 let info = await session.info
-
-                self.queue.sync {
-                    self.session = session
-                    self.subscription = token
-                }
-
-                self.send(.control(.welcome(.init(
-                    sessionID: info.sessionID,
-                    bufferedFrom: info.bufferedFrom,
-                    bufferedTo: info.bufferedTo
-                ))))
-
-                // Design doc §3.5: never silently degrade. A client whose resume
-                // could not be honoured is told before the bytes arrive, so it
-                // can clear rather than splice a hole into its scrollback.
-                switch decision {
-                case .replay, .fresh:
-                    break
-                case .replayFromAnchor(let anchor, _, _):
-                    self.send(.control(.resumeTooOld(ptyID: 0, earliestOffset: anchor)))
-                case .mustRedraw(let earliest, _):
-                    self.send(.control(.resumeTooOld(ptyID: 0, earliestOffset: earliest)))
-                case .impossible(let latest):
-                    self.send(.control(.error(
-                        code: 409,
-                        message: "resume offset is ahead of the session; latest is \(latest)"
-                    )))
-                }
-
-                if !decision.bytes.isEmpty {
-                    self.send(.pty(0, decision.bytes))
-                }
-
-                let pump = Task { [weak self] in
-                    for await event in events {
-                        guard let self, !self.isClosed else { return }
-                        self.forward(event)
-                    }
-                }
-                self.queue.sync { self.pumpTask = pump }
+                let token = await tokens.issue(sessionID: info.sessionID)
+                let response = BootstrapResponse(
+                    port: port,
+                    token: token,
+                    certSHA256: fingerprint,
+                    sessionID: info.sessionID
+                )
+                let json = String(decoding: try response.encoded(), as: UTF8.self)
+                self.write(.control(.bootstrapResponse(json: json)))
             } catch {
-                self.send(.control(.error(code: 400, message: "\(error)")))
-                self.closeConnection()
+                self.write(.control(.error(code: 500, message: "\(error)")))
             }
         }
     }
-
-    private func forward(_ event: SessionEvent) {
-        switch event {
-        case .output(_, let bytes):
-            send(.pty(0, bytes))
-        case .termios(let state):
-            send(.control(.termios(state)))
-        case .screenMode(let alt):
-            send(.control(.screenMode(alt: alt)))
-        case .agent(let kind, let agentID, let detail):
-            send(.control(.agentEvent(kind: kind, agentID: agentID, detail: detail)))
-        case .exited(let status):
-            send(.control(.bye(reason: "session exited with status \(status)")))
-            closeConnection()
-        }
-    }
-
-    private var isClosed: Bool { queue.sync { closed } }
 
     /// Writes a frame, looping until the whole thing is out.
     ///
-    /// Blocking on a non-blocking fd via a retry loop is acceptable here because
-    /// the peer is a local process reading as fast as it can; a slow local reader
-    /// costs this one client's queue and nothing else.
-    private func send(_ envelope: FrameEnvelope) {
+    /// Retrying on EAGAIN is acceptable because the peer is a local process
+    /// reading as fast as it can; a slow local reader costs this one client's
+    /// queue and nothing else. EPIPE lands in the final branch and closes.
+    private func write(_ envelope: FrameEnvelope) {
         let bytes = envelope.encoded
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
@@ -415,12 +404,13 @@ final class LocalClient: @unchecked Sendable {
     private func closeLocked() {
         guard !closed else { return }
         closed = true
-        pumpTask?.cancel()
         readSource?.cancel()
         readSource = nil
-        if let session, let subscription {
-            Task { await session.detach(subscription) }
-        }
+        let attachment = self.attachment
+        self.attachment = nil
+        // finish() calls back into closeTransport, which re-enters closeLocked —
+        // harmless now that `closed` is already true.
+        attachment?.finish()
         onFinish(self)
     }
 }
