@@ -124,8 +124,7 @@ public actor MeshyySession {
 
         try await connection.connect()
 
-        baseEstablished = false
-        pendingOutput.removeAll()
+        resetForAttach(resumeFrom: nil)
         try connection.send(.hello(.init(
             token: bootstrap.token,
             cols: size.cols,
@@ -139,7 +138,19 @@ public actor MeshyySession {
 
     // MARK: - Inbound
 
-    private func handle(_ envelope: FrameEnvelope) {
+    /// Handles one inbound frame and returns the bytes it caused to be delivered.
+    ///
+    /// `internal` rather than `private`, and returning what it delivered, so the
+    /// conformance harness can drive the **shipping** client with the exact frames a
+    /// daemon would send and compare it byte for byte against the reference
+    /// `ClientModel`. Without that seam the only way to observe delivery is the event
+    /// stream, whose timing depends on another task being scheduled — which is how a
+    /// previous attempt at this turned into a flaky test measuring its own scheduler.
+    ///
+    /// The production path ignores the return value; `events` remains the real
+    /// interface.
+    @discardableResult
+    func handle(_ envelope: FrameEnvelope) -> [UInt8] {
         switch envelope.kind {
         case .pty:
             // Bytes cannot be counted before the base is known, and they must not be
@@ -148,20 +159,22 @@ public actor MeshyySession {
             // costs latency rather than correctness.
             guard baseEstablished else {
                 pendingOutput.append(envelope.payload)
-                return
+                return []
             }
             deliver(envelope.payload)
+            return envelope.payload
 
         case .control:
-            guard let frame = try? ControlFrame.decode(envelope.payload) else { return }
-            handle(frame)
+            guard let frame = try? ControlFrame.decode(envelope.payload) else { return [] }
+            return handle(frame)
 
         case .blob:
-            break
+            return []
         }
     }
 
-    private func handle(_ frame: ControlFrame) {
+    @discardableResult
+    private func handle(_ frame: ControlFrame) -> [UInt8] {
         switch frame {
         case .welcome:
             // The buffered window is informational; the replay base is what the
@@ -169,6 +182,7 @@ public actor MeshyySession {
             break
 
         case .replayBase(_, let offset):
+            var flushed: [UInt8] = []
             if offset != consumedOffset, consumedOffset > 0 {
                 // The daemon rewound or skipped. `resumeTooOld` (below) explains
                 // why; this is where the offset is corrected so subsequent acks are
@@ -180,7 +194,11 @@ public actor MeshyySession {
             baseEstablished = true
             let queued = pendingOutput
             pendingOutput.removeAll()
-            for chunk in queued { deliver(chunk) }
+            for chunk in queued {
+                deliver(chunk)
+                flushed += chunk
+            }
+            return flushed
 
         case .resumeTooOld:
             // Already reported through screenRebuilt when the base arrives, which
@@ -210,6 +228,17 @@ public actor MeshyySession {
         default:
             break
         }
+        return []
+    }
+
+    /// Resets the protocol state for a new attach.
+    ///
+    /// Called by `attach` and by the conformance harness, so the harness exercises
+    /// the same reset the shipping path does rather than a test-only imitation.
+    func resetForAttach(resumeFrom: UInt64?) {
+        baseEstablished = false
+        pendingOutput.removeAll()
+        if let resumeFrom { consumedOffset = resumeFrom }
     }
 
     private func deliver(_ bytes: [UInt8]) {

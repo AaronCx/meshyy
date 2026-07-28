@@ -168,4 +168,55 @@ production is never graceful. A hard kill with bytes in flight mid-control-frame
 a single scenario that tests the framing resync path, and it is closer to what
 users actually hit than a 5% loss rate is.
 
-**Stopping here as instructed.** No code changed.
+---
+
+# Addendum, 2026-07-28 — after 1a-bis, 1b-zero, 1b-bis, 1d/1f, 1e-bis
+
+The audit above is unchanged; this records what it led to.
+
+## Wire format coverage, stated explicitly (1c-bis asks for this)
+
+**It has golden fixtures, and they are real.** `ControlFrameTests.goldens` is a table
+of 14 frames paired with the exact hex they must produce:
+
+- `goldenWireFormat` asserts encoding produces those bytes, so a wire change shows up
+  as a fixture diff rather than as a silent protocol break.
+- `goldenDecodes` asserts each fixture decodes back to the frame it came from, so the
+  table cannot drift into being self-consistent nonsense.
+- Every frame case additionally round-trips (`roundTrip`, 17 cases), and §5.3's
+  version-skew rules are asserted rather than assumed: an unknown frame type decodes
+  to `.unknown` and round-trips its payload, extra fields on a known frame are
+  ignored, an unrecognised `AgentEvent` kind is treated as a newer peer, and a peer
+  that predates the protocol-version field is read as version 1.
+- CBOR beneath it has 44 cases including RFC 8949 Appendix A vectors and rejection of
+  tags, floats, indefinite lengths, reserved additional-info, truncation, trailing
+  bytes, invalid UTF-8, over-deep nesting, and collection lengths the input cannot
+  back.
+
+What the wire format does **not** have: any test of framing behaviour under a
+*damaged* stream beyond `malformedFrameIsTerminal` (one unknown channel kind). A
+control frame truncated mid-header by an abrupt disconnect is untested — that is 1h.
+
+## Current numbers
+
+| | audit | now |
+|---|---|---|
+| test functions | 127 | **133** |
+| running on merge | 87 | **133** |
+| gated out of CI | 40 | **0** |
+| inject impairment | 0 | 0 — still nothing, until 1d-bis |
+| resume across abrupt loss | 0 | 0 — still nothing, until 1h |
+| shipping client pinned to the oracle | no | **yes**, 200 scenarios, per step |
+
+## What the four findings turned into
+
+1. **`ClientModel` unpinned** → `ConformanceTests` replays all 200 shared scenarios
+   against both implementations, comparing after every step. A mutation that
+   previously merged green now fails 137 of them.
+2. **Assertion stopped at the model layer** → the corpus moved to
+   `MeshyyTestSupport.ResumeScenario` and is now executed at two levels. Transport
+   tests also became byte-exact rather than substring-based.
+3. **`MeshyyChaos` declared and unimported** → dependency dropped, and
+   `scripts/check-test-coverage.sh` fails the build on a recurrence, on a job that
+   narrows the test run, or on a suite gated behind an environment variable.
+4. **Every disconnect graceful** → still true. 1h.

@@ -64,3 +64,41 @@ defect produced no signal at all in CI, and the substring-based version of that
 test could not see it even when run.
 
 The gap 1a-bis was written to prove is closed.
+
+---
+
+## 2026-07-28 — 1b-bis acceptance: the pin holds
+
+The acceptance criterion for hardening PR 1: after pinning `ClientModel` to
+`MeshyySession`, a mutation in the shipping client's offset arithmetic must turn the
+suite red.
+
+Same mutant A (`consumedOffset += bytes.count + 1`), run against
+`ConformanceTests` alone:
+
+| | scenarios catching mutant A |
+|---|---|
+| before the pin | **0 of 200** |
+| after the pin | **137 of 200** |
+
+And the report is a reproduction rather than an alarm:
+
+```
+seed 1, step 21 (reconnect):
+  reference delivered 4891 bytes
+  shipping  delivered 4877 bytes
+  first difference at byte 4679
+  reference[4679...] = [48, 103, 101, 107, 32, 47, 76, 38, 113, 108, 97, 93, 87, 70, 35, 104]…
+  shipping [4679...] = [35, 104, 54, 71, 114, 102, 99, 85, 86, 27, 91, 50, 74, 27, 91, 50]…
+```
+
+Seed, step index, step kind, both byte counts, the first differing offset, and a
+window of each stream. The shipping client is 14 bytes short and the divergence
+begins at byte 4679 — enough to go straight to the defect.
+
+**Why 137 and not 200.** A scenario only catches this if it reconnects *after* the
+drift has accumulated past a boundary that changes what the daemon replays. 63
+scenarios either reconnect too early or resume inside a window where a one-byte
+drift still lands on the same replay. That is the honest number, and it is worth
+knowing: a single scenario would have been a coin flip, which is the argument for
+keeping all 200 rather than sampling.
