@@ -92,7 +92,12 @@ let package = Package(
             // daemon over a real QUIC connection rather than a stub, because a
             // client tested against a stub only proves the two agree with
             // each other.
-            dependencies: ["MeshyyKit", "MeshyyCore", "MeshyyDaemon", "MeshyyTestSupport"],
+            //
+            // MeshyyChaos arrived here in 1d-bis, imported by ChaosTransportTests,
+            // which drives a real QUIC session through an impaired UDP relay.
+            dependencies: [
+                "MeshyyKit", "MeshyyCore", "MeshyyDaemon", "MeshyyTestSupport", "MeshyyChaos",
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

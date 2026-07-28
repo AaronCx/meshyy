@@ -375,3 +375,53 @@ Two further consequences worth stating now rather than discovering in M4:
   meshyy is currently a **private** repo which SwiftPM must be able to resolve.
 
 Source: direct inspection of `AaronCx/a-plus-terminal` at commit 40e9279.
+
+## 2026-07-28 — NAT rebind breaks a Network framework QUIC connection, silently
+
+**Decision.** M4 must treat a NAT rebind as a dead network and recover by redialling.
+There is no migration path to fall back on, and no transport-level event to trigger on.
+
+**Source.** Measured, not read. `ChaosUDPProxy.rebind()` replaces the relay's own back
+socket, so the daemon sees the same QUIC connection arriving from a new source port —
+a faithful NAT rebind. `ChaosTransportTests.natRebindOutcome` asserts the ports really
+changed before drawing any conclusion, because a test that reports "survived a rebind"
+having never performed one is worse than no test.
+
+**Result, macOS 26.4.1, over four runs.** The byte flow stops every time. This
+confirms M0's finding — Network framework QUIC exposes no migration API — at the level
+that actually matters, which is whether the implementation tolerates it anyway. It
+does not.
+
+**The part that shapes M4.** What the *client* knows is worse than a clean failure.
+Across runs `currentState` was sometimes `.connected` and sometimes
+`.closed("the daemon closed the control stream")`, the difference being whether the
+daemon happened to give up inside the observation window. The client's own transport
+never reported a network problem in either case: it either believes it is fine, or it
+is told second-hand by a peer it can no longer reach.
+
+So the rewritten M4's premise is now measured rather than assumed —
+
+> A NAT rebind looks identical to a dead network from the client side: packets leave,
+> nothing returns.
+
+— and 4b's heartbeat is not one option among several. It is the only mechanism that
+can notice this. The test asserts the invariant behind both observed states (the
+client never detects it itself) rather than either state individually, and records a
+finding if a future OS changes that, since it would re-open the M4 design.
+
+**Clean-room note.** The relay never inspects a payload. It knows nothing about QUIC
+beyond "these are datagrams", which is what makes it both correct and safe to have
+written.
+
+---
+
+## 2026-07-28 — the TCP chaos proxy stays, against the brief's letter
+
+**Decision.** 1d-bis says to *replace* the TCP shim with a UDP relay. The UDP relay is
+built and is the right instrument for QUIC, but `ChaosTCPProxy` is kept.
+
+**Reasoning.** The §1 benchmark gate — the measurement the entire project is justified
+by — drives `ssh` through the TCP proxy to synthesise RTT. SSH does not run over a UDP
+relay. Deleting the TCP proxy would delete the reproduction of
+`attach: total = 187.4 ms + 8.31 x RTT`, which is the number meshyy is measured
+against. UDP for impairing QUIC, TCP for the SSH baseline it is compared to.

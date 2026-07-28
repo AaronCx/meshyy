@@ -17,25 +17,42 @@ public struct ChaosProfile: Sendable, Equatable {
     /// TCP stream would corrupt it rather than emulate loss, so the TCP proxy
     /// ignores this and models congestion as delay.
     public var loss: Double
+    /// Per-direction loss overrides. `nil` falls back to `loss`. Set one of these to
+    /// attribute a failure to a side: a client that recovers from downstream loss but
+    /// not upstream loss is a different bug from one that recovers from neither.
+    public var lossUp: Double?
+    public var lossDown: Double?
     /// Probability a datagram is held back and delivered after the next one.
     /// UDP only.
     public var reorder: Double
     /// Sever every connection this many seconds after it opens. `nil` never
     /// severs. Emulates the iOS-suspension kill described in design doc §6.1.
     public var severAfter: Duration?
+    /// Seeds every random decision the UDP relay makes.
+    ///
+    /// A chaos run that cannot be replayed is an anecdote. Tests print this on
+    /// failure and it is the whole reproduction: same seed, same profile, same
+    /// sequence of drops and reorderings.
+    public var seed: UInt64
 
     public init(
         delay: Duration = .zero,
         jitter: Duration = .zero,
         loss: Double = 0,
+        lossUp: Double? = nil,
+        lossDown: Double? = nil,
         reorder: Double = 0,
-        severAfter: Duration? = nil
+        severAfter: Duration? = nil,
+        seed: UInt64 = 0x6D65_7368_7979
     ) {
         self.delay = delay
         self.jitter = jitter
         self.loss = loss
+        self.lossUp = lossUp
+        self.lossDown = lossDown
         self.reorder = reorder
         self.severAfter = severAfter
+        self.seed = seed
     }
 
     /// Pass-through. Used to measure the proxy's own floor cost so it can be
