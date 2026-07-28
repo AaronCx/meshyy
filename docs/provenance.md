@@ -206,3 +206,47 @@ as a black box; design doc §5.3, §6.3, §7, §10, §11, §13.
 
 Decided by: Aaron, on being shown the measurement — "the answer was never
 per-keystroke prediction."
+
+---
+
+## 2026-07-27 QUIC 0-RTT is unreachable; §6.1 and M4 corrected
+
+Decision: meshyy does not use QUIC 0-RTT, and the design doc no longer claims it.
+§6.1's "first byte in roughly one round trip instead of five or six" is replaced
+by the measured "about 2 round trips to the server, 2.7 to output back, with no
+process spawn". M4's acceptance criterion is rewritten accordingly and split into
+a transport measurement and a device-only roaming test.
+
+Rationale: measured, not assumed. Network framework exposes no path — public or
+private — that puts application bytes in QUIC's first flight.
+`sec_protocol_options_set_tls_resumption_enabled` is inert for QUIC.
+`NWParameters.allowFastOpen` with an `.idempotent` send is accepted and then never
+sends early. The only symbol that engages resumption at all,
+`sec_protocol_options_set_tls_early_data_enabled`, is SPI and worth ~13 ms of CPU
+— a fraction of a round trip. Using SPI in a launchd daemon on a
+privacy-branded product is not a trade worth making for that.
+
+The win survives the correction: 2 round trips against SSH's measured 8.3
+(docs/benchmarks.md) plus a shell and multiplexer start. It comes from QUIC
+combining the transport and crypto handshakes and from resuming an already-running
+session, not from 0-RTT.
+
+A second correction fell out of the same review, and it is the more useful one:
+§6.1 implied the *screen* costs a round trip to restore. It does not. iOS suspends
+rather than kills, so the emulator still holds the frame and first paint on
+foreground is free. What costs round trips is the session going live again. That
+distinction matters because it is the difference between a latency the user sees
+and one they do not — and it means the perceived-latency work is already done.
+
+Deliberately NOT taken: persisting session content on the client so a jetsammed
+app could repaint without the network. That is the only case where first paint
+genuinely costs a round trip, and fixing it means writing terminal scrollback to
+disk. §9 is emphatic about session content, and while it constrains the daemon
+rather than the app, extending it is Aaron's call rather than an implementation
+detail. Recorded as an open question instead.
+
+Source: empirical probe of the macOS 26.4.1 SDK and runtime; SDK header inspection
+for the sec_protocol_options and NWProtocolQUIC surfaces.
+
+Consulted: RFC 9001 §4.6 (0-RTT), Apple Network framework and Security framework
+headers, design doc §6.1, §10 M4, §12.1.

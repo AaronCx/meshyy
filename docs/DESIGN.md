@@ -228,11 +228,38 @@ migration handles WiFi to LTE **while the app is in the foreground**. It does
 not survive suspension.
 
 So meshyy reconnects every time the app returns. What it saves is the SSH
-handshake, the tmux attach, and the redraw. QUIC 0-RTT plus a resume token gets
-first byte in roughly one round trip instead of five or six.
+handshake and the process spawn behind it.
 
-State this plainly in the README. Do not imply the connection survives
-backgrounding, because it does not, and users will notice.
+**Corrected 2026-07-27: QUIC 0-RTT is not reachable through Network framework.**
+This section originally claimed "QUIC 0-RTT plus a resume token gets first byte in
+roughly one round trip instead of five or six". Measured, that is wrong on both
+halves. There is no public or private path that gets application bytes into
+QUIC's first flight: `sec_protocol_options_set_tls_resumption_enabled` is inert
+for QUIC, `allowFastOpen` with an `.idempotent` send is accepted and then never
+sends early, and the only symbol that engages resumption at all is SPI and buys
+about 13 ms of CPU — a fraction of a round trip, never a whole one.
+
+The honest claim, which is still the headline win:
+
+> A QUIC reconnect puts the first byte at the server in about 2 round trips and
+> gets output back in about 2.7, with no process spawn. A cold SSH attach costs
+> 8.3 round trips (docs/benchmarks.md) plus a shell and multiplexer start.
+
+That win comes from QUIC combining the transport and crypto handshakes, and from
+resuming a session that is already running, rather than from 0-RTT. Do not put
+0-RTT in the README.
+
+Also state plainly that the connection does not survive backgrounding, because it
+does not, and users will notice.
+
+One thing this section used to imply and should not: that the *screen* takes a
+round trip to come back. It does not. iOS suspends the app rather than killing it,
+so the emulator still holds the frame and first paint on foreground is
+effectively free. What costs round trips is the session becoming *live* again —
+new output arriving and keystrokes landing. If the app is jetsammed rather than
+suspended the screen is genuinely gone, and recovering it without a network round
+trip would mean persisting session content to disk, which is a privacy decision
+(§9) and not currently taken.
 
 ### 6.2 Ring buffer
 
@@ -435,10 +462,18 @@ client, SSH bootstrap, a+Terminal renders a live session. No resume yet.
   injects loss, latency, and hard disconnects. Background the app for 5 minutes,
   foreground, and the session resumes with correct scrollback.
 
-**M4. Roaming and fast reconnect.** QUIC 0-RTT, path change handling, connection
-migration in foreground.
-- Acceptance: WiFi to cellular switch mid-session with no visible interruption.
-  Foreground-from-suspended shows first byte in under one RTT plus 50ms.
+**M4. Roaming and fast reconnect.** Path change handling and connection migration
+in foreground. **Not 0-RTT** — §6.1 records why it is unreachable.
+- Acceptance, transport: foreground-from-suspended reaches `.ready` within 1.5 RTT
+  and delivers the first resumed output byte within 2.2 RTT + 30 ms, measured
+  against injected delay rather than on loopback (loopback RTT is ~0 and proves
+  nothing). `NWConnection.requestEstablishmentReport` is the instrumentation hook.
+- Acceptance, roaming: WiFi to cellular switch mid-session with no visible
+  interruption. **Device-only** — one Mac has one usable interface, so this cannot
+  be settled here and is a `docs/qa/` device test.
+- Note: `nw_quic_migration_info_*` is entirely SPI, so whatever migration Network
+  framework performs is automatic and unobservable from public API. The test can
+  only assert the session survived, not that migration is what saved it.
 
 **M5. Agent events.** Termios watcher, alt-screen scanner, agent status on the
 control stream, and the daemon pushing notifications to the user's own ntfy or
