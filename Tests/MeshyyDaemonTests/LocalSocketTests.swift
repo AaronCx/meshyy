@@ -18,6 +18,7 @@ private final class TestClient {
     fileprivate var fd: Int32 = -1
     private var decoder = FrameDecoder()
     private(set) var received: [FrameEnvelope] = []
+    private var consumed = 0
 
     init(socketPath: String) throws {
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -89,10 +90,26 @@ private final class TestClient {
         return predicate(received)
     }
 
-    /// Every PTY byte received, concatenated — the stream the client would have
-    /// fed its emulator.
+    /// Every PTY byte received since the last `consumeStream()`, concatenated —
+    /// the stream the client would have fed its emulator.
     var ptyStream: [UInt8] {
-        received.filter { $0.kind == .pty }.flatMap(\.payload)
+        Array(received.filter { $0.kind == .pty }.flatMap(\.payload).dropFirst(consumed))
+    }
+
+    /// Total PTY bytes ever received, including anything already consumed.
+    ///
+    /// This — not `ptyStream.count` — is the absolute offset to resume from. The
+    /// two differ after `consumeStream()`, and conflating them made a resume ask
+    /// for an offset 17 bytes behind reality and get 17 duplicated bytes back. The
+    /// real client keeps the same distinction: `consumedOffset` is absolute.
+    var absolutePTYCount: Int {
+        received.filter { $0.kind == .pty }.flatMap(\.payload).count
+    }
+
+    /// Marks everything received so far as consumed, so a byte-exact assertion can
+    /// start from a clean slate after a handshake.
+    func consumeStream() {
+        consumed = absolutePTYCount
     }
 
     var controlFrames: [ControlFrame] {
@@ -105,9 +122,24 @@ private final class TestClient {
     }
 }
 
+/// What the session's child process is.
+private enum SessionChild {
+    /// A child that produces output forever without being asked — `yes`. For
+    /// backpressure: the question is whether the daemon keeps draining a PTY when
+    /// nobody is listening.
+    case firehose
+    /// A pure byte pipe: what goes in comes back, exactly. The right instrument
+    /// when the subject is the transport. See `DaemonConfig.deterministicEcho`.
+    case bytePipe
+    /// A real interactive shell. Only for tests whose subject IS the shell —
+    /// `stty size` reaching the kernel, or M1's "attach gives a working shell".
+    case shell
+}
+
 /// A server on a unique temp socket, torn down with the harness.
 private func withServer(
     bufferCapacity: Int = RingBuffer.defaultCapacity,
+    child: SessionChild = .bytePipe,
     _ body: (String, SessionStore) async throws -> Void
 ) async throws {
     // sockaddr_un.sun_path is 104 bytes on Darwin, and NSTemporaryDirectory()
@@ -118,17 +150,26 @@ private func withServer(
     let path = directory + "/d.sock"
     defer { try? FileManager.default.removeItem(atPath: directory) }
 
-    var config = DaemonConfig()
-    // `sh -c`-free but non-login: a login shell would source rc files and make
-    // output unpredictable across machines.
-    config.shell = "/bin/sh"
-    config.shellArguments = []
-    config.bufferCapacity = bufferCapacity
-    config.environment = [
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "TERM": "xterm-256color",
-        "HOME": NSHomeDirectory(),
-    ]
+    var config: DaemonConfig
+    switch child {
+    case .firehose:
+        config = DaemonConfig.deterministicEcho(bufferCapacity: bufferCapacity)
+        config.shell = "/usr/bin/yes"
+        config.shellArguments = ["meshyy-backpressure"]
+    case .bytePipe:
+        config = DaemonConfig.deterministicEcho(bufferCapacity: bufferCapacity)
+    case .shell:
+        // Non-login: a login shell sources rc files and makes output vary by machine.
+        config = DaemonConfig()
+        config.shell = "/bin/sh"
+        config.shellArguments = []
+        config.bufferCapacity = bufferCapacity
+        config.environment = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "TERM": "xterm-256color",
+            "HOME": NSHomeDirectory(),
+        ]
+    }
 
     let store = SessionStore(config: config)
     let server = LocalSocketServer(path: path, store: store)
@@ -139,14 +180,29 @@ private func withServer(
     await store.closeAll()
 }
 
-/// Splits a marker across printf arguments so the command's own echo cannot
-/// satisfy an assertion about the command's output. Same reasoning as PTYTests.
+/// Splits a marker across printf arguments so a *shell's* echo of the command
+/// cannot satisfy an assertion about the command's output. Only needed for the
+/// `.shell` tests; a byte pipe needs no such trick, because there is nothing to
+/// distinguish echo from output.
 private func markerCommand(_ marker: String) -> [UInt8] {
     let midpoint = marker.index(marker.startIndex, offsetBy: marker.count / 2)
     let command = "printf '%s%s\\n' '\(marker[marker.startIndex..<midpoint])' "
         + "'\(marker[midpoint...])'\n"
     return Array(command.utf8)
 }
+
+/// Deterministic payload of `count` bytes, distinct enough that a reordering or a
+/// duplication changes the array rather than merely the timing.
+///
+/// **Printable ASCII only.** Even under `stty raw` a PTY is not transparent to
+/// arbitrary bytes: flow-control and signal characters are eaten by the line
+/// discipline. A first version generating 0…250 returned 312 of 700 bytes. See
+/// `DaemonConfig.deterministicEcho`.
+private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
+    let printable = Array(0x20...0x7E)   // space through tilde, 95 values
+    return (0..<count).map { UInt8(printable[($0 * 7 + Int(seed) * 31) % printable.count]) }
+}
+
 
 @Suite("Local socket transport", .serialized,
        .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
@@ -168,7 +224,7 @@ struct LocalSocketTests {
     /// Design doc M1 acceptance: attach gives a working shell.
     @Test("Hello is answered with Welcome and a live shell")
     func attachGivesAShell() async throws {
-        try await withServer { path, _ in
+        try await withServer(child: .shell) { path, _ in
             let client = try TestClient(socketPath: path)
             defer { client.close() }
 
@@ -196,7 +252,7 @@ struct LocalSocketTests {
 
     @Test("The requested window size reaches the shell, and a resize is forwarded")
     func sizeAndResize() async throws {
-        try await withServer { path, _ in
+        try await withServer(child: .shell) { path, _ in
             let client = try TestClient(socketPath: path)
             defer { client.close() }
             client.send(.control(.hello(.init(token: "", cols: 111, rows: 41, session: "size"))))
@@ -217,18 +273,24 @@ struct LocalSocketTests {
 
     /// The M3 payoff, over the M1 transport: a client that reconnects with the
     /// offset it last held gets a byte-exact continuation.
+    ///
+    /// Asserts on whole byte arrays, not marker substrings. `docs/qa/mutation-log.md`
+    /// records a duplicating mutant that slipped past a substring-based "no
+    /// duplicates" assertion because the duplication missed the marker.
     @Test("Reattaching with a resume offset replays byte-exactly")
     func resumeReplaysExactly() async throws {
         try await withServer { path, store in
-            // First attachment: run something, remember everything seen.
             let first = try TestClient(socketPath: path)
             first.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "resume"))))
-            #expect(first.pump { !$0.isEmpty })
-            first.send(.pty(0, markerCommand("BEFORE_DROP")))
-            #expect(first.pump { _ in
-                String(decoding: first.ptyStream, as: UTF8.self).contains("BEFORE_DROP")
-            })
+            #expect(first.pump { !$0.isEmpty }, "no Welcome")
+
+            let before = payload(400, seed: 1)
+            first.send(.pty(0, before))
+            #expect(first.pump { _ in first.ptyStream.count >= before.count },
+                    "byte pipe did not return the first payload")
             let seenBefore = first.ptyStream
+            // Absolute, including the handshake marker — see `absolutePTYCount`.
+            let absoluteOffset = first.absolutePTYCount
 
             // The socket dies, standing in for an iOS suspension.
             first.close()
@@ -236,34 +298,29 @@ struct LocalSocketTests {
             // Output continues while nobody is attached.
             let session = await store.session(named: "resume")
             #expect(session != nil)
-            try await session?.send(markerCommand("WHILE_AWAY"))
-            try await Task.sleep(for: .milliseconds(600))
+            let away = payload(300, seed: 2)
+            try await session?.send(away)
+            try await Task.sleep(for: .milliseconds(400))
 
             // Reattach from exactly what the first client consumed.
             let second = try TestClient(socketPath: path)
             defer { second.close() }
             second.send(.control(.hello(.init(
                 token: "", cols: 80, rows: 24,
-                resumeFrom: UInt64(seenBefore.count),
+                resumeFrom: UInt64(absoluteOffset),
                 session: "resume"
             ))))
-            #expect(second.pump { _ in
-                String(decoding: second.ptyStream, as: UTF8.self).contains("WHILE_AWAY")
-            }, "replay did not contain what happened while away")
+            #expect(second.pump { _ in second.ptyStream.count >= away.count },
+                    "replay did not contain what happened while away")
 
-            // §6.4: no gaps, no duplicates. The two clients' streams concatenated
-            // must equal what the PTY produced, so the replay must begin exactly
-            // where the first client stopped.
+            // §6.4, asserted exactly: the two clients' streams concatenated must
+            // equal what the PTY produced, with no gap and no overlap.
             let combined = seenBefore + second.ptyStream
-            let text = String(decoding: combined, as: UTF8.self)
-            #expect(text.contains("BEFORE_DROP"))
-            #expect(text.contains("WHILE_AWAY"))
-            // A duplicated replay would show the pre-drop marker twice.
-            let occurrences = text.components(separatedBy: "BEFORE_DROP").count - 1
-            #expect(occurrences == 1,
-                    "resume duplicated bytes the client already had (\(occurrences) copies)")
+            let expected = before + away
+            #expect(combined.count == expected.count,
+                    "expected \(expected.count) bytes across the seam, got \(combined.count)")
+            #expect(combined == expected, "the byte stream across the seam is not exact")
 
-            // And no ResumeTooOld, because the 4 MB default easily covers this.
             #expect(!second.controlFrames.contains { frame in
                 if case .resumeTooOld = frame { return true }
                 return false
@@ -292,9 +349,9 @@ struct LocalSocketTests {
             }
 
             // Far more than 512 bytes, deterministically.
-            let filler = "0123456789012345678901234567890123456789012345678901234567890"
-            let loop = "i=0; while [ $i -lt 200 ]; do printf '%s\\n' '\(filler)'; i=$((i+1)); done\n"
-            try await session.send(Array(loop.utf8))
+            // Written straight to the PTY rather than looped in a shell: 12 KiB
+            // against a 512-byte buffer, with no dependence on shell timing.
+            try await session.send(payload(12_288, seed: 6))
 
             // Wait for eviction rather than for a duration: the buffer's own window
             // moving off zero is the precondition, and nothing else will do.
@@ -340,7 +397,7 @@ struct LocalSocketTests {
 
     @Test("Two clients on the same session both see live output")
     func twoClientsShareASession() async throws {
-        try await withServer { path, _ in
+        try await withServer { path, store in
             let first = try TestClient(socketPath: path)
             defer { first.close() }
             let second = try TestClient(socketPath: path)
@@ -350,14 +407,19 @@ struct LocalSocketTests {
                 client.send(.control(.hello(.init(
                     token: "", cols: 80, rows: 24, session: "shared"
                 ))))
-                #expect(client.pump { !$0.isEmpty })
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
             }
 
-            first.send(.pty(0, markerCommand("SHARED_OUTPUT")))
+            // Driven from the daemon side so neither client is the writer, which
+            // makes "both saw it" a claim about fan-out rather than about echo.
+            let bytes = payload(256, seed: 3)
+            try await (await store.session(named: "shared"))?.send(bytes)
+
             for (index, client) in [first, second].enumerated() {
-                #expect(client.pump { _ in
-                    String(decoding: client.ptyStream, as: UTF8.self).contains("SHARED_OUTPUT")
-                }, "client \(index) did not see the shared output")
+                #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                        "client \(index) did not see the shared output")
+                #expect(client.ptyStream.suffix(bytes.count) == bytes,
+                        "client \(index) saw different bytes")
             }
         }
     }
@@ -368,7 +430,7 @@ struct LocalSocketTests {
             let client = try TestClient(socketPath: path)
             defer { client.close() }
             client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "skew"))))
-            #expect(client.pump { !$0.isEmpty })
+            #expect(client.pump { !$0.isEmpty }, "no Welcome")
 
             // A frame from a hypothetical newer client.
             let future = CBOR.map([
@@ -378,10 +440,11 @@ struct LocalSocketTests {
             client.send(FrameEnvelope(kind: .control, payload: future.encode()))
 
             // The session must still work afterwards.
-            client.send(.pty(0, markerCommand("STILL_ALIVE")))
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("STILL_ALIVE")
-            }, "an unknown control frame killed the session")
+            let bytes = payload(64, seed: 4)
+            client.send(.pty(0, bytes))
+            #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                    "an unknown control frame killed the session")
+            #expect(client.ptyStream.suffix(bytes.count) == bytes)
         }
     }
 
@@ -418,18 +481,20 @@ struct LocalSocketTests {
             let client = try TestClient(socketPath: path)
             defer { client.close() }
             client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "order"))))
-            #expect(client.pump { !$0.isEmpty })
+            #expect(client.pump { !$0.isEmpty }, "no Welcome")
 
-            // One command split across many frames, one byte at a time. If the daemon
-            // reorders any of them the shell sees garbage and the marker never
-            // appears — which is a far stronger check than comparing timestamps.
-            let command = Array("printf '%s%s\\n' ORDER ED_OK\n".utf8)
-            for byte in command {
+            // 512 bytes, ONE FRAME PER BYTE, through a byte pipe. Any reordering,
+            // duplication or loss changes the returned array — which the earlier
+            // shell-based version could not detect, because it only checked that a
+            // marker substring appeared somewhere.
+            let bytes = payload(512, seed: 5)
+            for byte in bytes {
                 client.send(.pty(0, [byte]))
             }
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("ORDERED_OK")
-            }, "input was reordered; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+            #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                    "only \(client.ptyStream.count) of \(bytes.count) bytes came back")
+            #expect(client.ptyStream == bytes,
+                    "input was reordered, duplicated or dropped across 512 single-byte frames")
         }
     }
 
@@ -437,7 +502,7 @@ struct LocalSocketTests {
     /// apply before the command runs.
     @Test("A resize applies before a command sent immediately after it")
     func resizeOrderedBeforeCommand() async throws {
-        try await withServer { path, _ in
+        try await withServer(child: .shell) { path, _ in
             let client = try TestClient(socketPath: path)
             defer { client.close() }
             client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "rz"))))
@@ -449,6 +514,100 @@ struct LocalSocketTests {
             #expect(client.pump { _ in
                 String(decoding: client.ptyStream, as: UTF8.self).contains("47 133")
             }, "the resize did not apply before the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+        }
+    }
+
+    // MARK: - Backpressure (hardening 1d)
+
+    /// The daemon must keep draining the PTY when no client is attached.
+    ///
+    /// If the read loop ever waits on anything a client controls, the child blocks
+    /// on its own stdout and the session hangs for real — and it hangs for the user
+    /// who walked away, which is the user least able to explain what happened.
+    ///
+    /// This found a live deadlock in the mirror direction. `PTYSession.send` used to
+    /// loop until the PTY accepted every byte, on the same actor that runs the read
+    /// loop, so any write larger than the PTY's few-KiB input buffer wedged the
+    /// session permanently at 100% CPU. See `PTY.writeSome`.
+    @Test("A firehose child never blocks while no client is attached")
+    func firehoseKeepsDrainingWithNoClient() async throws {
+        // 64 KiB buffer against an unbounded producer: it must wrap many times.
+        try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { _, store in
+            let session = try await store.attachOrCreate(name: "firehose", size: .default)
+
+            // Wait for the ring to have cycled well past its capacity, which can only
+            // happen if the daemon kept reading with nobody attached.
+            let target: UInt64 = 8 * 64 * 1024
+            var produced: UInt64 = 0
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                produced = await session.info.bufferedTo
+                if produced >= target { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+
+            #expect(produced >= target,
+                    "only \(produced) bytes drained in 30s; the read loop is not keeping up")
+            #expect(await session.isAlive, "the child died or blocked instead of producing")
+
+            // Oldest-first eviction: the window has moved off zero and is capped.
+            let window = await session.info
+            #expect(window.bufferedFrom > 0, "the ring buffer never evicted anything")
+            #expect(window.bufferedTo - window.bufferedFrom <= 64 * 1024,
+                    "the buffer grew past its capacity")
+
+            // And nothing is stuck waiting to be written to the PTY.
+            #expect(await session.pendingWriteCount == 0)
+        }
+    }
+
+    /// The other half of 1d: after all that eviction, a client resuming from an
+    /// offset that is long gone gets a clean answer rather than a stall.
+    @Test("A resume from an evicted offset yields ResumeTooOld, not a stall")
+    func evictedOffsetYieldsResumeTooOld() async throws {
+        try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { path, store in
+            let session = try await store.attachOrCreate(name: "firehose", size: .default)
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                if await session.info.bufferedFrom > 0 { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            #expect(await session.info.bufferedFrom > 0, "nothing was evicted in 30s")
+
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(
+                token: "", cols: 80, rows: 24, resumeFrom: 0, session: "firehose"
+            ))))
+            #expect(client.pump(timeout: 10) { frames in
+                frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
+                    if case .resumeTooOld = frame { return true }
+                    return false
+                }
+            }, "an evicted offset must be answered, not stalled; got \(client.controlFrames)")
+        }
+    }
+
+    /// A write larger than the PTY's input buffer must be accepted and drained
+    /// rather than blocking the session. This is the exact shape of a paste.
+    @Test("A write far larger than the PTY input buffer drains without wedging")
+    func largeWriteDoesNotWedge() async throws {
+        try await withServer { path, store in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "paste"))))
+            #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+            // 128 KiB in one go — far past any PTY input buffer.
+            let big = payload(128 * 1024, seed: 9)
+            client.send(.pty(0, big))
+
+            #expect(client.pump(timeout: 30) { _ in client.ptyStream.count >= big.count },
+                    "only \(client.ptyStream.count) of \(big.count) bytes came back")
+            #expect(client.ptyStream == big, "a large write was not echoed byte-exactly")
+
+            let session = await store.session(named: "paste")
+            #expect(await session?.pendingWriteCount == 0, "the write queue did not drain")
         }
     }
 }

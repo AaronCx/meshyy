@@ -65,7 +65,11 @@ let package = Package(
         ),
         .testTarget(
             name: "MeshyyCoreTests",
-            dependencies: ["MeshyyCore", "MeshyyChaos"],
+            // MeshyyChaos was declared here and imported by nothing, which reads from
+            // the manifest like a wired-up chaos harness and was not one. Dropped
+            // until ChaosUDPProxy lands and a test genuinely uses it; scripts/
+            // check-test-coverage.sh now fails the build on the same mistake.
+            dependencies: ["MeshyyCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

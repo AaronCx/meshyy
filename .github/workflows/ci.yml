@@ -23,6 +23,8 @@ jobs:
         run: scripts/check-privacy.py
       - name: MIT headers (design doc §0.3)
         run: scripts/check-headers.sh
+      - name: Every test target runs on merge (hardening 1b-zero)
+        run: scripts/check-test-coverage.sh
 
   clean-room:
     # A structural check that the one rule the project exists for has not been
@@ -41,9 +43,8 @@ jobs:
         run: swift --version && xcodebuild -version
       - name: Build
         run: swift build
-      - name: Test (deterministic suites)
-        # NOT `make test`: that sets MESHYY_INTEGRATION_TESTS=1 and pulls in the
-        # real-shell/PTY/QUIC suites, which are not stable on a shared two-core
-        # runner. `make check` before a push is what covers those.
-        # See docs/qa/known-debt.md for why, and how to close it.
+      - name: Test
+        # Runs everything, including the PTY, socket and QUIC suites. They were
+        # gated until 1b-zero; the fix was to stop asserting on a real interactive
+        # shell's timing, not to loosen the assertions. See docs/qa/known-debt.md.
         run: swift test

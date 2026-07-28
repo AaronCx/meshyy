@@ -46,3 +46,21 @@ model-level property test compares whole byte arrays; the transport-level tests
 compare substrings. That gap belongs in 1c-bis.
 
 Reverted; `git diff` clean; full suite green again.
+
+---
+
+## 2026-07-27 — 1a-bis re-check, after ungating (1b-zero)
+
+Same mutation, same command, after the transport suites were ungated and their
+assertions made byte-exact.
+
+| | before 1b-zero | after |
+|---|---|---|
+| mutant A (+1, loses bytes) | **CI green** | **7 failures** |
+
+The byte-exact resume test reports it precisely: `delivered.count → 699` against
+`before.count + away.count → 700`. **One lost byte, named.** Previously the same
+defect produced no signal at all in CI, and the substring-based version of that
+test could not see it even when run.
+
+The gap 1a-bis was written to prove is closed.

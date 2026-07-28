@@ -31,9 +31,17 @@ import Testing
 /// Recorded as debt in docs/qa/known-debt.md, with a self-hosted runner as the fix:
 /// the tests are stable on this machine, so the runner is the variable.
 enum RealProcessTests {
-    static var isEnabled: Bool {
-        ProcessInfo.processInfo.environment["MESHYY_INTEGRATION_TESTS"] == "1"
-    }
+    /// UNGATED as of 1b-zero. Kept as a single switch so the decision is visible in
+    /// one place rather than spread across `@Suite` attributes, and so a future
+    /// environment that genuinely cannot run these has somewhere to say so.
+    ///
+    /// The gate existed because the suites were flaky on a shared CI runner. The
+    /// cause was not the runner: it was asserting on a real interactive shell, whose
+    /// prompt, readline and job control made "did the bytes arrive" depend on machine
+    /// load. Replacing the shell with a byte pipe (`DaemonConfig.deterministicEcho`)
+    /// for every test whose subject is the transport removed the dependency, and made
+    /// the assertions byte-exact rather than substring-based at the same time.
+    static var isEnabled: Bool { true }
 
     static let reason: Comment =
         "set MESHYY_INTEGRATION_TESTS=1 (make test does) — spawns a real shell/PTY/socket"
