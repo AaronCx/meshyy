@@ -255,11 +255,47 @@ public actor MeshyySession {
         try connection?.send(.resize(cols: newSize.cols, rows: newSize.rows))
     }
 
-    /// Sends a quick action's keystrokes (design doc §7.3).
+    /// Performs an offered quick action, resolving its keystrokes **locally**
+    /// (design doc §7.3).
     ///
-    /// The bytes come from the caller's own `AgentProfile`, never from anything the
-    /// daemon sent. That is the §7.3 security property: the remote picks the
-    /// question, only local data may write the answer.
+    /// This overload exists so the security property is structural rather than
+    /// documentary. The daemon advertises an id and a label; the bytes come from
+    /// `profiles`, which is the caller's own data. A remote that forges a
+    /// `QuickActions` frame — or draws a convincing fake permission prompt to
+    /// provoke a real one — still cannot choose what a tap sends, because the id it
+    /// names either matches a local definition or nothing happens.
+    ///
+    /// Throws `unknownAction` rather than sending anything on a miss. Silently
+    /// doing nothing would leave a user tapping a dead button; sending a guess
+    /// would be the hole this design closes.
+    public func performQuickAction(
+        id: String,
+        from profiles: [AgentProfile]
+    ) throws {
+        let definitions = profiles.flatMap(\.quickActions)
+        guard let definition = definitions.first(where: { $0.id == id }) else {
+            throw QuickActionError.unknownAction(id: id)
+        }
+        try send(definition.sends)
+    }
+
+    public enum QuickActionError: Error, Equatable, CustomStringConvertible {
+        case unknownAction(id: String)
+
+        public var description: String {
+            switch self {
+            case .unknownAction(let id):
+                "meshyy: no local definition for quick action \(id.debugDescription). "
+                    + "Actions are resolved from local profiles, never from the wire, "
+                    + "so an id this client does not know is refused rather than guessed."
+            }
+        }
+    }
+
+    /// Sends raw keystrokes for an action the caller has already resolved.
+    ///
+    /// Prefer `performQuickAction(id:from:)`, which does the resolution and cannot
+    /// be handed bytes that came off the wire.
     public func performQuickAction(sending bytes: [UInt8]) throws {
         try send(bytes)
     }

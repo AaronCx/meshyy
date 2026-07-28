@@ -263,3 +263,31 @@ struct AgentActivityTests {
         #expect(monitor.offeredActions.isEmpty)
     }
 }
+
+@Suite("Quick action resolution")
+struct QuickActionResolutionTests {
+
+    /// The §7.3 property, stated as a test: an id is only meaningful against local
+    /// profile data. There is no path from a wire frame to a keystroke.
+    @Test("An advertised action carries no way to derive its keystrokes")
+    func wireFormIsNotSufficient() {
+        let advertised = claudeCode.quickActions[0].advertised
+        // Everything the wire gives you.
+        let fromWire = (advertised.id, advertised.label)
+        // The bytes are recoverable only by looking them up locally.
+        let local = claudeCode.quickActions.first { $0.id == fromWire.0 }
+        #expect(local?.sends == Array("1\r".utf8))
+        // And an id nobody declared resolves to nothing at all.
+        #expect(claudeCode.quickActions.first { $0.id == "injected-by-remote" } == nil)
+    }
+
+    @Test("Resolution is exact: a near-miss id does not fall through to another action")
+    func resolutionIsExact() {
+        let ids = claudeCode.quickActions.map(\.id)
+        #expect(ids == ["approve", "deny"])
+        for candidate in ["approv", "approvee", "APPROVE", "", "deny "] {
+            #expect(claudeCode.quickActions.first { $0.id == candidate } == nil,
+                    "\(candidate.debugDescription) must not resolve")
+        }
+    }
+}
