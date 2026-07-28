@@ -548,3 +548,33 @@ security-sensitive component, and this would add an inbound HTTP surface that ex
 input into a live PTY. It needs a per-session capability token, tailnet-only binding,
 and a fixed keystroke allowlist — its own separately-reviewed milestone, not a clause
 inside M6.
+
+## 2026-07-28 — 1g: the ack frame is inert on the daemon side
+
+**Finding, not a decision.** `SessionAttachment` records every `Ack` a client sends and
+consults it nowhere. Its only reader is a diagnostics accessor. Resume replays from the
+offset the client states in `Hello`, full stop.
+
+**How it surfaced.** The 1g adversarial case "an `Ack` for an offset the client never
+received" was written expecting a forged ack to be able to move a later replay point.
+The test passed immediately, which was suspicious, and a mutation confirmed the
+suspicion: wiring resume to `max(hello.resumeFrom, ackedOffset)` left it **green**. The
+forged value cannot survive to the next attach, because `ackedOffset` is per-attachment
+and is re-initialised from `hello.resumeFrom` on every attach.
+
+**Why this is right, and why it still needs recording.** A client that over-acks — by
+malice, by a bug, or by a reordered frame — cannot make the daemon skip bytes, because
+the daemon never takes the client's word for what it has consumed when deciding what to
+send. That single-source-of-truth property is what makes §6.4 hold against a lying peer
+and it should not be changed.
+
+But §6.2 describes acks as though the daemon uses them, and the client pays a control
+frame every 250 ms to send them. Either the daemon should use them (to trim the ring
+buffer, which is the obvious candidate) or §6.2 should say plainly that they are
+advisory and exist for diagnostics and for a future low-water mark. Flagged rather than
+resolved: changing what acks mean is a protocol decision, not a test fix.
+
+**Method note.** The first pass at the 1g analysis grepped for keywords and reported all
+nine cases covered; two were false positives. Coverage established by keyword is what
+produced the vacuous privacy gate and the unpinned `ClientModel`. The analysis was redone
+by reading every test name.
