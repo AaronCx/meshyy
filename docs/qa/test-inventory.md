@@ -266,3 +266,48 @@ defect was used to check it, after the privacy gate that silently ate the `//` i
 **Still open.** Nothing here impairs a live connection; every byte is delivered
 by the harness. Loss, reordering, and NAT rebind against a real QUIC session
 remain 1d-bis.
+
+---
+
+# Addendum, 2026-07-28: after 1d-bis
+
+The row that read "inject impairment | 0 | 0 — still nothing, until 1d-bis" is closed.
+
+| | before 1d-bis | after |
+|---|---|---|
+| test functions | 142 | **149** |
+| running on merge | 142 | **149** |
+| inject impairment | **0** | 7 tests against a real QUIC session over a degraded relay |
+
+`ChaosUDPProxy` relays datagrams between client and daemon without ever inspecting a
+payload, so connection IDs, version negotiation and coalescing pass through opaquely.
+The QUIC connection is real; only the network under it is fake.
+
+| knob | shape | what it is for |
+|---|---|---|
+| loss, reorder, delay, jitter | profile, seeded | ordinary degradation |
+| `blackHole(_:for:)` | runtime | deafness, then healing — M4 4a/4b |
+| `kill(after:)` | runtime | the wire stops at a byte offset |
+| `halfOpen(_:)` | runtime | one direction dies, the other lives |
+| `rebind()` | runtime | NAT rebind via a source-port change — M4 |
+| `severAll()` | runtime | the §6.1 iOS-suspension kill |
+
+**The test that fails without the relay.** `theRelayIsActuallyInThePath` asserts both
+that a pristine relay is transparent *and* that the relay's own counters show it
+carried the traffic. Transparency alone would also be satisfied by a relay that was
+never in the path — the failure mode a chaos harness is most likely to have and least
+likely to notice.
+
+**Two limitations, stated rather than implied.**
+
+1. **A seed reproduces the relay's decisions, not a whole session.** A live replay
+   would also need identical traffic, and QUIC picks its own retransmission timing.
+   The first draft of the determinism test compared two live runs and was flaky for
+   exactly that reason; it now asserts the decision stream directly.
+2. **Ordinary loss is mostly invisible.** QUIC retransmits through it, so a drop rate
+   surfaces as latency. `lossIsRetransmittedThrough` asserts that — and also asserts
+   the relay really dropped something, so a green run cannot mean "nothing happened."
+
+**Still open.** Every impairment here is synthesised on loopback. Real radio
+transitions, jetsam and backgrounding remain device-only, which is why the rewritten
+M4 requires a physical iPhone for its acceptance.
