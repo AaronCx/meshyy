@@ -53,18 +53,41 @@ repeated here because they cost an afternoon each and will again:
 And one more: a listener's `newConnectionHandler` and `newConnectionGroupHandler`
 are mutually exclusive. Setting both fails it with `EINVAL`.
 
-## ~~CI coverage of the QUIC suites~~ — RESOLVED, confirmed in a CI log
+## CI does not gate the QUIC or client-session suites — deliberate, and debt
 
-The integration suites were skipped on GitHub runners because a file keychain
-could not be created there. With the keychain gone (above) the capability probe
-succeeds and **CI now runs everything**: 127 tests in 15 suites, no skips,
-confirmed on run 30318113414.
+Removing the keychain made these suites *able* to run on a GitHub runner, and they
+did pass there twice. They also failed there three times, with a **different test
+timing out each run**, while the same suite passed six consecutive times locally in
+13 s. Three attempts to stabilise them on the runner each moved the failure instead
+of removing it: raising the wait ceilings to 30 s, replacing the detached event
+consumer with a caller-task pull (which made CI *hang* — `await iterator.next()`
+has no deadline), and serialising the suites under one parent.
 
-The gate is deliberately **kept** rather than deleted: it is a bounded capability
-probe, and an environment that cannot support these suites should skip with a
-reason rather than hang for the job timeout. But its failure mode is silence — a
-gate that quietly keeps skipping looks identical to a gate that is not needed. If
-you ever doubt what CI covered, grep the log for `skipped`.
+They assert on a real shell echoing through a real PTY over a real QUIC connection.
+That is exactly what makes them worth having, and exactly what a shared two-core
+runner cannot schedule predictably. Loosening the assertions until CI agreed would
+have weakened the tests where their value is.
+
+**So the split is explicit.** CI gates the 100+ deterministic tests: the §6.4
+property test (200 seeded scenarios), CBOR, control frames and golden fixtures, the
+screen scanner, agent activity, the notifier, the PTY suite, and the local-socket
+suite. The QUIC transport and client-session suites are gated on
+`MESHYY_INTEGRATION_TESTS=1`, which `make test` sets — so `make check` before a push
+covers them, and CI does not.
+
+**Read a green CI badge accordingly.** It does not cover the QUIC handshake, the
+bootstrap, the token rules, or the client's resume bookkeeping.
+
+Ways to close it, best first:
+
+1. **Self-hosted runner** on this Mac. The tests are stable here; the variable is
+   the runner, so change the runner rather than the tests.
+2. **Make the assertions independent of shell timing** — drive a program with
+   deterministic output instead of a shell, and assert on transport-level facts
+   rather than on `stty size` round trips. More work, and it would lose some of
+   what these tests are for.
+3. Accept a retry wrapper on the integration step. Cheapest, and the worst: it
+   trains everyone to re-run red builds.
 
 ## Tests are not parallel-safe
 

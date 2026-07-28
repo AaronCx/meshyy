@@ -41,5 +41,9 @@ jobs:
         run: swift --version && xcodebuild -version
       - name: Build
         run: swift build
-      - name: Test
+      - name: Test (deterministic suites)
+        # NOT `make test`: that sets MESHYY_INTEGRATION_TESTS=1 and pulls in the
+        # real-shell/PTY/QUIC suites, which are not stable on a shared two-core
+        # runner. `make check` before a push is what covers those.
+        # See docs/qa/known-debt.md for why, and how to close it.
         run: swift test

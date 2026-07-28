@@ -21,7 +21,15 @@ check: lint build test
 build:
 	$(SWIFT) build
 
+## Runs EVERYTHING, including the real-shell/PTY/QUIC integration suites.
+## Those are gated on MESHYY_INTEGRATION_TESTS because they are not stable on a
+## shared CI runner; see docs/qa/known-debt.md. `make check` before every push is
+## what actually covers them.
 test:
+	MESHYY_INTEGRATION_TESTS=1 $(SWIFT) test
+
+## What CI runs: the deterministic suites only.
+test-ci:
 	$(SWIFT) test
 
 lint: licences privacy headers cleanroom

@@ -23,35 +23,49 @@ import Testing
 /// long since delivered everything. The symptom was a client offset of 16 against
 /// a daemon offset of 69 — not a transport bug, a test that was measuring its own
 /// scheduler.
-private final class EventLog {
+private final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
     private var events: [MeshyySessionEvent] = []
-    private var iterator: AsyncStream<MeshyySessionEvent>.AsyncIterator?
 
+    /// Consumes on a detached task, and `wait` polls with a bounded sleep.
+    ///
+    /// An earlier version pulled events on the caller's task to remove the
+    /// dependency on that task being scheduled. That was worse: `await
+    /// iterator.next()` blocks indefinitely when nothing arrives, so the deadline
+    /// check between elements never ran and CI hung instead of failing. A test
+    /// helper must be incapable of hanging, whatever the product does.
     func attach(to session: MeshyySession) async {
-        iterator = await session.events.makeAsyncIterator()
+        let stream = await session.events
+        Task { [weak self] in
+            for await event in stream { self?.append(event) }
+        }
     }
 
-    var all: [MeshyySessionEvent] { events }
+    private func append(_ event: MeshyySessionEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    var all: [MeshyySessionEvent] { lock.withLock { events } }
 
     var outputBytes: [UInt8] {
-        events.compactMap { if case .output(let bytes) = $0 { return bytes } else { return nil } }
+        all.compactMap { if case .output(let bytes) = $0 { return bytes } else { return nil } }
             .flatMap { $0 }
     }
 
     var text: String { String(decoding: outputBytes, as: UTF8.self) }
 
     var rebuilds: [(UInt64, UInt64)] {
-        events.compactMap {
+        all.compactMap {
             if case .screenRebuilt(let from, let at) = $0 { return (from, at) } else { return nil }
         }
     }
 
     var failures: [String] {
-        events.compactMap { if case .failed(let reason) = $0 { return reason } else { return nil } }
+        all.compactMap { if case .failed(let reason) = $0 { return reason } else { return nil } }
     }
 
     var summary: String {
-        events.map { event in
+        all.map { event in
             switch event {
             case .output(let bytes): "output(\(bytes.count)B)"
             case .screenRebuilt(let from, let at): "rebuilt(\(from)->\(at))"
@@ -73,14 +87,12 @@ private final class EventLog {
     @discardableResult
     func wait(
         timeout: TimeInterval = 30,
-        until predicate: () -> Bool
+        until predicate: @Sendable @escaping () -> Bool
     ) async -> Bool {
-        if predicate() { return true }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            guard let next = await iterator?.next() else { return predicate() }
-            events.append(next)
             if predicate() { return true }
+            try? await Task.sleep(for: .milliseconds(25))
         }
         return predicate()
     }
