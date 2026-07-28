@@ -15,6 +15,20 @@ import Darwin
 import Foundation
 import MeshyyCore
 
+/// Stops a write to a hung-up peer from killing the process.
+///
+/// On Darwin, `write` to a socket whose peer has closed raises SIGPIPE, whose
+/// default disposition is to terminate. For a daemon that is fatal and absurd:
+/// one client quitting at the wrong moment takes down every other session. This
+/// makes the write return EPIPE instead, which the write loops handle.
+///
+/// Found by `LocalSocketTests.overrunIsAnnounced`, which closes clients while the
+/// server is mid-burst; the whole test process died with signal 13.
+public func silenceSIGPIPE(on fd: Int32) {
+    var on: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+}
+
 public final class LocalSocketServer: @unchecked Sendable {
     public enum ServerError: Error, CustomStringConvertible {
         case pathTooLong(String)
@@ -163,6 +177,7 @@ public final class LocalSocketServer: @unchecked Sendable {
             let fd = Darwin.accept(listenFD, nil, nil)
             if fd < 0 { return } // EAGAIN: no more pending
             let accepted = fd
+            silenceSIGPIPE(on: accepted)
             let client = LocalClient(fd: accepted, store: store) { [weak self] finished in
                 guard let self else { return }
                 self.queue.async { [weak self] in
@@ -384,6 +399,7 @@ final class LocalClient: @unchecked Sendable {
                 if written > 0 { offset += written; continue }
                 if errno == EAGAIN || errno == EWOULDBLOCK { usleep(1_000); continue }
                 if errno == EINTR { continue }
+                // EPIPE: the peer hung up mid-write. Routine, not exceptional.
                 self.closeLocked()
                 return
             }

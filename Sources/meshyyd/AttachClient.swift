@@ -100,6 +100,9 @@ final class AttachClient: @unchecked Sendable {
             Darwin.close(descriptor)
             return false
         }
+        // A daemon that goes away mid-write must not kill this process with
+        // SIGPIPE; the write loops handle EPIPE instead.
+        silenceSIGPIPE(on: descriptor)
         fd = descriptor
         return true
     }

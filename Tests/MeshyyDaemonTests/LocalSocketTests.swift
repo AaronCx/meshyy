@@ -46,6 +46,7 @@ private final class TestClient {
             throw Failure.connect(String(cString: strerror(errno)))
         }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+        silenceSIGPIPE(on: fd)
     }
 
     enum Failure: Error { case socket, connect(String) }
@@ -263,19 +264,40 @@ struct LocalSocketTests {
     }
 
     /// Design doc §3.5, fail visible: an overrun must be announced, not spliced.
+    ///
+    /// The first version of this test assumed a fixed amount of shell output would
+    /// overflow a 512-byte buffer. It did locally and did not on CI, because the
+    /// prompt string differs per machine and the prompt is part of the volume. So
+    /// this waits for the precondition it actually needs — that eviction has
+    /// happened — instead of assuming it.
     @Test("An overrun resume is announced with ResumeTooOld rather than spliced silently")
     func overrunIsAnnounced() async throws {
-        // A tiny buffer so a little output evicts the client's offset.
         try await withServer(bufferCapacity: 512) { path, store in
             let client = try TestClient(socketPath: path)
             defer { client.close() }
             client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "overrun"))))
             #expect(client.pump { !$0.isEmpty })
 
-            let session = await store.session(named: "overrun")
-            // Well over 512 bytes, so offset 0 is long gone.
-            try await session?.send(Array("for i in 1 2 3 4 5 6 7 8; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx%s\\n' $i; done\n".utf8))
-            try await Task.sleep(for: .milliseconds(800))
+            guard let session = await store.session(named: "overrun") else {
+                Issue.record("session was not created")
+                return
+            }
+
+            // Far more than 512 bytes, deterministically.
+            let filler = "0123456789012345678901234567890123456789012345678901234567890"
+            let loop = "i=0; while [ $i -lt 200 ]; do printf '%s\\n' '\(filler)'; i=$((i+1)); done\n"
+            try await session.send(Array(loop.utf8))
+
+            // Wait for eviction rather than for a duration: the buffer's own window
+            // moving off zero is the precondition, and nothing else will do.
+            var evicted = false
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if await session.info.bufferedFrom > 0 { evicted = true; break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            #expect(evicted, "the ring buffer never overran, so there is nothing to announce")
+            guard evicted else { return }
 
             let late = try TestClient(socketPath: path)
             defer { late.close() }
