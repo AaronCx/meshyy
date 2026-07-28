@@ -344,17 +344,46 @@ final class QUICPeer: @unchecked Sendable {
     }
 
     /// Actually releases everything. Always on `queue`.
+    ///
+    /// Streams are FINished, not cancelled outright. `inFlightSends` reaching zero
+    /// only means Network framework *accepted* the bytes — `contentProcessed` fires
+    /// when the transport takes them, not when the peer has them. Cancelling at that
+    /// moment resets the QUIC stream, and a reset tells the peer to discard whatever
+    /// was still in flight. The symptom was a client that saw a silent hang instead
+    /// of the Error explaining why its token was refused, and it only appeared under
+    /// load: alone the bytes had already left, in a busy suite they had not.
+    ///
+    /// So: signal end-of-stream, let the peer drain, and only then cancel.
     private func tearDown() {
         guard !closed else { return }
         closed = true
         let attachment = self.attachment
         self.attachment = nil
-        for stream in streams.values { stream.cancel() }
+
+        let closing = Array(streams.values)
+        for stream in closing {
+            stream.send(
+                content: nil,
+                contentContext: .finalMessage,
+                isComplete: true,
+                completion: .contentProcessed { _ in }
+            )
+        }
         streams.removeAll()
         decoders.removeAll()
         streamForKind.removeAll()
-        group.cancel()
+
+        // Bounded: a peer that never reads must not hold the connection open, but a
+        // peer that is merely busy must get its last frame.
+        queue.asyncAfter(deadline: .now() + Self.drainGrace) { [group] in
+            for stream in closing { stream.cancel() }
+            group.cancel()
+        }
+
         attachment?.finish()
         onFinish(self)
     }
+
+    /// How long a FINished stream is given to reach the peer before it is cancelled.
+    private static let drainGrace: TimeInterval = 0.5
 }
