@@ -373,3 +373,56 @@ cover: the view was right when the user tapped and wrong by the time the tap arr
 **Mutation-checked**: removing the tier-1 gate, offering the palette regardless of
 status, and letting a stale status survive a reattach were each planted and each named
 by a test.
+
+---
+
+# 1g: gap analysis of the nine adversarial cases
+
+Checked against the existing suite before adding anything, as the brief asked.
+
+| # | case | before | after |
+|---|---|---|---|
+| 1 | disconnect mid-frame, partway through a control frame | covered (1h) | — |
+| 2 | disconnect during replay, before the client caught up | covered (1h) | — |
+| 3 | reconnect with an offset older than the buffer → `ResumeTooOld` | covered ×3 | — |
+| 4 | reconnect with an offset ahead of the write head → rejected | covered ×2 | — |
+| 5 | duplicate `Hello` on one session | **not covered** | added |
+| 6 | two connections claiming one session id concurrently | partial — unix socket only | added over QUIC |
+| 7 | `Ack` for an offset the client never received | **not covered** | added |
+| 8 | large PTY burst while the client is disconnected | covered | — |
+| 9 | resize during disconnect | covered (1h) | — |
+
+**Count: 171 → 174.** Six were already covered, one partially, two not at all. Both of
+the genuine gaps are protocol-*abuse* cases rather than network-failure ones, which is
+consistent — the suite grew out of resume correctness, and a peer that lies had never
+been the subject.
+
+## How the analysis was done, and how it was nearly done wrong
+
+The first pass grepped the suite for keywords and reported **all nine as covered**. Two
+were false positives: one matched the bare word "twice" in an unrelated comment, the
+other matched "simultaneous" in the M4 reconnect tests, which are about trigger
+concurrency and have nothing to do with sessions. A coverage claim established by
+keyword is exactly what produced the vacuous privacy gate and the unpinned
+`ClientModel`. The real analysis was done by reading every test name in the suite.
+
+## What case 7 actually found: the ack frame is inert on the daemon side
+
+The forged-`Ack` test was written expecting a lie to be able to move a later replay
+point. It cannot, and the first version of the test passed **while proving nothing** —
+caught by mutation: wiring resume to `max(hello.resumeFrom, ackedOffset)` left it
+green.
+
+The reason is structural. `ackedOffset` lives on the *attachment*, not the session, and
+is re-initialised from `hello.resumeFrom` on every attach, so an ack sent down one
+connection is unreachable from the next. And a search for its readers turns up exactly
+one — a diagnostics accessor. **Nothing in the daemon consults an ack when deciding
+what to replay.** Resume is driven entirely by the offset the client states in `Hello`.
+
+That is not a defect: the client's own offset being the single source of truth is
+precisely what makes resume robust against a lying or buggy peer. But it is worth
+writing down, because §6.2 reads as though the daemon uses acks and it does not — the
+client sends one every 250 ms and the daemon files it. The test was renamed to assert
+the property that actually protects the client and that a mutation *can* break: the
+replay point is exactly what the client asked for, byte for byte. Making resume ignore
+the stated offset, or shift it by one, both turn it red.
