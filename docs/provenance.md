@@ -296,3 +296,45 @@ server-facing 4-tuple; SDK interface inspection of NWProtocolQUIC.Metadata.
 
 Consulted: RFC 9000 §9 (connection migration); Apple Network framework interfaces;
 design doc §6.1, §10 M4, §12.1.
+
+---
+
+## 2026-07-27 SecIdentityCreate: no keychain, and a latent hang avoided
+
+Decision: `DaemonIdentity` obtains its `SecIdentity` from
+`SecIdentityCreate(nil, certificate, privateKey)` and touches no keychain. The key
+is generated transient (`kSecAttrIsPermanent: false`) and persisted as a raw P-256
+representation in a 0600 file beside the certificate DER.
+
+This **supersedes** the M0 spike's conclusion that a dedicated file keychain was
+the only working route. That conclusion rested on an assumption I did not check —
+that `SecIdentityCreate` was private SPI. It is not: it is in
+`Security.framework/Headers/SecIdentity.h`, `API_AVAILABLE(macos(10.12))`, and not
+deprecated.
+
+Three things the mistake would have cost, and only the first was known at the time:
+
+1. Deprecated API (`SecKeychainCreate` et al, deprecated since 10.10) carried for
+   no reason.
+2. **A latent hang after every update.** Keys in a file keychain are ACL-bound to
+   the binary that created them. meshyyd would have loaded its own key happily
+   until the next time it was rebuilt, and then blocked on a Security prompt no
+   headless process can answer. A failure that appears only after an update, in a
+   launchd agent, is close to the worst shape a bug can have.
+3. **No CI coverage.** A file keychain needs a Security session, which a GitHub
+   runner lacks, so the QUIC integration suites skipped there. Removing the
+   keychain removes the gate.
+
+Verified rather than assumed: two separate `meshyyd` processes over the same
+directory report an identical certificate fingerprint, and the stored files are
+0600 in a 0700 directory.
+
+The lesson worth keeping is not about Security framework. It is that "this API is
+private" was an assumption that felt like knowledge, and it went unchecked through
+a whole spike and into shipping code. The header was one grep away.
+
+Source: `Security.framework/Headers/SecIdentity.h`; empirical verification on
+macOS 26.4.1.
+
+Consulted: design doc §5.1, §8; docs/spikes/2026-07-27-quic-network-framework.md
+(now annotated as superseded).

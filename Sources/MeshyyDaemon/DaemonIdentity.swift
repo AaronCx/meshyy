@@ -1,24 +1,33 @@
 // meshyy — the daemon's TLS identity (design doc §5.1, §8).
 // Copyright (c) 2026 Aaron Character. MIT licence — see LICENSE.
 //
-// Network framework's QUIC needs a `sec_identity_t`, which needs a private key
-// and a certificate the keychain can pair. meshyyd generates both at first run and
-// reports the certificate's SHA-256 over the already-authenticated SSH channel;
-// the client pins that fingerprint. No CA, and no new trust decision for the user.
+// Network framework's QUIC needs a `sec_identity_t`, which needs a certificate and
+// its private key. meshyyd generates both at first run and reports the
+// certificate's SHA-256 over the already-authenticated SSH channel; the client
+// pins that fingerprint. No CA, and no new trust decision for the user.
 //
-// STORAGE: a dedicated file keychain, which is the only route that works. The M0
-// spike (docs/spikes/2026-07-27-quic-network-framework.md) measured the
-// alternatives:
-//   - data-protection keychain: -34018 errSecMissingEntitlement. Needs a
-//     team-prefixed keychain-access-groups entitlement, which an unsigned or
-//     ad-hoc-signed binary cannot have.
-//   - login keychain: -25308 errSecInteractionNotAllowed. It is locked in an SSH
-//     session and cannot prompt — and headless is exactly meshyyd's case.
-// Both failures are structural rather than transient, so there is nothing to
-// retry. SecKeychainCreate/SecKeychainUnlock are deprecated (macOS 10.10) and
-// still functional on 26.4.1; the migration path if they are removed is to sign
-// meshyyd with a Developer ID plus the entitlement and switch to the
-// data-protection keychain, which already fails *only* for want of it.
+// NO KEYCHAIN. `SecIdentityCreate(nil, certificate, privateKey)` pairs a
+// certificate with a key directly — public API, `API_AVAILABLE(macos(10.12))`, not
+// deprecated, and it touches no keychain at all.
+//
+// The M0 spike assumed this function was private SPI and built on a dedicated file
+// keychain instead. That was wrong, and the mistake was not free:
+//
+//   * `SecKeychainCreate` and friends are deprecated (macOS 10.10).
+//   * Worse, keys in a file keychain are ACL-bound to the binary that created
+//     them, so the daemon would have loaded its own key fine until the next time
+//     `meshyyd` was rebuilt — and then **hung**, silently, on a Security prompt no
+//     headless process can answer. A bug that appears only after an update is the
+//     worst kind to ship.
+//   * And it needed a Security session, which a CI runner does not have, so the
+//     QUIC integration suites could not run in CI.
+//
+// All three go away here. See docs/provenance.md, 2026-07-27 (SecIdentityCreate).
+//
+// Persistence is two files under `~/.meshyy`, both 0600: the raw P-256 private key
+// and the certificate DER. The fingerprint is therefore stable across restarts,
+// which matters for debugging rather than for security — the client re-pins on
+// every bootstrap, so a rotated identity is merely invisible rather than breaking.
 
 import CryptoKit
 import Darwin
@@ -29,201 +38,112 @@ import Security
 public struct DaemonIdentity: @unchecked Sendable {
     /// The paired key and certificate, for `sec_identity_create`.
     public let secIdentity: SecIdentity
-    /// DER of the certificate, as sent to no one — only its digest travels.
+    /// DER of the certificate. Only its digest ever travels.
     public let certificateDER: Data
     /// Lowercase hex SHA-256 of `certificateDER`. This is what the client pins.
     public let fingerprint: String
 
     public enum IdentityError: Error, CustomStringConvertible {
-        case keychain(String, OSStatus)
         case keyGeneration(String)
         case certificateRejected(byteCount: Int)
         case signing(String)
         case selfSignatureInvalid(String)
-        case directoryUnavailable(String)
+        case identityPairingFailed
+        case storageUnavailable(String)
 
         public var description: String {
             switch self {
-            case .keychain(let step, let status):
-                let text = SecCopyErrorMessageString(status, nil) as String? ?? "unknown"
-                return "identity: \(step) failed: \(text) (OSStatus \(status))"
             case .keyGeneration(let detail):
-                return "identity: key generation failed: \(detail)"
+                "identity: key generation failed: \(detail)"
             case .certificateRejected(let count):
-                return "identity: Security framework rejected our \(count)-byte "
-                    + "certificate DER as malformed"
+                "identity: Security framework rejected our \(count)-byte certificate "
+                    + "DER as malformed"
             case .signing(let detail):
-                return "identity: signing the certificate failed: \(detail)"
+                "identity: signing the certificate failed: \(detail)"
             case .selfSignatureInvalid(let detail):
-                return "identity: the certificate we just built does not validate "
-                    + "against itself: \(detail)"
-            case .directoryUnavailable(let detail):
-                return "identity: cannot prepare the keychain directory: \(detail)"
+                "identity: the certificate we just built does not validate against "
+                    + "itself: \(detail)"
+            case .identityPairingFailed:
+                "identity: SecIdentityCreate refused the certificate/key pair — the "
+                    + "certificate's public key does not match the private key"
+            case .storageUnavailable(let detail):
+                "identity: cannot persist the identity: \(detail)"
             }
         }
     }
 
-    /// Where the keychain and its password live. `~/.meshyy`, 0700.
     public static var defaultDirectory: String {
         (NSHomeDirectory() as NSString).appendingPathComponent(".meshyy")
     }
 
-    private static let keyLabel = "meshyyd identity key"
-    private static let certLabel = "meshyyd identity certificate"
-    private static let applicationTag = Data("com.aaroncx.meshyyd.identity".utf8)
-    /// Ten years. The certificate is pinned by fingerprint, not trusted by date,
-    /// and an expiry that lapses would break a daemon nobody has touched for
-    /// years for no security benefit.
+    /// Ten years. The certificate is pinned by fingerprint, not trusted by date, so
+    /// an expiry that lapsed would break a daemon nobody had touched for years in
+    /// exchange for nothing.
     private static let validity: TimeInterval = 60 * 60 * 24 * 3650
 
-    /// Loads the existing identity, or creates one on first run.
-    public static func loadOrCreate(directory: String = DaemonIdentity.defaultDirectory) throws -> DaemonIdentity {
-        let keychainPath = (directory as NSString).appendingPathComponent("meshyyd.keychain-db")
-        let passwordPath = (directory as NSString).appendingPathComponent("keychain-password")
+    // MARK: - Load or create
 
+    public static func loadOrCreate(
+        directory: String = DaemonIdentity.defaultDirectory
+    ) throws -> DaemonIdentity {
         try prepareDirectory(directory)
+        let keyPath = (directory as NSString).appendingPathComponent("identity.key")
+        let certPath = (directory as NSString).appendingPathComponent("identity.crt")
 
-        if FileManager.default.fileExists(atPath: keychainPath),
-           let password = try? String(contentsOfFile: passwordPath, encoding: .utf8),
-           let keychain = try? openKeychain(path: keychainPath, password: password),
-           let existing = try? load(from: keychain) {
+        if let existing = try? load(keyPath: keyPath, certPath: certPath) {
             return existing
         }
-
-        // Either first run or an unusable keychain. Replace rather than limp:
-        // a client that cannot complete a handshake is worse than one that has to
-        // re-pin, and re-pinning is free because the fingerprint travels over SSH
-        // on every connect (design doc §5.1).
-        try? FileManager.default.removeItem(atPath: keychainPath)
-        let password = TokenStore.randomSecret(bytes: 32)
-        try writePrivately(password, to: passwordPath)
-        let keychain = try createKeychain(path: keychainPath, password: password)
-        return try generate(into: keychain)
+        // Either first run or unusable material. Replace rather than limp: the client
+        // re-pins on every bootstrap (design doc §5.1), so a regenerated identity
+        // costs nothing, while a daemon that cannot complete a handshake costs
+        // everything.
+        return try generate(keyPath: keyPath, certPath: certPath)
     }
 
-    // MARK: - Keychain
-
-    private static func prepareDirectory(_ directory: String) throws {
-        do {
-            try FileManager.default.createDirectory(
-                atPath: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            // createDirectory does not fix an existing directory's mode.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: directory
-            )
-        } catch {
-            throw IdentityError.directoryUnavailable("\(error)")
+    private static func load(keyPath: String, certPath: String) throws -> DaemonIdentity {
+        guard let keyData = FileManager.default.contents(atPath: keyPath),
+              let certDER = FileManager.default.contents(atPath: certPath)
+        else {
+            throw IdentityError.storageUnavailable("no stored identity")
         }
-    }
 
-    private static func writePrivately(_ contents: String, to path: String) throws {
-        // Created 0600 before anything is written, so the password is never
-        // briefly world-readable.
-        FileManager.default.createFile(atPath: path, contents: nil, attributes: [
-            .posixPermissions: 0o600,
-        ])
-        do {
-            try contents.write(toFile: path, atomically: false, encoding: .utf8)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: path
-            )
-        } catch {
-            throw IdentityError.directoryUnavailable("cannot write \(path): \(error)")
-        }
-    }
-
-    // SecKeychain is deprecated but is the only route that works headlessly for an
-    // unsigned binary; see the file header. Suppressed narrowly so the rest of the
-    // file still gets deprecation warnings.
-    @available(macOS, deprecated: 10.10)
-    private static func createKeychain(path: String, password: String) throws -> SecKeychain {
-        var keychain: SecKeychain?
-        let status = SecKeychainCreate(path, UInt32(password.utf8.count), password, false, nil, &keychain)
-        guard status == errSecSuccess, let keychain else {
-            throw IdentityError.keychain("SecKeychainCreate", status)
-        }
-        // Never lock on sleep or after an interval: meshyyd must be able to answer
-        // a QUIC handshake at 4am with nobody logged in.
-        var settings = SecKeychainSettings(
-            version: UInt32(SEC_KEYCHAIN_SETTINGS_VERS1),
-            lockOnSleep: false,
-            useLockInterval: false,
-            lockInterval: .max
-        )
-        SecKeychainSetSettings(keychain, &settings)
-        let unlock = SecKeychainUnlock(keychain, UInt32(password.utf8.count), password, true)
-        guard unlock == errSecSuccess else {
-            throw IdentityError.keychain("SecKeychainUnlock", unlock)
-        }
-        return keychain
-    }
-
-    @available(macOS, deprecated: 10.10)
-    private static func openKeychain(path: String, password: String) throws -> SecKeychain {
-        var keychain: SecKeychain?
-        let status = SecKeychainOpen(path, &keychain)
-        guard status == errSecSuccess, let keychain else {
-            throw IdentityError.keychain("SecKeychainOpen", status)
-        }
-        let unlock = SecKeychainUnlock(keychain, UInt32(password.utf8.count), password, true)
-        guard unlock == errSecSuccess else {
-            throw IdentityError.keychain("SecKeychainUnlock", unlock)
-        }
-        return keychain
-    }
-
-    // MARK: - Load
-
-    @available(macOS, deprecated: 10.10)
-    private static func load(from keychain: SecKeychain) throws -> DaemonIdentity {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecAttrLabel as String: certLabel,
-            kSecMatchSearchList as String: [keychain] as CFArray,
-            kSecReturnRef as String: true,
+        var error: Unmanaged<CFError>?
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrKeySizeInBits as String: 256,
         ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess, let identity = item as! SecIdentity? else {
-            throw IdentityError.keychain("SecItemCopyMatching(identity)", status)
+        guard let privateKey = SecKeyCreateWithData(
+            keyData as CFData, attributes as CFDictionary, &error
+        ) else {
+            throw IdentityError.keyGeneration(
+                "stored key is unusable: "
+                    + (error.map { String(describing: $0.takeRetainedValue()) } ?? "unknown")
+            )
         }
-
-        var certificate: SecCertificate?
-        let copy = SecIdentityCopyCertificate(identity, &certificate)
-        guard copy == errSecSuccess, let certificate else {
-            throw IdentityError.keychain("SecIdentityCopyCertificate", copy)
+        guard let certificate = SecCertificateCreateWithData(nil, certDER as CFData) else {
+            throw IdentityError.certificateRejected(byteCount: certDER.count)
         }
-        let der = SecCertificateCopyData(certificate) as Data
+        guard let identity = SecIdentityCreate(nil, certificate, privateKey) else {
+            throw IdentityError.identityPairingFailed
+        }
         return DaemonIdentity(
             secIdentity: identity,
-            certificateDER: der,
-            fingerprint: Self.hex(SHA256.hash(data: der))
+            certificateDER: certDER,
+            fingerprint: hex(SHA256.hash(data: certDER))
         )
     }
 
-    // MARK: - Generate
-
-    @available(macOS, deprecated: 10.10)
-    private static func generate(into keychain: SecKeychain) throws -> DaemonIdentity {
-        let privateAttributes: [String: Any] = [
-            kSecAttrIsPermanent as String: true,
-            kSecAttrLabel as String: keyLabel,
-            kSecAttrApplicationTag as String: applicationTag,
-            kSecUseKeychain as String: keychain,
-        ]
+    private static func generate(keyPath: String, certPath: String) throws -> DaemonIdentity {
+        // Transient: `kSecAttrIsPermanent` false means the key exists only in this
+        // process's memory and no keychain is consulted. Persistence is our own file
+        // below, which is what keeps the key free of an ACL bound to this binary.
+        var error: Unmanaged<CFError>?
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits as String: 256,
-            kSecUseKeychain as String: keychain,
-            kSecPrivateKeyAttrs as String: privateAttributes,
+            kSecPrivateKeyAttrs as String: [kSecAttrIsPermanent as String: false],
         ]
-
-        var error: Unmanaged<CFError>?
         guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
             throw IdentityError.keyGeneration(
                 error.map { String(describing: $0.takeRetainedValue()) } ?? "unknown"
@@ -245,11 +165,11 @@ public struct DaemonIdentity: @unchecked Sendable {
             publicKeyPoint: [UInt8](pointData),
             serialNumber: serial,
             commonName: "meshyyd",
-            // Backdated an hour so a small clock skew between the daemon and a
-            // validator does not make a fresh certificate not-yet-valid.
+            // Backdated an hour so a small clock skew does not make a fresh
+            // certificate not-yet-valid.
             notBefore: Date().addingTimeInterval(-3600),
             notAfter: Date().addingTimeInterval(validity),
-            dnsNames: Self.subjectAlternativeNames(),
+            dnsNames: subjectAlternativeNames(),
             subjectKeyIdentifier: Array(SHA256.hash(data: pointData).prefix(20))
         )
 
@@ -260,48 +180,78 @@ public struct DaemonIdentity: @unchecked Sendable {
             throw IdentityError.signing("building TBSCertificate: \(error)")
         }
         guard let signature = SecKeyCreateSignature(
-            privateKey,
-            .ecdsaSignatureMessageX962SHA256,
-            Data(tbs) as CFData,
-            &error
+            privateKey, .ecdsaSignatureMessageX962SHA256, Data(tbs) as CFData, &error
         ) as Data? else {
             throw IdentityError.signing(
                 error.map { String(describing: $0.takeRetainedValue()) } ?? "unknown"
             )
         }
 
-        let der: Data
+        let certDER: Data
         do {
-            der = Data(try template.certificate(signature: [UInt8](signature)))
+            certDER = Data(try template.certificate(signature: [UInt8](signature)))
         } catch {
             throw IdentityError.signing("assembling certificate: \(error)")
         }
 
-        guard let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
-            throw IdentityError.certificateRejected(byteCount: der.count)
+        guard let certificate = SecCertificateCreateWithData(nil, certDER as CFData) else {
+            throw IdentityError.certificateRejected(byteCount: certDER.count)
         }
 
         // Validate the self-signature with something that actually checks it. A
-        // fingerprint-pinning client would happily accept a certificate whose own
-        // signature was garbage, so this is the only place the mistake would be
-        // caught — and it must be caught here, not by whatever validates it later.
+        // fingerprint-pinning client would accept a certificate whose own signature
+        // was garbage, so this is the only place the mistake would ever be caught.
         if let failure = selfSignatureFailure(certificate) {
             throw IdentityError.selfSignatureInvalid(failure)
         }
 
-        let add: [String: Any] = [
-            kSecClass as String: kSecClassCertificate,
-            kSecValueRef as String: certificate,
-            kSecAttrLabel as String: certLabel,
-            kSecUseKeychain as String: keychain,
-        ]
-        let addStatus = SecItemAdd(add as CFDictionary, nil)
-        guard addStatus == errSecSuccess || addStatus == errSecDuplicateItem else {
-            throw IdentityError.keychain("SecItemAdd(certificate)", addStatus)
+        guard let identity = SecIdentityCreate(nil, certificate, privateKey) else {
+            throw IdentityError.identityPairingFailed
         }
 
-        return try load(from: keychain)
+        guard let keyData = SecKeyCopyExternalRepresentation(privateKey, &error) as Data? else {
+            throw IdentityError.keyGeneration("cannot export the private key for storage")
+        }
+        try writePrivately(keyData, to: keyPath)
+        try writePrivately(certDER, to: certPath)
+
+        return DaemonIdentity(
+            secIdentity: identity,
+            certificateDER: certDER,
+            fingerprint: hex(SHA256.hash(data: certDER))
+        )
     }
+
+    // MARK: - Storage
+
+    private static func prepareDirectory(_ directory: String) throws {
+        do {
+            try FileManager.default.createDirectory(
+                atPath: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            // createDirectory does not fix the mode of a directory that already exists.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: directory
+            )
+        } catch {
+            throw IdentityError.storageUnavailable("\(error)")
+        }
+    }
+
+    /// Writes 0600, and creates the file with that mode rather than fixing it after
+    /// — otherwise the private key is briefly world-readable.
+    private static func writePrivately(_ data: Data, to path: String) throws {
+        try? FileManager.default.removeItem(atPath: path)
+        guard FileManager.default.createFile(
+            atPath: path, contents: data, attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw IdentityError.storageUnavailable("cannot write \(path)")
+        }
+    }
+
+    // MARK: - Certificate helpers
 
     /// dNSNames for the certificate. Not load-bearing — the client pins a
     /// fingerprint and replaces chain validation entirely — but a well-formed

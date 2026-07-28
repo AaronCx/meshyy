@@ -134,7 +134,7 @@ final class TestDaemonHarness: @unchecked Sendable {
 /// environment that cannot support these suites SKIPS them with a reason, which is
 /// honest, instead of hanging for the job's timeout, which is not.
 enum IntegrationSupport {
-    nonisolated(unsafe) static let isAvailable: Bool = probe()
+    static let isAvailable: Bool = probe()
 
     private static func probe() -> Bool {
         let finished = DispatchSemaphore(value: 0)

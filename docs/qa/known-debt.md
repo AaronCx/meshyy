@@ -2,28 +2,21 @@
 
 Things that work, are deliberate, and would be wrong to forget.
 
-## Deprecated keychain API in `meshyyd`
+## ~~Deprecated keychain API in `meshyyd`~~ — RESOLVED
 
-`DaemonIdentity` uses `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainUnlock`
-and `SecKeychainSetSettings`, all deprecated since macOS 10.10. They work on
-26.4.1 and emit deprecation warnings, which are left in place on purpose: they are
-a standing reminder rather than noise to suppress.
+`DaemonIdentity` no longer touches a keychain. `SecIdentityCreate(nil, cert, key)`
+is public, `API_AVAILABLE(macos(10.12))` and not deprecated; the key is generated
+transient and persisted as a 0600 file alongside the certificate DER.
 
-**Why there is no alternative today.** Measured in
-`docs/spikes/2026-07-27-quic-network-framework.md`:
+This removed three problems at once, only one of which was known at the time:
 
-- Data-protection keychain: `-34018` errSecMissingEntitlement. It needs a
-  team-prefixed `keychain-access-groups` entitlement, which an unsigned or
-  ad-hoc-signed binary cannot carry.
-- Login keychain: `-25308` errSecInteractionNotAllowed. Locked in an SSH session
-  with no way to prompt — and headless is precisely meshyyd's case.
-
-Both are structural, not transient.
-
-**Migration when Apple removes it.** Sign `meshyyd` with Aaron's Developer ID plus
-a `keychain-access-groups` entitlement and switch to the data-protection keychain,
-which already fails *only* for want of that entitlement. A launchd agent should be
-signed anyway, so this is scheduling rather than research.
+1. The deprecated `SecKeychain*` surface is gone.
+2. **A latent hang.** File-keychain keys are ACL-bound to the binary that created
+   them, so meshyyd would have worked until its next rebuild and then blocked on a
+   Security prompt no headless process can answer. A bug that only appears after an
+   update.
+3. **CI coverage.** No keychain means no Security session requirement, so the
+   integration suites can run on a runner.
 
 ## QUIC 0-RTT is not available
 
@@ -59,6 +52,19 @@ repeated here because they cost an afternoon each and will again:
 
 And one more: a listener's `newConnectionHandler` and `newConnectionGroupHandler`
 are mutually exclusive. Setting both fails it with `EINVAL`.
+
+## CI coverage of the QUIC suites — should now work
+
+The integration suites were skipped on GitHub runners because
+`IntegrationSupport.isAvailable` probes for a usable identity and a file keychain
+could not be created there. With the keychain gone (above) that probe should now
+succeed and the suites should run in CI.
+
+The gate is deliberately **kept** rather than deleted: it is a bounded capability
+probe, and if some future environment cannot support these suites they should skip
+with a reason rather than hang. Confirm from a CI log that the suites are running
+before treating a green badge as covering the QUIC transport — the failure mode
+here is a gate that silently keeps skipping.
 
 ## Tests are not parallel-safe
 
