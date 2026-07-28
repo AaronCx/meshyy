@@ -481,17 +481,31 @@ client, SSH bootstrap, a+Terminal renders a live session. No resume yet.
   injects loss, latency, and hard disconnects. Background the app for 5 minutes,
   foreground, and the session resumes with correct scrollback.
 
-**M4. Roaming and fast reconnect.** Path change handling and connection migration
-in foreground. **Not 0-RTT** — §6.1 records why it is unreachable.
-- Acceptance, transport: foreground-from-suspended reaches `.ready` within 1.5 RTT
-  and delivers the first resumed output byte within 2.2 RTT + 30 ms, measured
-  against injected delay rather than on loopback (loopback RTT is ~0 and proves
-  nothing). `NWConnection.requestEstablishmentReport` is the instrumentation hook.
-- Acceptance, roaming: a WiFi-to-cellular switch mid-session produces no visible
-  corruption, and the first byte arrives within 300 ms of the new path becoming
-  satisfied. Framed as **reconnect-and-resume, not migration**, because migration
-  does not exist here — the §6.2 ring buffer is what makes the reconnect
-  invisible. **Device-only**: one Mac has one usable interface.
+**M4. Reconnect triggering and correctness.** *(Rewritten. The name change is the
+point: reconnect **speed** is solved and measured at 2.06 round trips, essentially
+optimal without 0-RTT. What was unsolved is **when** the reconnect fires. The
+original M4 — 0-RTT, migration, "first byte in under one RTT + 50 ms" — contained
+no achievable clause once M0 established that Network framework QUIC has neither
+0-RTT nor migration.)*
+
+Three signals, none redundant:
+- **4a. Path change.** `NWPathMonitor` reports interface transitions; act on the
+  announcement rather than waiting for a timeout to confirm what the OS already
+  said. Deduplicated on a path *signature*, because updates arrive that change
+  nothing about reachability and a redial storm is worse than the stall it avoids.
+- **4b. Heartbeat.** `ping`/`pong` on the control stream, 1 s interval, dead after
+  3 misses. Covers what 4a structurally cannot see: a NAT rebind announces
+  nothing. Gated on a confirming pong so an older daemon is not redialled forever.
+- **4c. Foreground.** `applicationWillEnterForeground()`, a public entry rather
+  than a UIKit observer — MeshyyKit builds for macOS too.
+- **4d. Single-flight and backoff.** All three fire within a few hundred ms of an
+  airplane-mode toggle, and each redial spends a single-use token.
+
+- Acceptance, met in-tree: a black-holed session recovers with no user action and
+  the §6.4 property holding across the seam; exactly one reconnect in flight under
+  a burst of every trigger, asserted rather than observed.
+- Acceptance, **outstanding**: the device clauses. Radio transitions, jetsam and
+  backgrounding cannot be measured on loopback. See §10.1.
 
 **M5. Agent events.** Termios watcher, alt-screen scanner, agent status on the
 control stream, and the daemon pushing notifications to the user's own ntfy or
@@ -501,16 +515,48 @@ Pushover endpoint.
 - **This is the milestone that actually fixes the product gap. If only part of
   meshyy ever ships, ship M1 through M5.**
 
-**M6. Quick actions.** Per section 7. One-tap approve / deny / numeric buttons
-driven off `AgentProfile`, offered and withdrawn by the daemon on the control
-stream.
-- Acceptance: a Claude Code permission prompt produces buttons that answer it in
-  one tap, the offer disappears when the prompt does, and no action is ever sent
-  without a tap.
-- Replaces predictive echo, which §7.1 measured as unreachable in every real
-  configuration.
+**M6. Quick actions.** *(Rewritten into two tiers. Predictive echo is dropped per
+the §7.1 measurement, not deferred.)*
+- **Tier 1, built: a fixed keystroke palette.** `y n Enter Esc 1 2 3 Ctrl-C`,
+  offered whenever the agent is waiting, with **no screen parsing**. It cannot
+  break when an agent's UI changes because it never looked at the UI. These are
+  terminal universals, not agent knowledge, which is how "no agent name and no
+  prompt string hardcoded in Swift" is satisfied.
+- **Tier 2, deliberately not built: labelled actions from declared prompt
+  patterns.** Data, never code, following `AgentProfile.detectionMarkers`.
+  Screen-scraping an alt-screen TUI demos well once and then breaks silently on
+  the next upstream release.
+- The gate lives in `MeshyySession`, not the UI: a hidden button is not a
+  guarantee, and a tap that arrives after the agent moves on must fail rather than
+  land in the middle of what it went on to do.
+- **Actionable notifications are a separate milestone, not a clause here.** A
+  lock-screen "Approve" reaching the daemon adds an inbound HTTP surface that
+  executes input into a live PTY; it needs a per-session capability token,
+  tailnet-only binding and a fixed keystroke allowlist.
 
-**M7. Attachments.** Blob streams replace the separate SFTP round trip.
+**M7. Attachments. Deferred, deliberately — not merely unstarted.** Blob streams
+would replace the separate SFTP round trip. The SFTP path works today and is in
+active daily use; M7 rewrites a functioning subsystem to save one round trip on
+an operation performed a handful of times a day, and spends solo-maintainer
+capacity that §13 already flags as the real risk. Revisit only if the SFTP path
+develops an actual problem.
+
+## 10.1 What remains
+
+Everything above is merged and green except the following, which is stated here
+rather than left implied:
+
+- **M4's device acceptance.** WiFi→LTE mid-session, airplane mode for 60 s,
+  foreground after 5 minutes suspended, and a simulated NAT rebind, each on a
+  physical iPhone with the §6.4 property asserted. Loopback cannot produce a
+  radio transition or a jetsam kill, so this is not something the in-tree suite
+  can discharge.
+- **Integration.** The shipping a+Terminal target does not speak meshyy today —
+  M2 was accepted against the test harness. Until it does, M4's device clauses
+  cannot be run at all, which makes integration a prerequisite rather than a
+  later step. Recorded in `docs/provenance.md`.
+- **M6 tier 2** and **M7**, both open and unstarted by intent. That is the
+  correct end state, not an incomplete one.
 
 ## 11. Testing
 
@@ -539,11 +585,20 @@ stream.
 2. ~~Can SwiftTerm render an overlay without a fork?~~ **Resolved and now moot.**
    M0 found it feasible without a fork (`docs/spikes/2026-07-27-swiftterm-overlay.md`),
    and §7's move to quick actions removes the need for an overlay at all.
-3. Ring buffer sizing. 4 MB is a guess. Instrument real sessions.
-4. Multiple PTYs per connection: worth it, or does tmux already cover it?
-5. Does the daemon need to survive its own restart with sessions intact? That
-   means persisting PTY ownership, which is a large jump in complexity. Probably
-   no for v1.
+3. ~~Ring buffer sizing. 4 MB is a guess.~~ **Still open, and still a guess.** No
+   real-session instrumentation exists, because nothing real runs on meshyy yet —
+   see §10.1. Not answerable before integration, and dishonest to close before then.
+4. ~~Multiple PTYs per connection: worth it, or does tmux already cover it?~~
+   **Answered: tmux covers it.** The §1 benchmark measured `tmux attach` as free
+   inside the 8.31-RTT SSH cost, and the multiplexer matrix already works. The
+   frame format carries a `ptyID` so this stays possible, but building a second
+   multiplexer to replace a working one is the M7 mistake in a different costume.
+5. ~~Does the daemon need to survive its own restart with sessions intact?~~
+   **Answered: no for v1.** Persisting PTY ownership across a restart is a large
+   jump in complexity, and the failure it protects against — a daemon restart —
+   is rare and already visible to the user, which §3.5 says is the acceptable
+   kind. A tmux session inside meshyy survives it anyway, which is the honest
+   mitigation.
 6. Linux daemon support. Deferred, but do not design anything that makes it
    impossible.
 
