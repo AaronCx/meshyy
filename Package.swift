@@ -53,6 +53,15 @@ let package = Package(
             dependencies: ["MeshyyKit", "MeshyyCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // Shared by both test targets: the resume scenario corpus and the reference
+        // client used as a differential oracle. Deliberately NOT a product — nothing
+        // ships it. It exists so the corpus is written once and executed at more than
+        // one level, rather than duplicated (hardening 1b-bis).
+        .target(
+            name: "MeshyyTestSupport",
+            dependencies: ["MeshyyCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .target(
             name: "MeshyyChaos",
             dependencies: ["MeshyyCore"],
@@ -69,7 +78,7 @@ let package = Package(
             // the manifest like a wired-up chaos harness and was not one. Dropped
             // until ChaosUDPProxy lands and a test genuinely uses it; scripts/
             // check-test-coverage.sh now fails the build on the same mistake.
-            dependencies: ["MeshyyCore"],
+            dependencies: ["MeshyyCore", "MeshyyTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
@@ -83,7 +92,7 @@ let package = Package(
             // daemon over a real QUIC connection rather than a stub, because a
             // client tested against a stub only proves the two agree with
             // each other.
-            dependencies: ["MeshyyKit", "MeshyyCore", "MeshyyDaemon"],
+            dependencies: ["MeshyyKit", "MeshyyCore", "MeshyyDaemon", "MeshyyTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
