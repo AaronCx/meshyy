@@ -53,18 +53,18 @@ repeated here because they cost an afternoon each and will again:
 And one more: a listener's `newConnectionHandler` and `newConnectionGroupHandler`
 are mutually exclusive. Setting both fails it with `EINVAL`.
 
-## CI coverage of the QUIC suites — should now work
+## ~~CI coverage of the QUIC suites~~ — RESOLVED, confirmed in a CI log
 
-The integration suites were skipped on GitHub runners because
-`IntegrationSupport.isAvailable` probes for a usable identity and a file keychain
-could not be created there. With the keychain gone (above) that probe should now
-succeed and the suites should run in CI.
+The integration suites were skipped on GitHub runners because a file keychain
+could not be created there. With the keychain gone (above) the capability probe
+succeeds and **CI now runs everything**: 127 tests in 15 suites, no skips,
+confirmed on run 30318113414.
 
 The gate is deliberately **kept** rather than deleted: it is a bounded capability
-probe, and if some future environment cannot support these suites they should skip
-with a reason rather than hang. Confirm from a CI log that the suites are running
-before treating a green badge as covering the QUIC transport — the failure mode
-here is a gate that silently keeps skipping.
+probe, and an environment that cannot support these suites should skip with a
+reason rather than hang for the job timeout. But its failure mode is silence — a
+gate that quietly keeps skipping looks identical to a gate that is not needed. If
+you ever doubt what CI covered, grep the log for `skipped`.
 
 ## Tests are not parallel-safe
 
