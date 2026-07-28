@@ -1,4 +1,5 @@
 import Testing
+import Synchronization
 // meshyy — a real daemon on throwaway paths, for the client-side tests.
 // Copyright (c) 2026 Aaron Character. MIT licence — see LICENSE.
 //
@@ -121,6 +122,44 @@ final class TestDaemonHarness: @unchecked Sendable {
 }
 
 
+/// Whether this machine can run the integration suites at all.
+///
+/// They need three things a plain unit test does not: a QUIC listener, a unix
+/// socket, and a **file keychain** for the daemon's TLS identity. The keychain is
+/// the fragile one — `SecKeychainCreate` needs a Security session, and a CI runner
+/// may not have one. When it does not, the call does not fail cleanly; it blocks,
+/// and the whole suite hangs with no output rather than failing.
+///
+/// So the capability is probed once, on a thread, behind a deadline. An
+/// environment that cannot support these suites SKIPS them with a reason, which is
+/// honest, instead of hanging for the job's timeout, which is not.
+enum IntegrationSupport {
+    nonisolated(unsafe) static let isAvailable: Bool = probe()
+
+    private static func probe() -> Bool {
+        let finished = DispatchSemaphore(value: 0)
+        let box = Mutex(false)
+        // Detached rather than a Task: if the Security call blocks, this thread is
+        // stuck forever and must not be holding a cooperative-pool slot.
+        Thread.detachNewThread {
+            let directory = "/tmp/meshyy-probe-" + UUID().uuidString.prefix(8).lowercased()
+            defer { try? FileManager.default.removeItem(atPath: directory) }
+            if (try? DaemonIdentity.loadOrCreate(directory: directory)) != nil {
+                box.withLock { $0 = true }
+            }
+            finished.signal()
+        }
+        guard finished.wait(timeout: .now() + 20) == .success else {
+            FileHandle.standardError.write(Data("""
+                meshyy tests: a file keychain could not be created within 20s, so the                 socket/QUIC integration suites are SKIPPED in this environment. They                 are not disabled — run them on a machine with a Security session.
+
+                """.utf8))
+            return false
+        }
+        return box.withLock { $0 }
+    }
+}
+
 /// Parent suite for everything that binds a real socket.
 ///
 /// swift-testing runs distinct top-level suites in PARALLEL. These tests each
@@ -129,7 +168,11 @@ final class TestDaemonHarness: @unchecked Sendable {
 /// passing alone — which reads exactly like a product bug and is not one. Nesting
 /// them under one `.serialized` suite states the real constraint instead of
 /// relying on a command-line flag.
-@Suite("MeshyyKit (real sockets, serialized)", .serialized)
+@Suite(
+    "MeshyyKit (real sockets, serialized)",
+    .serialized,
+    .enabled(if: IntegrationSupport.isAvailable, "needs a file keychain and real sockets")
+)
 struct MeshyyKitSuite {}
 
 /// Runs `body` against a fresh daemon and guarantees it is shut down first.
