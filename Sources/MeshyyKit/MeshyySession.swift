@@ -193,7 +193,18 @@ public actor MeshyySession {
     ///
     /// Call this again after a suspension with a fresh bootstrap: the SSH channel
     /// is cheap and the token is single-use, so every reconnect gets a new one.
-    public func attach(bootstrap: BootstrapResponse, sshHost: String) async throws {
+    /// - Parameter timeout: how long to wait for the QUIC connection.
+    ///
+    ///   Exposed because the caller knows what the wait costs. In a+Terminal this sits
+    ///   between tapping a server and seeing a prompt, and a path that cannot work — a
+    ///   daemon unreachable from that network — must fail fast and let SSH take over.
+    ///   The 10s default spent most of a "slow to connect" complaint waiting for a
+    ///   connection that was never going to arrive.
+    public func attach(
+        bootstrap: BootstrapResponse,
+        sshHost: String,
+        timeout: Duration = .seconds(10)
+    ) async throws {
         connection?.close(reason: "reattaching")
 
         startIngress()
@@ -215,7 +226,7 @@ public actor MeshyySession {
         }
         self.connection = connection
 
-        try await connection.connect()
+        try await connection.connect(timeout: timeout)
 
         resetForAttach(resumeFrom: nil)
         startHeartbeat()

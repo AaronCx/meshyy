@@ -46,6 +46,37 @@ public final class QUICServer: @unchecked Sendable {
     private let store: SessionStore
     private let tokens: TokenActor
     private let bindAllInterfaces: Bool
+
+    /// Whether a peer may attach: loopback, or the Tailscale CGNAT range.
+    ///
+    /// 100.64.0.0/10 is the shared-address space Tailscale assigns from (RFC 6598), so
+    /// this admits a tailnet without admitting the LAN it happens to ride on. Checked on
+    /// the address rather than the interface type because the interface a tailnet rides
+    /// on is not a property this daemon can reason about correctly — see the note in
+    /// `start()`.
+    static func isPermittedPeer(_ endpoint: NWEndpoint?) -> Bool {
+        // No path yet. Refusing here would drop legitimate peers on a timing detail, and
+        // the token and certificate pin are the real controls — this check is
+        // defence-in-depth. So allow, and say so rather than pretending it was checked.
+        guard let endpoint else { return true }
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        let address: String
+        switch host {
+        case .ipv4(let v4): address = "\(v4)"
+        case .ipv6(let v6):
+            let text = "\(v6)"
+            // ::ffff:100.x.y.z and ::1 both arrive here on a dual-stack listener.
+            if text.hasPrefix("::1") { return true }
+            address = text.contains(".") ? String(text.split(separator: ":").last ?? "") : text
+        default: return false
+        }
+        let bare = address.split(separator: "%").first.map(String.init) ?? address
+        if bare == "127.0.0.1" || bare == "::1" { return true }
+        let octets = bare.split(separator: ".").compactMap { UInt8($0) }
+        guard octets.count == 4 else { return false }
+        // 100.64.0.0/10
+        return octets[0] == 100 && (64...127).contains(octets[1])
+    }
     private let queue = DispatchQueue(label: "meshyy.quic.listener")
 
     private var listener: NWListener?
@@ -91,14 +122,22 @@ public final class QUICServer: @unchecked Sendable {
 
         let parameters = NWParameters(quic: options)
         parameters.allowLocalEndpointReuse = true
-        if !bindAllInterfaces {
-            // Design doc §8: loopback or the Tailscale interface by default;
-            // binding everything takes an explicit flag and a startup warning.
-            // Network framework has no "loopback plus one utun" constraint, so the
-            // honest implementation is to prohibit the interface types that would
-            // put this on a hostile LAN and let loopback and utun through.
-            parameters.prohibitedInterfaceTypes = [.wifi, .cellular, .wiredEthernet]
-        }
+        // §8's policy — loopback and Tailscale, not the hostile LAN — is enforced on the
+        // PEER ADDRESS at accept time, not by prohibiting interface types.
+        //
+        // The previous implementation set prohibitedInterfaceTypes = [.wifi, .cellular,
+        // .wiredEthernet] on the reasoning that this "lets loopback and utun through".
+        // That reasoning is WRONG, and it silently broke the product's main use case:
+        // Network framework classifies a Tailscale utun path by the interface it rides
+        // ON, so a phone connecting over Tailscale-on-WiFi is prohibited exactly like a
+        // phone on the raw LAN. Measured: a QUIC dial to this daemon's Tailscale address
+        // times out after 10s, every time.
+        //
+        // The symptom was brutal precisely because it was invisible — the daemon happily
+        // accepted the SSH bootstrap and created the session, so `list` showed a live
+        // session that no client could ever reach, and the app fell back to SSH after
+        // eating the full connect timeout. An address check is testable and cannot be
+        // wrong about what an interface "really" is.
 
         let listener: NWListener
         do {
@@ -127,7 +166,8 @@ public final class QUICServer: @unchecked Sendable {
         // NOTE: newConnectionHandler must NOT also be set — the two are mutually
         // exclusive and setting both fails the listener with EINVAL.
         listener.newConnectionGroupHandler = { [weak self] group in
-            self?.accept(group)
+            guard let self else { return }
+            self.accept(group, restrictPeers: !self.bindAllInterfaces)
         }
         listener.start(queue: queue)
         self.listener = listener
@@ -148,8 +188,8 @@ public final class QUICServer: @unchecked Sendable {
         return port
     }
 
-    private func accept(_ group: NWConnectionGroup) {
-        let peer = QUICPeer(group: group, store: store, tokens: tokens) { [weak self] finished in
+    private func accept(_ group: NWConnectionGroup, restrictPeers: Bool) {
+        let peer = QUICPeer(group: group, store: store, tokens: tokens, restrictPeers: restrictPeers) { [weak self] finished in
             self?.queue.async { [weak self] in
                 self?.peers.removeValue(forKey: ObjectIdentifier(finished))
             }
@@ -177,6 +217,16 @@ final class QUICPeer: @unchecked Sendable {
     private let group: NWConnectionGroup
     private let queue: DispatchQueue
     private let onFinish: (QUICPeer) -> Void
+    /// Enforce §8's loopback-or-Tailscale policy on the peer address.
+    ///
+    /// Checked HERE rather than on the group, because `NWConnectionGroup` exposes no
+    /// endpoint or path — the remote address only becomes visible on an individual
+    /// stream. The previous attempt used `prohibitedInterfaceTypes` on the listener
+    /// instead, which did not do what it claimed: Network framework classifies a
+    /// Tailscale utun path by the interface it rides on, so prohibiting `.wifi` silently
+    /// blocked every tailnet client. That is the product's main use case, and it failed
+    /// invisibly for hours.
+    private let restrictPeers: Bool
 
     private var attachment: SessionAttachment?
     /// One decoder per stream. Frames are length-prefixed per stream, so sharing a
@@ -202,10 +252,12 @@ final class QUICPeer: @unchecked Sendable {
         group: NWConnectionGroup,
         store: SessionStore,
         tokens: TokenActor,
+        restrictPeers: Bool = true,
         onFinish: @escaping (QUICPeer) -> Void
     ) {
         self.group = group
         self.queue = DispatchQueue(label: "meshyy.quic.peer")
+        self.restrictPeers = restrictPeers
         self.onFinish = onFinish
         self.attachment = SessionAttachment(
             store: store,
@@ -239,6 +291,23 @@ final class QUICPeer: @unchecked Sendable {
     }
 
     private func adopt(_ stream: NWConnection) {
+        if restrictPeers, let remote = stream.currentPath?.remoteEndpoint,
+           !QUICServer.isPermittedPeer(remote) {
+            // §3.5: refuse visibly and immediately. Dropping this silently would leave
+            // the client waiting out its whole connect timeout with no idea why — which
+            // is exactly how the interface-type version of this policy hid for hours.
+            // stderr, not `log`: there is no logger in this target, and a bare `log`
+            // resolves to Foundation's logarithm, which compiles in some contexts and
+            // silently is not what anyone meant.
+            let peer = String(describing: remote)
+            FileHandle.standardError.write(Data("""
+                meshyyd: refused a QUIC peer at \(peer) — not loopback or Tailscale. \
+                Start meshyyd with --all-interfaces to allow it.
+
+                """.utf8))
+            stream.cancel()
+            return
+        }
         let key = ObjectIdentifier(stream)
         streams[key] = stream
         decoders[key] = FrameDecoder()
