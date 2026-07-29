@@ -245,6 +245,10 @@ public actor MeshyySession {
         connection.onState = { [weak self] state in
             guard let self, case .failed(let reason) = state else { return }
             Task {
+                // Same reason as in `detach`: a replay this failure interrupted is
+                // already counted into consumedOffset, so it must reach the consumer
+                // before the failure does or those bytes are lost silently.
+                await self.flushReplayPaint()
                 await self.emit(.failed(reason: reason))
                 // `.failed` now means the transport gave up on a path that went
                 // silent, not that the daemon ended the session — the two were
@@ -641,6 +645,13 @@ public actor MeshyySession {
     }
 
     public func detach(reason: String = "client detached") {
+        // Before `.ended`, and before anything else: a replay interrupted by this
+        // detach has already been COUNTED into consumedOffset, so the next attach
+        // resumes past it. Dropping it here loses those bytes silently, which is the
+        // §6.4 violation the corpus-over-transport test exists to catch — and did,
+        // on a loaded runner where a disconnect lands mid-replay often enough to
+        // matter and locally where it does not.
+        flushReplayPaint()
         flushAck()
         connection?.close(reason: reason)
         connection = nil
