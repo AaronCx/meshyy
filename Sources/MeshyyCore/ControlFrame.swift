@@ -82,6 +82,14 @@ public enum ControlFrame: Sendable, Equatable {
     /// they were right — `list` printed "not implemented" and there was no way to check
     /// whether a session existed at all. A claim nobody can verify is indistinguishable
     /// from a false one.
+    /// End a session and the shell behind it (`meshyyd kill NAME`).
+    ///
+    /// Added because there was no way to remove one. A client that stops attaching
+    /// leaves the session running forever, and with a shell rc that auto-attaches a
+    /// multiplexer, orphans accumulate into a pile that silently degrades every live
+    /// session — tmux sizes to its smallest client, so one stale attachment clamps the
+    /// terminal for all of them.
+    case sessionKillRequest(name: String)
     case sessionListRequest
     /// JSON array of live sessions. A JSON payload rather than a CBOR structure for the
     /// same reason `bootstrapResponse` uses one: this is diagnostic output for a human
@@ -173,6 +181,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .agentEvent: "agent"
         case .quickActions: "qa"
         case .replayBase: "base"
+        case .sessionKillRequest: "kill"
         case .sessionListRequest: "ls"
         case .sessionListResponse: "lsr"
         case .bootstrapRequest: "boot"
@@ -241,6 +250,8 @@ extension ControlFrame {
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
+        case .sessionKillRequest(let name):
+            pairs.append((.text("name"), .text(name)))
         case .sessionListRequest:
             break   // the type tag is the whole message
         case .sessionListResponse(let json):
@@ -384,6 +395,8 @@ extension ControlFrame {
                 ptyID: try requiredInt("pty"),
                 earliestOffset: try requiredOffset("earliest")
             )
+        case "kill":
+            return .sessionKillRequest(name: try requiredText("name"))
         case "ls":
             return .sessionListRequest
         case "lsr":

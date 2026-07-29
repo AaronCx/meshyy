@@ -62,6 +62,20 @@ enum MeshyydCLI {
             }
         case "list":
             await AttachClient(socketPath: socketPath, session: "").list()
+        case "kill":
+            // `meshyyd kill NAME` — end a session and the shell behind it. Without
+            // this, a session a client stops attaching to runs forever, and orphans
+            // accumulate into a pile that degrades the live ones: a multiplexer sizes
+            // itself to its smallest attached client, so one stale attachment clamps
+            // the terminal for every other.
+            // `arguments` has already had the verb removed (line 24), so the name is
+            // the first remaining non-flag — dropping another element ate it.
+            let names = arguments.filter { !$0.hasPrefix("--") }
+            guard let name = names.first else {
+                FileHandle.standardError.write(Data("usage: meshyyd kill NAME\n".utf8))
+                exit(2)
+            }
+            await AttachClient(socketPath: socketPath, session: name).kill()
         case "version":
             print("meshyyd \(Meshyy.version) (protocol \(Meshyy.protocolVersion))")
         default:
@@ -72,6 +86,7 @@ enum MeshyydCLI {
                   attach    [--session NAME] [--socket PATH] [--json]
                   bootstrap [--session NAME] [--socket PATH]
                   list      [--socket PATH]
+                  kill      NAME [--socket PATH]
                   version
 
                 `attach --json` and `bootstrap` are what an SSH exec channel runs:
