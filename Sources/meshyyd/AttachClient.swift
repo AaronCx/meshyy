@@ -63,6 +63,13 @@ final class AttachClient: @unchecked Sendable {
     /// daemon's JSON verbatim, so the bytes a program parses are the bytes the
     /// daemon produced (the same pass-through rule as the bootstrap handshake).
     private func awaitList(timeoutSeconds: Double, json: Bool = false) {
+        // The deadline below only gets re-checked between reads, and this fd is
+        // blocking — against a daemon that never answers, `read` never returns and
+        // the 5s failure was unreachable (same trap as Bootstrap.run; set here and
+        // not in `connect()` because the interactive relay WANTS blocking reads).
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
         var decoder = FrameDecoder()
         var buffer = [UInt8](repeating: 0, count: 65536)
         let deadline = Date().addingTimeInterval(timeoutSeconds)
@@ -109,9 +116,17 @@ final class AttachClient: @unchecked Sendable {
     /// whose shell has died still exists, and saying "1 session" about it would be
     /// the same kind of unchecked claim this command exists to remove.
     private func render(_ json: String) {
-        guard let data = json.data(using: .utf8),
-              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else {
+        // schema 2 wraps the rows in an envelope; a pre-envelope serve sends the
+        // bare array. This renderer reads both, because the CLI binary and the
+        // running serve are upgraded at different moments on a real host.
+        let parsed = json.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        let rows: [[String: Any]]
+        if let envelope = parsed as? [String: Any],
+           let sessions = envelope["sessions"] as? [[String: Any]] {
+            rows = sessions
+        } else if let bare = parsed as? [[String: Any]] {
+            rows = bare
+        } else {
             FileHandle.standardError.write(Data("meshyyd: unreadable session list\n".utf8))
             exit(3)
         }

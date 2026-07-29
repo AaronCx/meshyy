@@ -628,9 +628,17 @@ struct LocalSocketTests {
                     if case .sessionListResponse = $0 { return true }
                     return false
                 }) else { return nil }
-                let rows = try JSONSerialization.jsonObject(
-                    with: Data(json.utf8)) as? [[String: Any]]
-                return rows?.first { $0["name"] as? String == name }
+                // Schema 2: an envelope, never a bare array — that shape is what
+                // lets a consumer prove capability even when the table is empty.
+                guard let envelope = try JSONSerialization.jsonObject(
+                        with: Data(json.utf8)) as? [String: Any],
+                      envelope["schema"] as? Int ?? 0 >= 2,
+                      let rows = envelope["sessions"] as? [[String: Any]]
+                else {
+                    Issue.record("list --json did not answer with a schema>=2 envelope: \(json)")
+                    return nil
+                }
+                return rows.first { $0["name"] as? String == name }
             }
 
             let client = try TestClient(socketPath: path)

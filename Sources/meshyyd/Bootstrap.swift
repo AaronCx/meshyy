@@ -74,6 +74,15 @@ enum Bootstrap {
         }
         silenceSIGPIPE(on: fd)
 
+        // Without a receive timeout the 10s deadline below is decorative: the socket
+        // is blocking, so `read` only returns when bytes arrive — and a daemon that
+        // does not understand this request (an older serve receiving a frame it
+        // ignores) sends nothing, ever. The deadline is only re-checked between
+        // reads, so the advertised failure was unreachable and the caller — an SSH
+        // exec channel the app awaits with no timeout of its own — hung forever.
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
         // A dedicated control frame rather than a real attach: this process wants
         // the handshake, not the session's byte stream.
         switch target {
