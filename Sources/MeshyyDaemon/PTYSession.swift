@@ -37,6 +37,14 @@ public struct SessionInfo: Sendable, Equatable {
     public var termios: TermiosState
     public var childPID: pid_t
     public var isAlive: Bool
+    /// Clients currently attached — the count a "detached session" claim rests on.
+    /// Observers (the daemon's own notification watcher) are excluded: they hold a
+    /// subscription on EVERY session for its whole life, so counting them would make
+    /// "detached" a state no session could ever be in.
+    public var attachedClients: Int
+    public var createdAt: Date
+    /// When the PTY last produced output. Nil for a session that has said nothing.
+    public var lastOutputAt: Date?
 }
 
 /// A PTY, the replay buffer behind it, and the watchers design doc §7.1 needs.
@@ -44,8 +52,10 @@ public struct SessionInfo: Sendable, Equatable {
 /// One actor per session. The PTY read loop runs on a DispatchSource and hands
 /// bytes in, so nothing touches the buffer off-actor.
 public actor PTYSession {
-    public let name: String
-    public let sessionID: String
+    // Immutable identity, readable without a hop — callers compare and log these
+    // constantly and an `await` per read is isolation theatre for a `let`.
+    public nonisolated let name: String
+    public nonisolated let sessionID: String
 
     private let pty: PTY
     private var buffer: SessionBuffer
@@ -82,6 +92,11 @@ public actor PTYSession {
     /// Live subscribers, keyed by an opaque token so a detach can remove exactly
     /// one without disturbing the others.
     private var subscribers: [UUID: AsyncStream<SessionEvent>.Continuation] = [:]
+    /// The subset of `subscribers` that are clients rather than observers — what
+    /// `SessionInfo.attachedClients` reports.
+    private var clientTokens: Set<UUID> = []
+    private let createdAt = Date()
+    private var lastOutputAt: Date?
 
     /// Design doc §7.1: poll termios at 50ms while a prediction is outstanding,
     /// 500ms otherwise. The daemon does not know about outstanding predictions,
@@ -319,6 +334,7 @@ public actor PTYSession {
     // MARK: - Ingest
 
     private func ingest(chunks: [[UInt8]], reachedEOF: Bool) {
+        if !chunks.isEmpty { lastOutputAt = Date() }
         for chunk in chunks {
             let offset = buffer.totalWritten
             let events = buffer.write(chunk)
@@ -373,7 +389,8 @@ public actor PTYSession {
     /// between "what do I replay" and "start sending me live output" in which
     /// bytes could be lost — which is exactly how a resume protocol grows a gap.
     public func attach(
-        resumeFrom: UInt64?
+        resumeFrom: UInt64?,
+        observer: Bool = false
     ) -> (decision: ResumeDecision, events: AsyncStream<SessionEvent>, token: UUID) {
         let decision = buffer.resume(from: resumeFrom)
         let token = UUID()
@@ -383,6 +400,7 @@ public actor PTYSession {
             bufferingPolicy: .unbounded
         )
         subscribers[token] = continuation
+        if !observer { clientTokens.insert(token) }
         // Tell a new subscriber the current state immediately, so it does not
         // have to wait for the next change to know whether to predict.
         continuation.yield(.termios(lastTermios))
@@ -396,6 +414,7 @@ public actor PTYSession {
 
     public func detach(_ token: UUID) {
         subscribers.removeValue(forKey: token)?.finish()
+        clientTokens.remove(token)
     }
 
     /// Forwards keystrokes to the child. Returns immediately, always.
@@ -488,7 +507,10 @@ public actor PTYSession {
             altScreen: lastAltScreen,
             termios: lastTermios,
             childPID: pty.childPID,
-            isAlive: exitStatus == nil
+            isAlive: exitStatus == nil,
+            attachedClients: clientTokens.count,
+            createdAt: createdAt,
+            lastOutputAt: lastOutputAt
         )
     }
 

@@ -301,7 +301,13 @@ final class LocalClient: @unchecked Sendable {
                         if frame.kind == .control,
                            let control = try? ControlFrame.decode(frame.payload),
                            case .bootstrapRequest(let session) = control {
-                            handleBootstrap(session: session)
+                            handleBootstrap(request: .named(session))
+                            continue
+                        }
+                        if frame.kind == .control,
+                           let control = try? ControlFrame.decode(frame.payload),
+                           case .bootstrapNewInGroup(let prefix) = control {
+                            handleBootstrap(request: .newInGroup(prefix))
                             continue
                         }
                         // Same reasoning as bootstrap: enumeration is a local-transport
@@ -365,7 +371,7 @@ final class LocalClient: @unchecked Sendable {
             guard let self else { return }
             let infos = await self.store.list()
             let payload = infos.map { info in
-                [
+                var row: [String: Any] = [
                     "name": info.name,
                     "session_id": info.sessionID,
                     "cols": info.size.cols,
@@ -375,7 +381,16 @@ final class LocalClient: @unchecked Sendable {
                     "alt_screen": info.altScreen,
                     "child_pid": Int(info.childPID),
                     "alive": info.isAlive,
-                ] as [String: Any]
+                    // What "detached" means, from the only table that knows. A
+                    // client deciding whether a session is safe to adopt or offer
+                    // for resume reads THIS, never its own bookkeeping.
+                    "attached_clients": info.attachedClients,
+                    "created_at": Int(info.createdAt.timeIntervalSince1970),
+                ]
+                if let last = info.lastOutputAt {
+                    row["last_output_at"] = Int(last.timeIntervalSince1970)
+                }
+                return row
             }
             let json = (try? JSONSerialization.data(withJSONObject: payload))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
@@ -383,9 +398,20 @@ final class LocalClient: @unchecked Sendable {
         }
     }
 
+    /// How a bootstrap names its session: by the client, or by the daemon.
+    private enum BootstrapTarget {
+        /// `attach --session NAME`: the client names it, reattach or create.
+        case named(String)
+        /// `attach --new-in-group PREFIX`: the daemon allocates the lowest free
+        /// numbered name in the group, so "new" can never resolve to a session
+        /// that already belonged to someone (design doc §3.1: never guess what
+        /// the daemon can simply report).
+        case newInGroup(String)
+    }
+
     /// Answers a §5.1 bootstrap request: ensure the session exists, mint a
     /// single-use token bound to its id, and hand back the JSON verbatim.
-    private func handleBootstrap(session name: String) {
+    private func handleBootstrap(request: BootstrapTarget) {
         Task { [weak self] in
             guard let self else { return }
             guard let tokens = self.bootstrap.tokens else {
@@ -403,25 +429,36 @@ final class LocalClient: @unchecked Sendable {
                 self.write(.control(.error(code: 503, message: "no certificate fingerprint")))
                 return
             }
-            guard SessionStore.isValidName(name) else {
-                self.write(.control(.error(
-                    code: 400,
-                    message: "session name \(name.debugDescription) is not allowed"
-                )))
-                return
-            }
 
             do {
                 // Created here rather than on QUIC attach, because the token has to
                 // be bound to a session id that already exists.
-                let session = try await self.store.attachOrCreate(name: name, size: .default)
+                let session: PTYSession
+                switch request {
+                case .named(let name):
+                    guard SessionStore.isValidName(name) else {
+                        self.write(.control(.error(
+                            code: 400,
+                            message: "session name \(name.debugDescription) is not allowed"
+                        )))
+                        return
+                    }
+                    session = try await self.store.attachOrCreate(name: name, size: .default)
+                case .newInGroup(let prefix):
+                    session = try await self.store.createLowestFree(
+                        inGroup: prefix, size: .default
+                    )
+                }
                 let info = await session.info
                 let token = await tokens.issue(sessionID: info.sessionID)
                 let response = BootstrapResponse(
                     port: port,
                     token: token,
                     certSHA256: fingerprint,
-                    sessionID: info.sessionID
+                    sessionID: info.sessionID,
+                    // Always echoed, but load-bearing for `newInGroup`: the name is
+                    // the allocation, and the client needs it to reattach later.
+                    name: info.name
                 )
                 let json = String(decoding: try response.encoded(), as: UTF8.self)
                 self.write(.control(.bootstrapResponse(json: json)))

@@ -36,7 +36,7 @@ enum MeshyydCLI {
             // What the SSH exec channel runs: `meshyyd attach --session X --json`
             // is routed here by the `--json` flag below. Kept as a separate verb
             // too so it can be exercised directly.
-            await Bootstrap.run(socketPath: socketPath, session: option("session") ?? "default")
+            await Bootstrap.run(socketPath: socketPath, target: bootstrapTarget(option))
         case "serve":
             await serve(
                 socketPath: socketPath,
@@ -48,12 +48,17 @@ enum MeshyydCLI {
             // Design doc §5.1 step 2: the client runs
             // `meshyyd attach --session <name> --json` over an SSH exec channel and
             // expects the bootstrap JSON on stdout. Without --json it is the
-            // interactive local attach from M1.
+            // interactive local attach from M1. `--new-in-group PREFIX` asks the
+            // daemon to allocate the lowest free numbered name instead — "new
+            // session" decided where the sessions actually live.
             if arguments.contains("--json") {
-                await Bootstrap.run(
-                    socketPath: socketPath,
-                    session: option("session") ?? "default"
-                )
+                await Bootstrap.run(socketPath: socketPath, target: bootstrapTarget(option))
+            } else if let prefix = option("new-in-group") {
+                // Interactive local attach cannot take a daemon-chosen name today;
+                // refusing beats silently attaching to "default".
+                FileHandle.standardError.write(Data(
+                    "meshyyd: --new-in-group \(prefix) requires --json\n".utf8))
+                exit(2)
             } else {
                 await AttachClient(
                     socketPath: socketPath,
@@ -61,7 +66,11 @@ enum MeshyydCLI {
                 ).run()
             }
         case "list":
-            await AttachClient(socketPath: socketPath, session: "").list()
+            // `--json` prints the daemon's own session table verbatim — the form a
+            // program consumes. The human table is a RENDERING of that JSON; a
+            // machine parsing the rendering re-learns column-gluing the hard way.
+            await AttachClient(socketPath: socketPath, session: "")
+                .list(json: arguments.contains("--json"))
         case "kill":
             // `meshyyd kill NAME` — end a session and the shell behind it. Without
             // this, a session a client stops attaching to runs forever, and orphans
@@ -83,17 +92,28 @@ enum MeshyydCLI {
                 meshyyd \(Meshyy.version)
 
                   serve     [--socket PATH] [--shell PATH] [--buffer BYTES] [--all-interfaces]
-                  attach    [--session NAME] [--socket PATH] [--json]
-                  bootstrap [--session NAME] [--socket PATH]
-                  list      [--socket PATH]
+                  attach    [--session NAME | --new-in-group PREFIX] [--socket PATH] [--json]
+                  bootstrap [--session NAME | --new-in-group PREFIX] [--socket PATH]
+                  list      [--socket PATH] [--json]
                   kill      NAME [--socket PATH]
                   version
 
                 `attach --json` and `bootstrap` are what an SSH exec channel runs:
-                they print the design doc §5.1 handshake and exit.
+                they print the design doc §5.1 handshake and exit. `--new-in-group`
+                has the daemon allocate the lowest free name in a numbered group
+                (PREFIX0, PREFIX1, …), so "new session" can never land in an old one.
                 """)
             exit(command == "help" ? 0 : 2)
         }
+    }
+
+    /// `--new-in-group` wins over `--session` when both are given, because the
+    /// caller who says "new" has said something stronger than a name.
+    private static func bootstrapTarget(
+        _ option: (String) -> String?
+    ) -> Bootstrap.Target {
+        if let prefix = option("new-in-group") { return .newInGroup(prefix) }
+        return .named(option("session") ?? "default")
     }
 
     private static func serve(

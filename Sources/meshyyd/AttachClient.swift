@@ -51,16 +51,18 @@ final class AttachClient: @unchecked Sendable {
     /// session stays alive on the server" is unfalsifiable without it, and an
     /// unfalsifiable claim is indistinguishable from a false one — which is precisely
     /// how it was first reported.
-    func list() async {
+    func list(json: Bool = false) async {
         guard connect() else { return }
         defer { Darwin.close(fd) }
 
         send(.control(.sessionListRequest))
-        awaitList(timeoutSeconds: 5)
+        awaitList(timeoutSeconds: 5, json: json)
     }
 
-    /// Waits for a session list and renders it.
-    private func awaitList(timeoutSeconds: Double) {
+    /// Waits for a session list and renders it — or, with `json`, prints the
+    /// daemon's JSON verbatim, so the bytes a program parses are the bytes the
+    /// daemon produced (the same pass-through rule as the bootstrap handshake).
+    private func awaitList(timeoutSeconds: Double, json: Bool = false) {
         var decoder = FrameDecoder()
         var buffer = [UInt8](repeating: 0, count: 65536)
         let deadline = Date().addingTimeInterval(timeoutSeconds)
@@ -73,8 +75,13 @@ final class AttachClient: @unchecked Sendable {
             guard let frames = try? decoder.push(Array(buffer[0..<count])) else { break }
             for frame in frames where frame.kind == .control {
                 guard let control = try? ControlFrame.decode(frame.payload) else { continue }
-                if case .sessionListResponse(let json) = control {
-                    render(json)
+                if case .sessionListResponse(let payload) = control {
+                    if json {
+                        print(payload)
+                        fflush(stdout)
+                    } else {
+                        render(payload)
+                    }
                     exit(0)
                 }
                 if case .error(let code, let message) = control {
@@ -125,7 +132,10 @@ final class AttachClient: @unchecked Sendable {
             value.count >= width ? value + " " : value + String(repeating: " ", count: width - value.count)
         }
 
-        print(pad("NAME", 30) + pad("PID", 9) + pad("BUFFERED", 11) + pad("SIZE", 9) + "STATE")
+        print(
+            pad("NAME", 30) + pad("PID", 9) + pad("BUFFERED", 11) + pad("SIZE", 9)
+                + pad("CLIENTS", 9) + "STATE"
+        )
         for row in rows {
             let name = row["name"] as? String ?? "?"
             let pid = row["child_pid"] as? Int ?? 0
@@ -134,11 +144,14 @@ final class AttachClient: @unchecked Sendable {
             let cols = row["cols"] as? Int ?? 0
             let rowsN = row["rows"] as? Int ?? 0
             let alive = row["alive"] as? Bool ?? false
+            // "?" rather than 0 against an older daemon: absent is not detached.
+            let clients = (row["attached_clients"] as? Int).map(String.init) ?? "?"
             print(
                 pad(name, 30)
                     + pad("\(pid)", 9)
                     + pad("\(to - from)B", 11)
                     + pad("\(cols)x\(rowsN)", 9)
+                    + pad(clients, 9)
                     + (alive ? "alive" : "DEAD SHELL")
             )
         }

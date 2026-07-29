@@ -117,6 +117,13 @@ public enum ControlFrame: Sendable, Equatable {
     /// and a script, not a hot path, and a schema change here must not need a new frame.
     case sessionListResponse(json: String)
     case bootstrapRequest(session: String)
+    /// A bootstrap that asks the daemon to NAME the session: the lowest free slot in
+    /// `prefix`'s numeric group, allocated and created atomically where the sessions
+    /// actually live. The client-side alternative — list, pick, attach — has a race
+    /// between the look and the leap, and worse, a picker that computes "free" from
+    /// anything but the daemon's own table is guessing (design doc §3.1). Answered
+    /// with the same `bootstrapResponse`, whose `name` field carries the allocation.
+    case bootstrapNewInGroup(prefix: String)
     /// The §5.1 handshake, as the JSON the client parses. Carried as an opaque
     /// string rather than re-modelled so the bytes the client sees are exactly the
     /// bytes the daemon produced.
@@ -207,6 +214,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .sessionListRequest: "ls"
         case .sessionListResponse: "lsr"
         case .bootstrapRequest: "boot"
+        case .bootstrapNewInGroup: "bootg"
         case .bootstrapResponse: "booted"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
@@ -282,6 +290,8 @@ extension ControlFrame {
             pairs.append((.text("json"), .text(json)))
         case .bootstrapRequest(let session):
             pairs.append((.text("sess"), .text(session)))
+        case .bootstrapNewInGroup(let prefix):
+            pairs.append((.text("prefix"), .text(prefix)))
         case .bootstrapResponse(let json):
             pairs.append((.text("json"), .text(json)))
         case .bye(let reason):
@@ -429,6 +439,8 @@ extension ControlFrame {
             return .sessionListResponse(json: try requiredText("json"))
         case "boot":
             return .bootstrapRequest(session: try requiredText("sess"))
+        case "bootg":
+            return .bootstrapNewInGroup(prefix: try requiredText("prefix"))
         case "booted":
             return .bootstrapResponse(json: try requiredText("json"))
         case "bye":
