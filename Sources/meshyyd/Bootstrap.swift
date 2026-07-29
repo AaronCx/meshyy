@@ -16,9 +16,29 @@ import MeshyyCore
 import MeshyyDaemon
 
 enum Bootstrap {
+    /// Who names the session: the caller (`--session`), or the daemon
+    /// (`--new-in-group`, which allocates the lowest free numbered name).
+    enum Target {
+        case named(String)
+        case newInGroup(String)
+    }
+
     static func run(socketPath: String, session: String) async {
-        guard SessionStore.isValidName(session) else {
-            fail("session name \(session.debugDescription) is not allowed")
+        await run(socketPath: socketPath, target: .named(session))
+    }
+
+    static func run(socketPath: String, target: Target) async {
+        switch target {
+        case .named(let session):
+            guard SessionStore.isValidName(session) else {
+                fail("session name \(session.debugDescription) is not allowed")
+            }
+        case .newInGroup(let prefix):
+            // The daemon appends a slot number, so validity is judged on a name the
+            // group can actually produce rather than on the bare prefix.
+            guard SessionStore.isValidName(prefix + "0") else {
+                fail("group prefix \(prefix.debugDescription) is not allowed")
+            }
         }
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -56,7 +76,12 @@ enum Bootstrap {
 
         // A dedicated control frame rather than a real attach: this process wants
         // the handshake, not the session's byte stream.
-        write(fd, .control(.bootstrapRequest(session: session)))
+        switch target {
+        case .named(let session):
+            write(fd, .control(.bootstrapRequest(session: session)))
+        case .newInGroup(let prefix):
+            write(fd, .control(.bootstrapNewInGroup(prefix: prefix)))
+        }
 
         var decoder = FrameDecoder()
         var buffer = [UInt8](repeating: 0, count: 65536)

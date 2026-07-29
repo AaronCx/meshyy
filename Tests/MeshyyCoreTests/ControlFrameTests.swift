@@ -42,6 +42,7 @@ struct ControlFrameTests {
         .sessionListRequest,
         .sessionListResponse(json: "[]"),
         .sessionListResponse(json: "[{\"name\":\"aplus-1\",\"alive\":true}]"),
+        .bootstrapNewInGroup(prefix: "aplus-1f-"),
         .ping(nonce: 0),
         .ping(nonce: .max),
         .pong(nonce: 0x0123_4567_89AB_CDEF),
@@ -180,6 +181,8 @@ struct ControlFrameTests {
         // decodes rather than being mistaken for a malformed map.
         ("session_list_request", .sessionListRequest, "a16174626c73"),
         ("session_list_response", .sessionListResponse(json: "[]"), "a26174636c7372646a736f6e625b5d"),
+        ("bootstrap_new_in_group", .bootstrapNewInGroup(prefix: "aplus-"),
+         "a2617465626f6f7467667072656669786661706c75732d"),
         ("ping", .ping(nonce: 7), "a261746470696e67616e07"),
         ("pong", .pong(nonce: 7), "a2617464706f6e67616e07"),
         ("termios_cooked", .termios(.cooked),

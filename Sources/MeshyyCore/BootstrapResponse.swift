@@ -33,6 +33,12 @@ public struct BootstrapResponse: Sendable, Equatable, Codable {
     /// is the normal case; present when the daemon is bound to a specific
     /// interface address the SSH hostname would not resolve to.
     public var host: String?
+    /// The session's name. Optional for wire compatibility with older daemons, but
+    /// THE answer when the daemon allocated the name (`attach --new-in-group`): a
+    /// client that asked for a new session learns here which one it got, and a
+    /// missing name on that path means the far end is too old to have understood
+    /// the request.
+    public var name: String?
 
     public init(
         port: UInt16,
@@ -40,7 +46,8 @@ public struct BootstrapResponse: Sendable, Equatable, Codable {
         certSHA256: String,
         sessionID: String,
         protocol protocolVersion: Int = Meshyy.protocolVersion,
-        host: String? = nil
+        host: String? = nil,
+        name: String? = nil
     ) {
         self.port = port
         self.token = token
@@ -48,6 +55,7 @@ public struct BootstrapResponse: Sendable, Equatable, Codable {
         self.sessionID = sessionID
         self.protocol = protocolVersion
         self.host = host
+        self.name = name
     }
 
     // Snake case on the wire, as design doc §5.1 spells it.
@@ -58,6 +66,7 @@ public struct BootstrapResponse: Sendable, Equatable, Codable {
         case sessionID = "session_id"
         case `protocol`
         case host
+        case name
     }
 
     public enum BootstrapError: Error, Equatable, CustomStringConvertible {

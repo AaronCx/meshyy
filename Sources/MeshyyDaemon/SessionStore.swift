@@ -174,6 +174,14 @@ public actor SessionStore {
     private let notifier: AgentNotifier?
     /// One watcher per session, translating agent events into notifications.
     private var notifyTasks: [String: Task<Void, Never>] = [:]
+    /// Names an in-flight group allocation has claimed but not yet created.
+    ///
+    /// `attachOrCreate` awaits (child spawn, notifier attach), and an actor is
+    /// re-entrant across awaits — so two concurrent allocations could both read the
+    /// same table, both conclude slot 2 is free, and one would silently ATTACH to the
+    /// other's brand-new session, which is precisely the bug group allocation exists
+    /// to end. The claim happens synchronously, before any await, so it cannot race.
+    private var reservedNames: Set<String> = []
 
     public init(config: DaemonConfig = DaemonConfig(), notifier: AgentNotifier? = nil) {
         self.config = config
@@ -225,7 +233,13 @@ public actor SessionStore {
         // phone. A separate subscription rather than piggybacking on a client's,
         // because the whole point is to fire when NO client is attached.
         if let notifier {
-            let (_, events, _) = await session.attach(resumeFrom: session.info.bufferedTo)
+            // An OBSERVER, not a client: this subscription lives as long as the session
+            // does, and counting it would make every session read as attached forever —
+            // exactly the truth `SessionInfo.attachedClients` exists to report.
+            let (_, events, _) = await session.attach(
+                resumeFrom: session.info.bufferedTo,
+                observer: true
+            )
             notifyTasks[name] = Task { [name] in
                 for await event in events {
                     guard case .agent(let kind, _, let detail) = event else { continue }
@@ -242,6 +256,31 @@ public actor SessionStore {
 
     public func session(named name: String) -> PTYSession? {
         sessions[name]
+    }
+
+    /// Creates the lowest-numbered free session in a numeric group — `prefix0`,
+    /// `prefix1`, … — and returns it. THE daemon-side answer to "give me a NEW
+    /// session on this server": the table consulted and the slot claimed are the
+    /// same table, in the same isolation, so two racing clients get two sessions
+    /// and nobody is ever handed a shell that already belonged to someone.
+    ///
+    /// Gaps are reused (0 and 2 alive → 1), matching how a user thinks about tab
+    /// positions rather than growing forever.
+    public func createLowestFree(
+        inGroup prefix: String,
+        size: TerminalSize
+    ) async throws -> PTYSession {
+        // Synchronous from read to claim — see `reservedNames`.
+        var slot = 0
+        var name = prefix + String(slot)
+        while sessions[name] != nil || reservedNames.contains(name) {
+            slot += 1
+            name = prefix + String(slot)
+        }
+        guard Self.isValidName(name) else { throw StoreError.nameRejected(name) }
+        reservedNames.insert(name)
+        defer { reservedNames.remove(name) }
+        return try await attachOrCreate(name: name, size: size)
     }
 
     /// Looks a session up by its 128-bit id rather than its name.

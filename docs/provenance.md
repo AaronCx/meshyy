@@ -578,3 +578,36 @@ resolved: changing what acks mean is a protocol decision, not a test fix.
 nine cases covered; two were false positives. Coverage established by keyword is what
 produced the vacuous privacy gate and the unpinned `ClientModel`. The analysis was redone
 by reading every test name.
+
+## 2026-07-29 — Session inventory: attachment truth, daemon-side allocation, CLOEXEC
+
+**Decision.** Three related additions. (1) `SessionInfo` reports `attachedClients`,
+`createdAt` and `lastOutputAt`, and `meshyyd list --json` prints the daemon's table
+verbatim for programs. (2) `attach --new-in-group PREFIX` has the DAEMON allocate the
+lowest free numbered name in a group, atomically with its own table (a synchronous
+reservation guards the actor's re-entrancy window; verified red without it — eight
+racing allocations all landed on the same name). The bootstrap response gains `name`,
+echoing what was attached or allocated. (3) `posix_spawn` now sets
+`POSIX_SPAWN_CLOEXEC_DEFAULT`, so a session's child gets only the slave as
+stdin/out/err and inherits none of the daemon's other descriptors.
+
+**Source.** Original design, from design doc §3.1 ("never guess something the daemon
+can simply report"). The motivating failure was a+Terminal computing "which session is
+free" from its own open tabs while the sessions lived on the daemon and outlived the
+tabs: every "new session" after a force-quit resolved to a shell that already belonged
+to someone. The observer distinction exists because the M5 notifier holds a
+subscription on every session for its whole life; counting it would make "detached"
+unobservable, and a client filtering on `attached_clients == 0` would never offer a
+resume.
+
+**The CLOEXEC finding.** The new list-truth test failed on first run: a client that
+closed its socket kept reading as attached forever. Cause: without
+`POSIX_SPAWN_CLOEXEC_DEFAULT`, every shell the daemon spawns inherits every
+descriptor the daemon holds — including every live client socket, so a client's EOF
+never arrives at the daemon while any later-spawned child lives, and the child holds
+other clients' connection fds, which §8's threat model plainly forbids. Found by a
+count on the far side, exactly per the method notes; a socketpair probe cleared
+kqueue before the spawn-inheritance theory was tested.
+
+**Consulted.** POSIX posix_spawn and Apple's spawn.h (`POSIX_SPAWN_CLOEXEC_DEFAULT`
+is an Apple extension); design doc §§3.1, 8; no mosh material.

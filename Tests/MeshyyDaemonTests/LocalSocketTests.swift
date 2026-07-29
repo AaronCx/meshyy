@@ -610,6 +610,56 @@ struct LocalSocketTests {
             #expect(await session?.pendingWriteCount == 0, "the write queue did not drain")
         }
     }
+
+    @Test("The list reports attachment truthfully, including across a client's death")
+    func listReportsAttachmentTruth() async throws {
+        try await withServer { path, _ in
+            /// Asks the daemon for its table and returns the row for `name`.
+            /// A FRESH connection per question, because the question under test is
+            /// what the daemon believes, not what one long-lived client has seen.
+            func daemonRow(_ name: String) throws -> [String: Any]? {
+                let asker = try TestClient(socketPath: path)
+                defer { asker.close() }
+                asker.send(.control(.sessionListRequest))
+                #expect(asker.pump { frames in
+                    frames.contains { $0.kind == .control }
+                }, "no list answer")
+                guard case .sessionListResponse(let json)? = asker.controlFrames.first(where: {
+                    if case .sessionListResponse = $0 { return true }
+                    return false
+                }) else { return nil }
+                let rows = try JSONSerialization.jsonObject(
+                    with: Data(json.utf8)) as? [[String: Any]]
+                return rows?.first { $0["name"] as? String == name }
+            }
+
+            let client = try TestClient(socketPath: path)
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "truth"))))
+            #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+            let attached = try daemonRow("truth")
+            #expect(attached?["attached_clients"] as? Int == 1,
+                    "one live client must read as one, got \(String(describing: attached))")
+            #expect(attached?["created_at"] as? Int ?? 0 > 0)
+
+            // An abrupt close, not a Bye — the case that matters is the client that
+            // vanished (suspended app, dead network), because that is the session a
+            // user later wants offered back as detached rather than haunted by a
+            // phantom attachment.
+            client.close()
+
+            // The daemon notices on its next read; poll rather than sleep-and-hope.
+            var lastSeen: Int? = attached?["attached_clients"] as? Int
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                lastSeen = try daemonRow("truth")?["attached_clients"] as? Int
+                if lastSeen == 0 { break }
+                usleep(50_000)
+            }
+            #expect(lastSeen == 0,
+                    "a vanished client must leave the count, or no session ever reads as detached")
+        }
+    }
 }
 
 extension TestClient {

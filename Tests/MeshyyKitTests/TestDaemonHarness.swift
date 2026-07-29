@@ -72,6 +72,15 @@ final class TestDaemonHarness: @unchecked Sendable {
     /// Design doc §5.1 steps 2-3, over the unix socket instead of an SSH exec
     /// channel. Returns the parsed handshake.
     func bootstrap(session: String) throws -> BootstrapResponse {
+        try bootstrap(sending: .bootstrapRequest(session: session))
+    }
+
+    /// The daemon-allocated variant: `meshyyd attach --new-in-group PREFIX --json`.
+    func bootstrap(newInGroup prefix: String) throws -> BootstrapResponse {
+        try bootstrap(sending: .bootstrapNewInGroup(prefix: prefix))
+    }
+
+    private func bootstrap(sending frame: ControlFrame) throws -> BootstrapResponse {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw Failure.socket }
         defer { Darwin.close(fd) }
@@ -97,7 +106,7 @@ final class TestDaemonHarness: @unchecked Sendable {
         }
         guard connected else { throw Failure.connect }
 
-        let request = FrameEnvelope.control(.bootstrapRequest(session: session)).encoded
+        let request = FrameEnvelope.control(frame).encoded
         _ = request.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
 
         var decoder = FrameDecoder()
