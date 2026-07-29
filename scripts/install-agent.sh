@@ -35,7 +35,23 @@ sed -e "s|__BINARY__|$BINARY|g" -e "s|__LOG_DIR__|$LOG_DIR|g" \
 # bootout first so a re-install replaces rather than layers. Ignore failure: the
 # agent may not be loaded yet.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+# bootstrap retries: immediately after a bootout, launchd can still be tearing the
+# old instance down, and the bootstrap fails with "Input/output error" (EIO). That
+# happened on two consecutive reinstalls on the dev Mac — and a failed bootstrap
+# here means the daemon is silently DOWN until someone notices. Give launchd a
+# moment and try again before giving up.
+for attempt in 1 2 3; do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST"; then
+        break
+    fi
+    if [[ "$attempt" == 3 ]]; then
+        echo "error: launchctl bootstrap failed three times; the agent is NOT running" >&2
+        exit 1
+    fi
+    echo "bootstrap attempt $attempt failed; retrying..." >&2
+    sleep 1
+done
 
 echo "installed $LABEL -> $BINARY"
 echo "socket: $HOME/.meshyy/meshyyd.sock"
