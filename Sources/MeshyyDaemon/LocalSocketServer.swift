@@ -313,6 +313,12 @@ final class LocalClient: @unchecked Sendable {
                             handleSessionList()
                             continue
                         }
+                        if frame.kind == .control,
+                           let control = try? ControlFrame.decode(frame.payload),
+                           case .sessionKillRequest(let name) = control {
+                            handleSessionKill(name: name)
+                            continue
+                        }
                         attachment?.receive(frame)
                     }
                 } catch {
@@ -329,6 +335,19 @@ final class LocalClient: @unchecked Sendable {
             if errno == EINTR { continue }
             closeConnection()
             return
+        }
+    }
+
+    /// Ends a session and the shell behind it.
+    ///
+    /// Answers with the list, so the caller sees the result rather than being told it
+    /// worked. A cleanup command that reports success without showing what remains is
+    /// how the pile-up went unnoticed in the first place.
+    private func handleSessionKill(name: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.store.close(name: name)
+            self.handleSessionList()
         }
     }
 

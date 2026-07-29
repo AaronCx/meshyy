@@ -56,10 +56,14 @@ final class AttachClient: @unchecked Sendable {
         defer { Darwin.close(fd) }
 
         send(.control(.sessionListRequest))
+        awaitList(timeoutSeconds: 5)
+    }
 
+    /// Waits for a session list and renders it.
+    private func awaitList(timeoutSeconds: Double) {
         var decoder = FrameDecoder()
         var buffer = [UInt8](repeating: 0, count: 65536)
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 65536) }
             if count <= 0 {
@@ -83,6 +87,17 @@ final class AttachClient: @unchecked Sendable {
         exit(3)
     }
 
+    /// `meshyyd kill NAME` — ends a session, then prints what is left.
+    ///
+    /// Shows the remaining list rather than reporting success, because "it worked" is
+    /// exactly the kind of claim that let a pile of orphaned sessions go unnoticed.
+    func kill() async {
+        guard connect() else { return }
+        defer { Darwin.close(fd) }
+        send(.control(.sessionKillRequest(name: session)))
+        awaitList(timeoutSeconds: 5)
+    }
+
     /// Prints one line per session. `alive` is the column that matters: a session
     /// whose shell has died still exists, and saying "1 session" about it would be
     /// the same kind of unchecked claim this command exists to remove.
@@ -101,8 +116,13 @@ final class AttachClient: @unchecked Sendable {
         // String to a C `%s` conversion needs a manually-bridged C pointer and
         // segfaulted on the first real session, which is a poor way to learn that a
         // diagnostic command is itself broken.
+        // Always at least one trailing space. Padding to a width a value already
+        // exceeds returned it unchanged, which glued the next column onto it —
+        // `aplus-<uuid>45683` — and made the output unparseable by anything, including
+        // the person trying to clean up. A diagnostic command that cannot be read is
+        // not one.
         func pad(_ value: String, _ width: Int) -> String {
-            value.count >= width ? value : value + String(repeating: " ", count: width - value.count)
+            value.count >= width ? value + " " : value + String(repeating: " ", count: width - value.count)
         }
 
         print(pad("NAME", 30) + pad("PID", 9) + pad("BUFFERED", 11) + pad("SIZE", 9) + "STATE")
