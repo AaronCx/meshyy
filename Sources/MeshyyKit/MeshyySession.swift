@@ -420,11 +420,23 @@ public actor MeshyySession {
     /// Restarted on every attach: probes sent down a connection that no longer exists
     /// can never be answered, and carrying them across would declare the fresh
     /// connection dead on arrival.
+    ///
+    /// **Runs whether or not this session can reconnect itself.** It used to return
+    /// early without a `bootstrapProvider`, on the reasoning that there was "nothing to
+    /// reconnect with" — which conflated the loop's two jobs. Detecting a dead path
+    /// needs a provider. Putting TRAFFIC on the connection does not, and that is the
+    /// only thing keeping a quiet session alive: `idleTimeout` is 5 seconds, so a
+    /// client that never probes is dropped five seconds after the user stops typing.
+    ///
+    /// That is exactly what happened. The app drives its own reconnection, so it sets
+    /// no provider, so it sent no probes, so every pause in typing killed the transport
+    /// — surfacing as a "Reconnecting" flash every few seconds, a replayed screen each
+    /// time, and a terminal that only picked up its true size after one of those
+    /// reconnects. All of it read as three unrelated bugs.
     private func startHeartbeat() {
         heartbeatTask?.cancel()
         heartbeat.reset()
         heartbeatConfirmed = false
-        guard bootstrapProvider != nil else { return }   // nothing to reconnect with
 
         let interval = heartbeat.interval
         heartbeatTask = Task { [weak self] in
@@ -457,6 +469,13 @@ public actor MeshyySession {
         if heartbeat.isDead, heartbeatConfirmed {
             let misses = heartbeat.missed
             heartbeat.reset()
+            guard bootstrapProvider != nil else {
+                // No way to redial from in here, so the caller owns recovery. Keep
+                // probing rather than stopping: the probes are also what hold a healthy
+                // connection open, and a session that gives up on them guarantees the
+                // idle timeout it was trying to detect.
+                return true
+            }
             Task { await self.reconnect(because: .heartbeatLost(misses: misses)) }
             return false   // the attach that follows starts a fresh loop
         }
