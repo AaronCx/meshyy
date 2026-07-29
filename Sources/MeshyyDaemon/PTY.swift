@@ -189,9 +189,20 @@ public final class PTY {
         sigemptyset(&unblocked)
         posix_spawnattr_setsigmask(&attributes, &unblocked)
 
+        // CLOEXEC_DEFAULT: the child gets ONLY what the file actions grant — the
+        // slave as stdin/out/err — and nothing else from this process's table.
+        // Without it, every descriptor the daemon holds is inherited by every
+        // shell it spawns: the listeners, the other sessions' PTYs, and — the part
+        // that bit — every live client socket. A client that vanished could then
+        // never be detected, because its socket stayed open inside a shell child
+        // and EOF never arrived; the attachment count read 1 forever, and the
+        // session could never be offered back as detached. A child holding other
+        // clients' connection fds is also exactly the leak §8's "most
+        // security-sensitive thing in either project" must not have.
         posix_spawnattr_setflags(
             &attributes,
-            Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK)
+            Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK
+                | POSIX_SPAWN_CLOEXEC_DEFAULT)
         )
 
         var pid: pid_t = 0
