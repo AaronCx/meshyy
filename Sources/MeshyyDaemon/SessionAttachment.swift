@@ -253,7 +253,14 @@ public final class SessionAttachment: @unchecked Sendable {
         // existed — it was created during bootstrap, before any client had said how
         // big its screen was — so relying on creation-time size left every QUIC
         // session at the 80x24 default.
-        try? await session.resize(to: TerminalSize(cols: hello.cols, rows: hello.rows))
+        //
+        // `resyncSize`, not `resize`: unconditionally is not enough on its own. A
+        // program inside the session can be out of sync with a PTY that is ALREADY the
+        // right size, and then re-sending that size changes nothing and signals nobody,
+        // so it stays out of sync for the life of the session. An attach is exactly
+        // when that must be repaired, because it is exactly when a client has been
+        // away and may have missed the change.
+        try? await session.resyncSize(to: TerminalSize(cols: hello.cols, rows: hello.rows))
 
         let (decision, events, token) = await session.attach(resumeFrom: hello.resumeFrom)
         let info = await session.info

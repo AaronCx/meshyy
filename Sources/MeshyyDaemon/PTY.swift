@@ -284,6 +284,38 @@ public final class PTY {
         // stop someone "fixing" it by adding a manual kill().
     }
 
+    /// Applies the size and makes the foreground program re-read it, whether or not
+    /// the size changed.
+    ///
+    /// **Why this is not the same as `resize`, and why the warning above does not
+    /// apply here.** The kernel sends SIGWINCH on TIOCSWINSZ only when the size
+    /// actually CHANGES. That is right for a live resize and wrong for an attach,
+    /// because a full-screen program can be out of sync with a PTY that is already the
+    /// correct size — and then the correct size is, by construction, a no-op. Nothing
+    /// can ever fix it: the client sends the right number, the daemon applies the right
+    /// number, the kernel correctly does nothing, and the program stays wrong forever.
+    ///
+    /// Measured on a real session: the PTY was 74x64 and tmux was still drawing 74x39,
+    /// hours later, with the phone re-sending 74x64 on every attach. Re-applying an
+    /// unchanged size was verified to produce no signal at all.
+    ///
+    /// So an attach signals explicitly. A duplicate SIGWINCH costs a redraw; a missing
+    /// one costs a terminal that never fills the screen again.
+    public func resyncSize(to size: TerminalSize) throws {
+        try Self.applySize(size, to: masterFD)
+        // The foreground process group of the terminal is what the kernel would have
+        // signalled — the tmux CLIENT, say, rather than the login shell that started
+        // it, which is why this is read rather than assumed to be the child's group.
+        //
+        // From the MASTER. `tcgetpgrp` on the slave fails with ENOTTY on Darwin —
+        // measured, same family of master/slave asymmetry as the note in `init`, and it
+        // fails silently through the guard below, which cost a green test run that
+        // proved nothing.
+        let group = tcgetpgrp(masterFD)
+        guard group > 0 else { return }   // no foreground group: nothing to tell
+        _ = killpg(group, SIGWINCH)
+    }
+
     private static func applySize(_ size: TerminalSize, to fd: Int32) throws {
         var window = winsize(
             ws_row: UInt16(size.rows),

@@ -462,6 +462,21 @@ public actor PTYSession {
         try pty.resize(to: newSize)
     }
 
+    /// Applies the size for a client that has just attached, and makes the foreground
+    /// program re-read it even when nothing changed.
+    ///
+    /// `resize` above returns early on an unchanged size, which is correct for a live
+    /// resize — the ioctl would be a no-op and the kernel would signal nobody. On an
+    /// ATTACH that early return is the bug: a full-screen program that drifted out of
+    /// sync (a tmux client that missed a SIGWINCH while the phone was away, say) can
+    /// never be corrected, because the client keeps sending the right size and the
+    /// right size keeps changing nothing. See `PTY.resyncSize`.
+    public func resyncSize(to newSize: TerminalSize) throws {
+        guard exitStatus == nil else { return }
+        size = newSize
+        try pty.resyncSize(to: newSize)
+    }
+
     public var info: SessionInfo {
         let window = buffer.window
         return SessionInfo(
