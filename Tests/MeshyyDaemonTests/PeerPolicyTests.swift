@@ -28,9 +28,26 @@ struct PeerPolicyTests {
                 "\(address) is inside 100.64.0.0/10 and must be admitted")
     }
 
-    @Test("Loopback is admitted")
-    func loopbackIsAdmitted() {
-        #expect(QUICServer.isPermittedPeer(endpoint("127.0.0.1")))
+    @Test("Loopback is admitted", arguments: ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
+    func loopbackIsAdmitted(address: String) {
+        #expect(QUICServer.isPermittedPeer(endpoint(address)),
+                "\(address) is loopback and must be admitted")
+    }
+
+    /// Fails OPEN on anything it cannot read, and that is deliberate.
+    ///
+    /// Refusing unrecognised forms turned this hardening measure into an outage twice —
+    /// once on a LAN probe, once on CI, where a loopback QUIC connection never
+    /// established because the endpoint was not the shape this expected. The token and
+    /// the pinned certificate are the real controls; a check that cannot read an
+    /// address has learned nothing about whether that address is hostile.
+    @Test("An unreadable endpoint is admitted rather than refused")
+    func unreadableEndpointFailsOpen() {
+        #expect(QUICServer.isPermittedPeer(nil), "no path yet must not be a refusal")
+        #expect(QUICServer.isPermittedPeer(.service(name: "x", type: "_meshyy._udp", domain: "local", interface: nil)),
+                "a service endpoint is not an address this can judge")
+        #expect(QUICServer.isPermittedPeer(.unix(path: "/tmp/x.sock")),
+                "a unix endpoint is not an address this can judge")
     }
 
     /// The LAN is what §8 is actually defending against, and it is one octet away from
