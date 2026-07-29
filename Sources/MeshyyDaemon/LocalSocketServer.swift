@@ -392,8 +392,19 @@ final class LocalClient: @unchecked Sendable {
                 }
                 return row
             }
-            let json = (try? JSONSerialization.data(withJSONObject: payload))
-                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+            // An ENVELOPE, not a bare array, and that shape is load-bearing: it is
+            // how a consumer proves it is talking to a daemon that reports the
+            // fields it needs. A bare-array check ("do the rows carry
+            // attached_clients?") evaporates exactly when the table is empty, and
+            // an empty table is the normal state of a freshly-upgraded host — the
+            // one moment the capability question matters most.
+            let envelope: [String: Any] = [
+                "schema": 2,
+                "meshyyd": Meshyy.version,
+                "sessions": payload,
+            ]
+            let json = (try? JSONSerialization.data(withJSONObject: envelope))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? #"{"schema":2,"sessions":[]}"#
             self.write(.control(.sessionListResponse(json: json)))
         }
     }

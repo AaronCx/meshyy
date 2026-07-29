@@ -124,8 +124,15 @@ public struct BootstrapResponse: Sendable, Equatable, Codable {
 
     /// Rejects a malformed response before any of it is used to open a socket or
     /// pin a certificate. Design doc §3.5: fail visible, and fail early.
+    ///
+    /// The protocol check is a sanity floor, NOT an equality gate. Frames are
+    /// additive (§5.3), so a NEWER daemon is compatible by design — and version
+    /// POLICY belongs to the caller, who can render a real "daemon is older/newer"
+    /// message. An equality check here would pre-break every fielded client on the
+    /// day the version first bumps, with an error claiming the response was
+    /// unreadable when it read it perfectly well.
     public func validate() throws {
-        guard `protocol` == Meshyy.protocolVersion else {
+        guard `protocol` >= 1 else {
             throw BootstrapError.unsupportedProtocol(`protocol`)
         }
         guard !token.isEmpty else { throw BootstrapError.emptyToken }

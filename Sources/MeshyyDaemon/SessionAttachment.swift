@@ -265,10 +265,24 @@ public final class SessionAttachment: @unchecked Sendable {
         let (decision, events, token) = await session.attach(resumeFrom: hello.resumeFrom)
         let info = await session.info
 
-        state.withLock {
-            $0.session = session
-            $0.subscription = token
-            $0.ackedOffset = hello.resumeFrom ?? 0
+        // The transport can die while this attach is in flight — Hello arrives, the
+        // app is force-quit, and `finish()` runs before this point. finish() is
+        // one-shot: it already captured session=nil and can never detach what gets
+        // stored after it. Storing anyway would leave a subscriber nobody owns —
+        // `attachedClients` reads 1 for the session's whole life (so it is never
+        // offered for resume), and its unbounded event stream buffers every byte of
+        // output with no consumer. So the store is conditional on the same lock
+        // finish() uses, and a lost race detaches immediately instead of leaking.
+        let lostToFinish = state.withLock { current -> Bool in
+            if current.finished { return true }
+            current.session = session
+            current.subscription = token
+            current.ackedOffset = hello.resumeFrom ?? 0
+            return false
+        }
+        if lostToFinish {
+            await session.detach(token)
+            return
         }
 
         send(.control(.welcome(.init(

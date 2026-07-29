@@ -99,4 +99,95 @@ struct SessionInventoryTests {
         }
         await store.closeAll()
     }
+
+    /// The orphan detector: a store whose children are UNIQUELY NAMED, so the
+    /// process table can answer "did anything this store spawned escape it?"
+    ///
+    /// The double-create bug's whole signature is that its victims are INVISIBLE to
+    /// the store: a PTYSession overwritten out of the table still runs its child,
+    /// but list, kill, reapDead and closeAll can never reach it. The process table
+    /// is the one witness that cannot be fooled — but only if this test's children
+    /// are distinguishable from every other suite's (suites run concurrently, and
+    /// counting plain `cat` children picked up theirs; caught on the first full run).
+    private struct OrphanProbe {
+        let store: SessionStore
+        private let executable: String
+        private let name: String
+
+        init() throws {
+            // Short enough to survive the kernel's 16-character process-name
+            // truncation intact, so `pgrep -x` matches exactly.
+            name = "mshy-o-\(UUID().uuidString.prefix(8).lowercased())"
+            executable = "/tmp/\(name)"
+            try FileManager.default.copyItem(atPath: "/bin/cat", toPath: executable)
+            var config = DaemonConfig.deterministicEcho()
+            config.shell = executable
+            store = SessionStore(config: config)
+        }
+
+        func strayChildren() throws -> Int {
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            probe.arguments = ["-P", "\(getpid())", "-x", name]
+            let out = Pipe()
+            probe.standardOutput = out
+            try probe.run()
+            probe.waitUntilExit()
+            let text = String(
+                decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            return text.split(separator: "\n").count
+        }
+
+        func cleanUp() {
+            try? FileManager.default.removeItem(atPath: executable)
+        }
+    }
+
+    @Test("Concurrent attaches to one fresh name share ONE shell, and none leak")
+    func concurrentNamedAttachesShareOneSession() async throws {
+        // Two devices bootstrapping the same remembered name at once — or one
+        // retrying behind a slow SSH exec channel. The nil-check and the table
+        // insert used to sit on opposite sides of the child-spawn suspension:
+        // verified against that version, eight callers got eight DISTINCT
+        // sessionIDs, seven shells orphaned outside the table forever.
+        let probe = try OrphanProbe()
+        defer { probe.cleanUp() }
+        let store = probe.store
+        let ids = try await withThrowingTaskGroup(of: String.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    try await store.attachOrCreate(name: "inv-shared", size: .default).sessionID
+                }
+            }
+            var collected: [String] = []
+            for try await id in group { collected.append(id) }
+            return collected
+        }
+        #expect(Set(ids).count == 1,
+                "one name produced \(Set(ids).count) different sessions")
+
+        await store.closeAll()
+        // Give reaped children a beat to leave the process table.
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(try probe.strayChildren() == 0,
+                "closeAll left orphaned children — sessions escaped the store's table")
+    }
+
+    @Test("A named attach racing a group allocation cannot fork one name into two shells")
+    func namedAttachRacingAllocationDoesNotFork() async throws {
+        let probe = try OrphanProbe()
+        defer { probe.cleanUp() }
+        let store = probe.store
+        async let named = store.attachOrCreate(name: "inv-race2-0", size: .default)
+        async let allocated = store.createLowestFree(inGroup: "inv-race2-", size: .default)
+        let (namedSession, allocatedSession) = try await (named, allocated)
+
+        if namedSession.name == allocatedSession.name {
+            #expect(namedSession.sessionID == allocatedSession.sessionID,
+                    "one name, two shells — the orphan factory")
+        }
+        await store.closeAll()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(try probe.strayChildren() == 0)
+    }
 }

@@ -182,6 +182,13 @@ public actor SessionStore {
     /// other's brand-new session, which is precisely the bug group allocation exists
     /// to end. The claim happens synchronously, before any await, so it cannot race.
     private var reservedNames: Set<String> = []
+    /// Creations in flight, by name. The claim `attachOrCreate` itself takes: the
+    /// nil-check and the table insert sit on opposite sides of the child-spawn
+    /// suspension, so without this two concurrent attaches to one fresh name both
+    /// passed the check and both spawned — eight racing callers produced eight
+    /// shells for one name, seven of them orphaned outside the table where list,
+    /// kill and the reaper could never reach them. Losers now await the winner.
+    private var creating: [String: Task<PTYSession, Error>] = [:]
 
     public init(config: DaemonConfig = DaemonConfig(), notifier: AgentNotifier? = nil) {
         self.config = config
@@ -201,19 +208,52 @@ public actor SessionStore {
     /// Returns the named session, creating it if absent. This is what `attach`
     /// wants: a user who attaches to a name they have not used before expects a
     /// shell, not an error.
+    ///
+    /// Concurrent callers for one name get ONE session: the first becomes the
+    /// claimant (see `creating`), the rest await its outcome. Two clients
+    /// attaching to the same name sharing a shell is the two-clients-one-session
+    /// feature working; two shells for one name is the orphan factory this
+    /// structure exists to close.
     public func attachOrCreate(
         name: String,
         size: TerminalSize
     ) async throws -> PTYSession {
         guard Self.isValidName(name) else { throw StoreError.nameRejected(name) }
 
-        if let existing = sessions[name] {
-            if await existing.isAlive { return existing }
-            // The child died while nobody was attached. Replace it rather than
-            // handing back a corpse — but only after its buffer has been read by
-            // anyone still listening, which `close` handles.
-            await existing.close()
-            sessions.removeValue(forKey: name)
+        while true {
+            if let inFlight = creating[name] {
+                // A claimant is mid-creation. Await it; on its failure, loop and
+                // try to become the claimant ourselves (bounded: each pass either
+                // returns, claims, or awaits a task that is already running).
+                if let session = try? await inFlight.value { return session }
+                continue
+            }
+            if let existing = sessions[name] {
+                if await existing.isAlive { return existing }
+                // The child died. Fall through to the claimed replace-and-create;
+                // the corpse is dealt with inside the claim so that its close —
+                // an await — cannot open a second replacement window.
+            }
+            break
+        }
+
+        let task = Task { try await self.replaceAndCreate(name: name, size: size) }
+        creating[name] = task
+        defer { creating[name] = nil }
+        return try await task.value
+    }
+
+    /// The creation itself, only ever reached through a `creating` claim.
+    private func replaceAndCreate(
+        name: String,
+        size: TerminalSize
+    ) async throws -> PTYSession {
+        if let corpse = sessions.removeValue(forKey: name) {
+            // Removed from the table BEFORE the awaited close, so no interleaved
+            // reader can return the corpse; `close` still drains its buffer to
+            // anyone listening.
+            notifyTasks.removeValue(forKey: name)?.cancel()
+            await corpse.close()
         }
 
         let session = try PTYSession(
@@ -270,10 +310,12 @@ public actor SessionStore {
         inGroup prefix: String,
         size: TerminalSize
     ) async throws -> PTYSession {
-        // Synchronous from read to claim — see `reservedNames`.
+        // Synchronous from read to claim — see `reservedNames`. `creating` counts
+        // as taken too: a NAMED attach mid-creation owns its slot just as surely
+        // as a finished one.
         var slot = 0
         var name = prefix + String(slot)
-        while sessions[name] != nil || reservedNames.contains(name) {
+        while sessions[name] != nil || reservedNames.contains(name) || creating[name] != nil {
             slot += 1
             name = prefix + String(slot)
         }
@@ -304,6 +346,9 @@ public actor SessionStore {
     }
 
     public func close(name: String) async throws {
+        // A creation in flight for this name finishes first, so the close acts on
+        // the session it produced instead of missing it by a few milliseconds.
+        if let inFlight = creating[name] { _ = try? await inFlight.value }
         guard let session = sessions.removeValue(forKey: name) else {
             throw StoreError.noSuchSession(name)
         }
@@ -312,6 +357,9 @@ public actor SessionStore {
     }
 
     public func closeAll() async {
+        // Same reasoning as `close(name:)`: let in-flight creations land in the
+        // table so this sweep actually sweeps them.
+        for task in creating.values { _ = try? await task.value }
         for task in notifyTasks.values { task.cancel() }
         notifyTasks.removeAll()
         for session in sessions.values { await session.close() }
