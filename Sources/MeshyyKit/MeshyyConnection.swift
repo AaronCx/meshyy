@@ -28,12 +28,20 @@ public enum MeshyyConnectionState: Sendable, Equatable {
 }
 
 public final class MeshyyConnection: @unchecked Sendable {
-    public enum ConnectionError: Error, Equatable, CustomStringConvertible {
+    /// `LocalizedError` as well as `CustomStringConvertible`, and the difference is not
+    /// cosmetic. Foundation's `localizedDescription` ignores `description` on a Swift
+    /// error and renders "The operation couldn't be completed.
+    /// (MeshyyKit.MeshyyConnection.ConnectionError error 1.)" — which is what a user
+    /// actually saw in a+Terminal's fallback banner. Every one of these cases already
+    /// knows exactly what went wrong; the text just never reached the screen.
+    public enum ConnectionError: Error, Equatable, CustomStringConvertible, LocalizedError {
         case pinMismatch(expected: String, actual: String)
         case noCertificate
         case timedOut(after: Duration)
         case transport(String)
         case notConnected
+
+        public var errorDescription: String? { description }
 
         public var description: String {
             switch self {
