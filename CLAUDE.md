@@ -50,6 +50,19 @@ badge does not cover them. See docs/qa/known-debt.md.
 Baseline: all green, zero known-flaky tests. If something is red, it is a real
 regression — do not push past it.
 
+## Installing the daemon on this Mac
+
+`scripts/install-agent.sh --release` **does not build**. It installs whatever is already
+at `.build/release/meshyyd`, so run `swift build -c release` first or you will restart
+the daemon on a stale binary and believe you have tested a fix — that happened on
+2026-07-29 and nearly produced a false "fixed" report.
+
+Also copy the binary to `~/bin/meshyyd`: an SSH **exec** channel gets a bare PATH that
+does not include `~/bin`, which is where a+Terminal probes for the daemon.
+
+Verify with `~/bin/meshyyd list` (not `pgrep`) — the socket appears a moment after the
+process does, so an immediate check reports a healthy daemon as missing.
+
 ## Constraints
 
 - **Zero dependencies.** `Package.swift` has an empty `dependencies:` array and
