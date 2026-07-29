@@ -611,3 +611,34 @@ kqueue before the spawn-inheritance theory was tested.
 
 **Consulted.** POSIX posix_spawn and Apple's spawn.h (`POSIX_SPAWN_CLOEXEC_DEFAULT`
 is an Apple extension); design doc §§3.1, 8; no mosh material.
+
+## 2026-07-29 — Stabilization round: creation claims, phantom clients, skew honesty
+
+**Context.** An adversarial review of the session-inventory work surfaced four
+mechanisms, each verified by a planted violation or a live probe before fixing.
+
+**Decisions.** (1) `attachOrCreate` claims its name in a `creating` task table
+synchronously before the child-spawn suspension; losers await the winner. Without
+it, eight concurrent attaches to one fresh name produced eight distinct sessions,
+seven orphaned outside the store's table — unreachable by list, kill, reap or
+closeAll (the process table was the only witness, which is why the regression
+tests assert it via uniquely-named probe children). `createLowestFree` treats
+in-flight creations as taken; `close`/`closeAll` await them so a shutdown sweeps
+what they produce. (2) `SessionAttachment.begin` stores its subscription
+conditionally on the same lock `finish()` uses: a transport that died mid-attach
+previously left a permanent phantom `attachedClients` and an unbounded event
+buffer with no consumer. (3) The bootstrap and list CLI paths set `SO_RCVTIMEO`:
+their deadlines were only checked between reads of a BLOCKING socket, so a serve
+that never answers (an older one ignoring an unknown frame) hung the caller
+forever — and the caller is an SSH exec channel the app awaits without a timeout.
+Verified live against a silent socket server: fails at 10s where it previously
+never returned. (4) `list --json` wraps rows in `{"schema": 2, "meshyyd":
+version, "sessions": [...]}` — capability must be provable from an EMPTY answer,
+because an empty table is the normal state of a freshly-upgraded host. The CLI
+renderer accepts both shapes; consumers gate on the envelope. Additionally,
+`BootstrapResponse.validate` now enforces a protocol FLOOR rather than equality:
+version policy belongs to callers, and an equality check would have broken every
+fielded client on the first future protocol bump with a misleading error.
+
+**Consulted.** POSIX setsockopt/SO_RCVTIMEO; design doc §§3.1, 3.5, 5.3, 8. No
+mosh material.
