@@ -25,6 +25,16 @@ public enum MeshyySessionEvent: Sendable {
     /// and a bug report — can say *why* the session dropped rather than only that it
     /// did. §3.5: fail visible.
     case reconnecting(trigger: String)
+    /// Release terminal state belonging to the geometry a replay was captured at.
+    ///
+    /// A SEPARATE event rather than `.output`, so `.output` remains exactly the bytes
+    /// the pty produced — which is what §6.4 is a statement about. Feeding these
+    /// through `.output` made the byte-exactness tests red, and the right answer was
+    /// not to relax the invariant but to stop pretending locally-generated escapes are
+    /// remote output.
+    ///
+    /// A renderer applies `TerminalGeometry.reset` on receipt.
+    case geometryReset
     /// Line discipline changed (design doc §7.1). Retained because §7's rewrite
     /// keeps the fact useful even though prediction is gone: a UI can explain why
     /// nothing echoes locally.
@@ -312,6 +322,20 @@ public actor MeshyySession {
             // to an older daemon would redial every few seconds forever — the classic
             // way an additive frame stops being additive.
             heartbeatConfirmed = true
+
+        case .resetGeometry:
+            // Emitted to the renderer, and returned as NOTHING.
+            //
+            // `handle`'s return value means "resumed pty bytes" — it is what the §6.4
+            // conformance harness compares against the daemon's buffer and what the
+            // abrupt-loss accounting balances against `consumedOffset`. These bytes are
+            // generated locally, not resumed, so including them in that return value
+            // would fail byte-exactness (it did, immediately) and would make the offset
+            // arithmetic disagree with itself.
+            //
+            // The emulator still gets them, because the event stream — not this return
+            // value — is what production renders from.
+            emit(.geometryReset)
 
         case .resumeTooOld:
             // Already reported through screenRebuilt when the base arrives, which

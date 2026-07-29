@@ -76,6 +76,7 @@ private final class EventLog: @unchecked Sendable {
             case .ended(let reason): "ended(\(reason))"
             case .failed(let reason): "FAILED(\(reason))"
             case .reconnecting(let trigger): "reconnecting(\(trigger))"
+            case .geometryReset: "geometryReset"
             }
         }.joined(separator: " ")
     }

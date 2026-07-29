@@ -32,6 +32,14 @@ public enum AgentEventKind: String, Sendable, Equatable, CaseIterable {
     case idle
 }
 
+/// Terminal state that depends on the size of the screen rather than its content.
+///
+/// Full-window scroll region, origin mode off, autowrap on. Deliberately NOT a reset of
+/// the screen: clearing here would discard the very content a replay just restored.
+public enum TerminalGeometry {
+    public static let reset: [UInt8] = Array("\u{1B}[r\u{1B}[?6l\u{1B}[?7h".utf8)
+}
+
 /// A single control-stream message.
 public enum ControlFrame: Sendable, Equatable {
     case hello(Hello)
@@ -89,6 +97,19 @@ public enum ControlFrame: Sendable, Equatable {
     /// multiplexer, orphans accumulate into a pile that silently degrades every live
     /// session — tmux sizes to its smallest client, so one stale attachment clamps the
     /// terminal for all of them.
+    /// Release terminal state that belongs to the geometry a replay was captured at.
+    ///
+    /// A CONTROL frame, emphatically not PTY bytes. The replayed stream carries the
+    /// scroll region of whatever client produced it — `ESC[1;24r` from a 24-row session
+    /// confines a 60-row client to its top 24 rows — so something must release it. But
+    /// injecting the escape into the PTY stream would put bytes on the wire that the
+    /// pty never produced: it breaks §6.4's byte-exactness outright, and worse, the
+    /// client counts delivered bytes into `consumedOffset`, so the offset would run
+    /// ahead of the buffer and the NEXT resume would silently skip that many real
+    /// bytes. The §6.4 tests caught exactly that on the first attempt.
+    ///
+    /// As a control frame it reaches the emulator without ever being counted.
+    case resetGeometry
     case sessionKillRequest(name: String)
     case sessionListRequest
     /// JSON array of live sessions. A JSON payload rather than a CBOR structure for the
@@ -181,6 +202,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .agentEvent: "agent"
         case .quickActions: "qa"
         case .replayBase: "base"
+        case .resetGeometry: "geo"
         case .sessionKillRequest: "kill"
         case .sessionListRequest: "ls"
         case .sessionListResponse: "lsr"
@@ -250,6 +272,8 @@ extension ControlFrame {
         case .resumeTooOld(let ptyID, let earliestOffset):
             pairs.append((.text("pty"), .int(ptyID)))
             pairs.append((.text("earliest"), .unsigned(earliestOffset)))
+        case .resetGeometry:
+            break   // the type tag is the whole message
         case .sessionKillRequest(let name):
             pairs.append((.text("name"), .text(name)))
         case .sessionListRequest:
@@ -395,6 +419,8 @@ extension ControlFrame {
                 ptyID: try requiredInt("pty"),
                 earliestOffset: try requiredOffset("earliest")
             )
+        case "geo":
+            return .resetGeometry
         case "kill":
             return .sessionKillRequest(name: try requiredText("name"))
         case "ls":

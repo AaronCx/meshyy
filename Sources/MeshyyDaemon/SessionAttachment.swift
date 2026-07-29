@@ -297,6 +297,27 @@ public final class SessionAttachment: @unchecked Sendable {
             for chunk in decision.bytes.chunked(into: FrameEnvelope.maximumPayload) {
                 send(.pty(0, chunk))
             }
+            // A REPLAY IS ONLY VALID AT THE GEOMETRY IT WAS CAPTURED AT.
+            //
+            // The buffer is a byte stream recorded while some earlier client was
+            // attached, and it carries that client's geometry inside it — most
+            // damagingly DECSTBM, the scroll region. Replaying a stream captured at 24
+            // rows into a client that is 60 rows tall leaves `ESC[1;24r` as the last
+            // word on the subject, and the emulator then refuses to paint anything
+            // below row 24 no matter how tall it is.
+            //
+            // Measured exactly that: a 60-row client received a replay whose scroll
+            // regions were all `1;24`. The user saw a terminal that drew its top half
+            // and left the rest black, and it did not happen over plain SSH because
+            // SSH never replays anything.
+            //
+            // So the replay is followed by a reset of the state that is geometry-
+            // dependent and NOT content: full-window scroll region, origin mode off,
+            // autowrap on. This restores nothing about what is on screen — it only
+            // stops a stale frame dictating where the next one may be drawn. A live
+            // application sets its own region on its next paint; until it does, "the
+            // whole window" is the safe default and "rows 1 to 24" is not.
+            send(.control(.resetGeometry))
         }
 
         // Tell the client the current line discipline and screen mode immediately,
