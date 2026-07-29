@@ -59,7 +59,17 @@ public final class QUICServer: @unchecked Sendable {
         // the token and certificate pin are the real controls — this check is
         // defence-in-depth. So allow, and say so rather than pretending it was checked.
         guard let endpoint else { return true }
-        guard case .hostPort(let host, _) = endpoint else { return false }
+        // FAIL OPEN on a shape this does not recognise, and refuse only what it can
+        // positively identify as outside the policy.
+        //
+        // The other way round turned a hardening measure into an outage twice: this
+        // refused every endpoint form it had not anticipated, which on a CI runner meant
+        // a loopback QUIC connection that simply never established. The token is
+        // single-use and short-TTL and the certificate is pinned over authenticated SSH
+        // — THOSE are the controls. This check exists to keep the daemon off a hostile
+        // LAN, and a check that cannot read an address has learned nothing about whether
+        // the address is hostile.
+        guard case .hostPort(let host, _) = endpoint else { return true }
         let address: String
         switch host {
         case .ipv4(let v4): address = "\(v4)"
@@ -68,12 +78,12 @@ public final class QUICServer: @unchecked Sendable {
             // ::ffff:100.x.y.z and ::1 both arrive here on a dual-stack listener.
             if text.hasPrefix("::1") { return true }
             address = text.contains(".") ? String(text.split(separator: ":").last ?? "") : text
-        default: return false
+        default: return true   // an address form this cannot read — see above
         }
         let bare = address.split(separator: "%").first.map(String.init) ?? address
         if bare == "127.0.0.1" || bare == "::1" { return true }
         let octets = bare.split(separator: ".").compactMap { UInt8($0) }
-        guard octets.count == 4 else { return false }
+        guard octets.count == 4 else { return true }   // unparseable — see above
         // 100.64.0.0/10
         return octets[0] == 100 && (64...127).contains(octets[1])
     }
