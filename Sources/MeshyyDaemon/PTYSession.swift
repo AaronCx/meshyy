@@ -474,22 +474,28 @@ public actor PTYSession {
     /// backpressure test can assert the queue drains rather than grows without bound.
     public var pendingWriteCount: Int { pendingWrite.count }
 
+    /// Applies a client's size and makes the foreground program re-read it — even
+    /// when nothing changed.
+    ///
+    /// This used to early-return on an unchanged size, which was right when the
+    /// transport flapped every few seconds: any program that missed a SIGWINCH was
+    /// repaired moments later by the next attach's resync. The premise died when
+    /// the heartbeat fix made sessions long-lived — measured on a real one: a tmux
+    /// client that missed a single WINCH stayed at 74x39 against a 74x64 PTY for a
+    /// DAY, because the session never reattached and every resize the phone sent
+    /// matched the size already recorded, so nothing was ever signalled. A resize
+    /// frame is a rare, user-caused event; answering it with one explicit signal
+    /// (see `PTY.resyncSize` — exactly one, whichever side produces it) turns every
+    /// keyboard show/dismiss into a repair opportunity instead of a no-op.
     public func resize(to newSize: TerminalSize) throws {
         guard exitStatus == nil else { return }
-        guard newSize != size else { return }
         size = newSize
-        try pty.resize(to: newSize)
+        try pty.resyncSize(to: newSize)
     }
 
-    /// Applies the size for a client that has just attached, and makes the foreground
-    /// program re-read it even when nothing changed.
-    ///
-    /// `resize` above returns early on an unchanged size, which is correct for a live
-    /// resize — the ioctl would be a no-op and the kernel would signal nobody. On an
-    /// ATTACH that early return is the bug: a full-screen program that drifted out of
-    /// sync (a tmux client that missed a SIGWINCH while the phone was away, say) can
-    /// never be corrected, because the client keeps sending the right size and the
-    /// right size keeps changing nothing. See `PTY.resyncSize`.
+    /// The attach-time spelling of the same repair (design doc §4.1): kept as its
+    /// own entry point because an attach must resync UNCONDITIONALLY, and the
+    /// shared mechanics live in `PTY.resyncSize`.
     public func resyncSize(to newSize: TerminalSize) throws {
         guard exitStatus == nil else { return }
         size = newSize
