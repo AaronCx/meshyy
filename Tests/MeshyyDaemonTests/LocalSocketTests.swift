@@ -14,7 +14,7 @@ import Testing
 /// A minimal client: connect, frame, unframe. Deliberately not `AttachClient` —
 /// a test that drove the shipping client would pass whenever the two agreed with
 /// each other rather than with the protocol.
-private final class TestClient {
+final class TestClient {
     fileprivate var fd: Int32 = -1
     private var decoder = FrameDecoder()
     private(set) var received: [FrameEnvelope] = []
@@ -123,7 +123,7 @@ private final class TestClient {
 }
 
 /// What the session's child process is.
-private enum SessionChild {
+enum SessionChild {
     /// A child that produces output forever without being asked — `yes`. For
     /// backpressure: the question is whether the daemon keeps draining a PTY when
     /// nobody is listening.
@@ -134,10 +134,16 @@ private enum SessionChild {
     /// A real interactive shell. Only for tests whose subject IS the shell —
     /// `stty size` reaching the kernel, or M1's "attach gives a working shell".
     case shell
+    /// An interactive shell WITH JOB CONTROL and no rc files (`zsh -f -i`) — the
+    /// production topology: a job-control shell puts its foreground job (a tmux
+    /// client, say) in its OWN process group, which is how a resize can be applied
+    /// to the kernel and heard by nobody. `/bin/sh` cannot reproduce that; its
+    /// jobs share its group and accidentally catch whatever is signalled.
+    case jobControlShell
 }
 
 /// A server on a unique temp socket, torn down with the harness.
-private func withServer(
+func withServer(
     bufferCapacity: Int = RingBuffer.defaultCapacity,
     child: SessionChild = .bytePipe,
     _ body: (String, SessionStore) async throws -> Void
@@ -163,6 +169,18 @@ private func withServer(
         config = DaemonConfig()
         config.shell = "/bin/sh"
         config.shellArguments = []
+        config.bufferCapacity = bufferCapacity
+        config.environment = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "TERM": "xterm-256color",
+            "HOME": NSHomeDirectory(),
+        ]
+    case .jobControlShell:
+        // -f: no rc files, so this is deterministic on any machine; -i: interactive,
+        // which is what turns zsh's job control on.
+        config = DaemonConfig()
+        config.shell = "/bin/zsh"
+        config.shellArguments = ["-f", "-i"]
         config.bufferCapacity = bufferCapacity
         config.environment = [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",

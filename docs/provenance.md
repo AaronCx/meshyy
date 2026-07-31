@@ -669,3 +669,28 @@ the foreground program. Verified red against the early return.
 
 **Consulted.** POSIX TIOCSWINSZ/TIOCGWINSZ and SIGWINCH semantics; design doc
 §3.5. No mosh material.
+
+## 2026-07-30 — Deliver resize to the session's process TREE, not the tty's guess
+
+**Decision.** `PTY.resyncSize` now signals SIGWINCH to every distinct process
+group among the child and its live descendants (enumerated via
+`sysctl(KERN_PROC_ALL)`), plus the tty's foreground group when it names one —
+minus the changed-size case the kernel's own signal already covers.
+
+**Source.** Live failure that survived the previous fix, diagnosed on the box:
+under the daemon's real default shell (the user's zsh), job control puts the
+tmux client in its OWN process group, and the pty's foreground-group
+bookkeeping names nobody useful (`TPGID 0`; `tcgetpgrp(master)` unusable) — so
+both the kernel's WINCH-on-change and an explicit `killpg(tcgetpgrp(...))` were
+delivered to no one. Proven by experiment: a live kernel resize left the tmux
+client unmoved; `killpg` at the shell's group did nothing; `killpg` at the tmux
+client's group repaired the screen instantly. `/bin/sh` harnesses cannot see
+this bug — their jobs share the shell's group and accidentally catch whatever
+is signalled — which is why every earlier layer of testing passed while the
+phone stayed black. The regression suite (TmuxResizeTests) therefore runs the
+dismiss sequence under BOTH topologies, with `zsh -f -i` (job control, no rc
+files) as the deterministic production shape; verified red against the
+pre-tree-delivery code in exactly and only the job-control case.
+
+**Consulted.** POSIX job control and tty semantics (setpgid/tcsetpgrp/SIGWINCH);
+sysctl KERN_PROC on Darwin. No mosh material.
