@@ -313,31 +313,74 @@ public final class PTY {
     /// So an attach signals explicitly. A duplicate SIGWINCH costs a redraw; a missing
     /// one costs a terminal that never fills the screen again.
     public func resyncSize(to size: TerminalSize) throws {
-        // Exactly one signal, whichever way it has to be produced. When the kernel's
-        // size differs, the ioctl alone makes the kernel signal the foreground group;
-        // signalling again on top would deliver a second WINCH per genuine resize —
-        // usually coalesced, but a full-screen redraw per delivery when not. When the
-        // kernel's size already matches, the ioctl is a no-op and the explicit signal
-        // is the only one there will be.
         var current = winsize()
-        let unchanged = ioctl(masterFD, TIOCGWINSZ, &current) == 0
+        let changed = !(ioctl(masterFD, TIOCGWINSZ, &current) == 0
             && current.ws_row == UInt16(size.rows)
-            && current.ws_col == UInt16(size.cols)
+            && current.ws_col == UInt16(size.cols))
 
         try Self.applySize(size, to: masterFD)
-        guard unchanged else { return }
 
-        // The foreground process group of the terminal is what the kernel would have
-        // signalled — the tmux CLIENT, say, rather than the login shell that started
-        // it, which is why this is read rather than assumed to be the child's group.
+        // The kernel's own WINCH-on-change is necessary but NOT sufficient: it goes
+        // to the tty's foreground group, and under a job-control shell the program
+        // that draws is often not in it. Measured on a live session: zsh put the
+        // tmux client in its own process group, the tty's foreground group named
+        // nobody useful, and every resize the phone sent was applied to the kernel
+        // and heard by no one — a terminal that keeps drawing at the old height,
+        // black below, unrecoverable for as long as the session lives. Signalling
+        // the group `tcgetpgrp` names had the same blind spot (that is where it was
+        // read from). A WINCH aimed at the tmux client's own group repaired the
+        // screen instantly.
         //
+        // So the daemon delivers the event to EVERY process group in the session's
+        // tree — the one thing it can enumerate that the tty cannot lie about. The
+        // set is tiny (the shell and its foreground job; a multiplexer SERVER
+        // daemonizes out of the tree and resizes its own panes). The tty's
+        // foreground group is included when it names anyone, minus the change case
+        // the kernel already covered; a duplicate delivery coalesces, a missing one
+        // is this whole bug.
+        var groups = sessionProcessGroups()
         // From the MASTER. `tcgetpgrp` on the slave fails with ENOTTY on Darwin —
-        // measured, same family of master/slave asymmetry as the note in `init`, and it
-        // fails silently through the guard below, which cost a green test run that
-        // proved nothing.
-        let group = tcgetpgrp(masterFD)
-        guard group > 0 else { return }   // no foreground group: nothing to tell
-        _ = killpg(group, SIGWINCH)
+        // measured, same family of master/slave asymmetry as the note in `init`.
+        let foreground = tcgetpgrp(masterFD)
+        if foreground > 0 {
+            if changed { groups.remove(foreground) } else { groups.insert(foreground) }
+        }
+        for group in groups {
+            _ = killpg(group, SIGWINCH)
+        }
+    }
+
+    /// Every distinct process group among the child and its live descendants, read
+    /// from the kernel's process table. `sysctl(KERN_PROC_ALL)` rather than libproc
+    /// so it stays on documented syscalls; one call per resize, and resizes happen
+    /// at keyboard-toggle cadence.
+    private func sessionProcessGroups() -> Set<pid_t> {
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size = 0
+        guard sysctl(&name, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        size += size / 4   // headroom: the table can grow between the two calls
+        let capacity = size / MemoryLayout<kinfo_proc>.stride + 1
+        var table = [kinfo_proc](repeating: kinfo_proc(), count: capacity)
+        guard sysctl(&name, 4, &table, &size, nil, 0) == 0 else { return [] }
+        let count = size / MemoryLayout<kinfo_proc>.stride
+
+        var childrenOf: [pid_t: [Int]] = [:]
+        for index in 0..<count {
+            childrenOf[table[index].kp_eproc.e_ppid, default: []].append(index)
+        }
+
+        var groups: Set<pid_t> = [childPID]   // the child leads its own group (SETSID)
+        var queue: [pid_t] = [childPID]
+        var visited: Set<pid_t> = []
+        while let pid = queue.popLast() {
+            guard visited.insert(pid).inserted else { continue }
+            for index in childrenOf[pid] ?? [] {
+                let entry = table[index]
+                if entry.kp_eproc.e_pgid > 0 { groups.insert(entry.kp_eproc.e_pgid) }
+                queue.append(entry.kp_proc.p_pid)
+            }
+        }
+        return groups
     }
 
     private static func applySize(_ size: TerminalSize, to fd: Int32) throws {
