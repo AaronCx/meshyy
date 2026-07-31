@@ -642,3 +642,30 @@ fielded client on the first future protocol bump with a misleading error.
 
 **Consulted.** POSIX setsockopt/SO_RCVTIMEO; design doc §§3.1, 3.5, 5.3, 8. No
 mosh material.
+
+## 2026-07-30 — Every resize repairs; the flapping transport was load-bearing
+
+**Decision.** `PTYSession.resize` no longer early-returns on an unchanged size: it
+routes through `PTY.resyncSize`, which now delivers exactly ONE signal either way —
+when the kernel's size differs the ioctl alone signals, and when it already matches
+the explicit `killpg(SIGWINCH)` is the only one there will be.
+
+**Source.** Live failure on the first long-lived session build 57 produced. A tmux
+client missed a single WINCH and drew 74x39 against a 74x64 PTY for a day. The
+attach-time resync (PR #18) could not fire because the heartbeat fix (#20) meant
+the session NEVER reattached — the old transport's constant flapping had been the
+accidental repair mechanism, and stabilising it made one missed signal permanent.
+Diagnosed from the far side in three commands: `meshyyd list --json` (daemon
+recorded 64), `tmux list-clients` (client believed 39), `stty -f` (kernel held
+64) — the client was the stale layer, and `kill -WINCH` on it repaired the screen
+instantly, which confirmed the fix's mechanism before it was written.
+
+**Why the negative control flipped scope.** The AttachResyncTests control that
+asserted "the ordinary path signals nobody on an unchanged size" encoded the old
+premise; it now pins the KERNEL's behaviour at the raw `PTY.resize` layer (which
+keeps the resync tests non-vacuous), while a new session-level test asserts the
+opposite of the old design: a mid-session resize to an unchanged size MUST reach
+the foreground program. Verified red against the early return.
+
+**Consulted.** POSIX TIOCSWINSZ/TIOCGWINSZ and SIGWINCH semantics; design doc
+§3.5. No mosh material.

@@ -313,7 +313,20 @@ public final class PTY {
     /// So an attach signals explicitly. A duplicate SIGWINCH costs a redraw; a missing
     /// one costs a terminal that never fills the screen again.
     public func resyncSize(to size: TerminalSize) throws {
+        // Exactly one signal, whichever way it has to be produced. When the kernel's
+        // size differs, the ioctl alone makes the kernel signal the foreground group;
+        // signalling again on top would deliver a second WINCH per genuine resize —
+        // usually coalesced, but a full-screen redraw per delivery when not. When the
+        // kernel's size already matches, the ioctl is a no-op and the explicit signal
+        // is the only one there will be.
+        var current = winsize()
+        let unchanged = ioctl(masterFD, TIOCGWINSZ, &current) == 0
+            && current.ws_row == UInt16(size.rows)
+            && current.ws_col == UInt16(size.cols)
+
         try Self.applySize(size, to: masterFD)
+        guard unchanged else { return }
+
         // The foreground process group of the terminal is what the kernel would have
         // signalled — the tmux CLIENT, say, rather than the login shell that started
         // it, which is why this is read rather than assumed to be the child's group.

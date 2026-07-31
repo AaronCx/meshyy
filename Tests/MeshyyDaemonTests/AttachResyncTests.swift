@@ -24,6 +24,7 @@
 
 import Foundation
 import MeshyyCore
+import Synchronization
 import Testing
 @testable import MeshyyDaemon
 
@@ -95,11 +96,13 @@ struct AttachResyncTests {
                 "a genuine resize did not reach the child (saw \(reported.debugDescription))")
     }
 
-    /// And the negative control, which is what makes the first test meaningful: the
-    /// ORDINARY resize path really does do nothing when the size is unchanged. Without
-    /// this, `attachResyncsAnUnchangedSize` could be passing because the kernel signals
-    /// on every ioctl, and the fix would be untested.
-    @Test("The ordinary resize path stays silent when the size is unchanged")
+    /// The negative control, which is what makes the resync tests meaningful: the RAW
+    /// PTY apply (`PTY.resize`, kernel semantics only) really does signal nobody when
+    /// the size is unchanged. Without this, `attachResyncsAnUnchangedSize` could be
+    /// passing because the kernel signals on every ioctl, and the fix would be
+    /// untested. Note this pins the KERNEL's behaviour at the PTY layer — the SESSION
+    /// layer now deliberately repairs on every resize (see the test below).
+    @Test("The raw PTY apply stays silent when the size is unchanged")
     func unchangedResizeSignalsNobody() throws {
         let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
         defer { pty.terminate() }
@@ -112,6 +115,57 @@ struct AttachResyncTests {
             re-applying an unchanged size DID signal the child, so the premise of the \
             resync fix no longer holds and `attachResyncsAnUnchangedSize` is proving \
             nothing — re-derive both before trusting either
+            """)
+    }
+
+    /// THE MID-SESSION REPAIR. A client re-sending a size the PTY already has must
+    /// still reach the foreground program.
+    ///
+    /// The old session-level early return was correct while the transport flapped —
+    /// any missed WINCH was repaired seconds later by a reattach's resync. The
+    /// heartbeat fix removed the flapping, and with it the accidental repair:
+    /// measured on a real session, a tmux client that missed one WINCH drew 74x39
+    /// against a 74x64 PTY for a DAY, with the phone re-sending the right size on
+    /// every keyboard toggle and the daemon answering every one with silence.
+    @Test("A mid-session resize repairs a program that missed its signal")
+    func unchangedResizeStillRepairs() async throws {
+        let session = try PTYSession(
+            name: "resize-repair",
+            executable: "/bin/sh",
+            arguments: ["-c", "trap 'stty size' WINCH; while :; do sleep 0.05; done"],
+            environment: ["PATH": "/usr/bin:/bin"],
+            size: TerminalSize(cols: 74, rows: 39)
+        )
+        await session.start()
+        let (_, events, token) = await session.attach(resumeFrom: nil)
+        let box = Mutex("")
+        let pump = Task {
+            for await event in events {
+                if case .output(_, let bytes) = event {
+                    box.withLock { $0 += String(decoding: bytes, as: UTF8.self) }
+                }
+            }
+        }
+        // Let the trap be installed before signalling, same as the PTY-level tests.
+        try await Task.sleep(for: .milliseconds(700))
+
+        // The exact stuck state: the PTY is already 74x39, the client sends 74x39.
+        try await session.resize(to: TerminalSize(cols: 74, rows: 39))
+
+        var seen = ""
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            seen = box.withLock { $0 }
+            if seen.contains("39 74") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        pump.cancel()
+        await session.detach(token)
+        await session.close()
+        #expect(seen.contains("39 74"), """
+            a mid-session resize to an unchanged size signalled nobody \
+            (saw \(seen.debugDescription)) — a program that missed one WINCH now stays \
+            wrong for the life of a session that no longer reattaches
             """)
     }
 }
