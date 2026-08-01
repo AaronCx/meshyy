@@ -392,6 +392,11 @@ final class LocalClient: @unchecked Sendable {
                     "attached_clients": info.attachedClients,
                     "created_at": Int(info.createdAt.timeIntervalSince1970),
                 ]
+                if let quiet = info.clientQuietFor {
+                    // Milliseconds: a consumer deciding whether an "attached"
+                    // client is really there needs better than second resolution.
+                    row["client_quiet_ms"] = Int(quiet * 1000)
+                }
                 if let last = info.lastOutputAt {
                     row["last_output_at"] = Int(last.timeIntervalSince1970)
                 }

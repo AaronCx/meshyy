@@ -43,6 +43,11 @@ public struct SessionInfo: Sendable, Equatable {
     /// "detached" a state no session could ever be in.
     public var attachedClients: Int
     public var createdAt: Date
+    /// Seconds since the most recently active client was last heard from, or nil
+    /// when nobody is attached. A client that has said nothing for longer than it
+    /// could plausibly go quiet — the client heartbeat is 1s — is a corpse the
+    /// transport has not reaped yet, not a live screen.
+    public var clientQuietFor: TimeInterval?
     /// When the PTY last produced output. Nil for a session that has said nothing.
     public var lastOutputAt: Date?
 }
@@ -96,7 +101,12 @@ public actor PTYSession {
     private var subscribers: [UUID: AsyncStream<SessionEvent>.Continuation] = [:]
     /// The subset of `subscribers` that are clients rather than observers — what
     /// `SessionInfo.attachedClients` reports.
-    private var clientTokens: Set<UUID> = []
+    /// Client subscriptions and when each was last heard from. A COUNT alone is
+    /// not enough to answer "is anyone actually there": a force-quit phone's QUIC
+    /// peer lingers on the daemon until the idle timeout, still counted, so a
+    /// session that is in truth abandoned reads as someone's live screen and is
+    /// never offered back. The timestamp is what tells the two apart.
+    private var clientTokens: [UUID: Date] = [:]
     private let createdAt = Date()
     private var lastOutputAt: Date?
 
@@ -409,7 +419,7 @@ public actor PTYSession {
             bufferingPolicy: .unbounded
         )
         subscribers[token] = continuation
-        if !observer { clientTokens.insert(token) }
+        if !observer { clientTokens[token] = Date() }
         // Tell a new subscriber the current state immediately, so it does not
         // have to wait for the next change to know whether to predict.
         continuation.yield(.termios(lastTermios))
@@ -421,9 +431,16 @@ public actor PTYSession {
         return (decision, stream, token)
     }
 
+    /// Records that a client was heard from. Every inbound frame counts —
+    /// including pings, which are the only traffic a watching client produces.
+    public func noteClientActivity(_ token: UUID) {
+        guard clientTokens[token] != nil else { return }
+        clientTokens[token] = Date()
+    }
+
     public func detach(_ token: UUID) {
         subscribers.removeValue(forKey: token)?.finish()
-        clientTokens.remove(token)
+        clientTokens.removeValue(forKey: token)
     }
 
     /// Forwards keystrokes to the child. Returns immediately, always.
@@ -525,6 +542,7 @@ public actor PTYSession {
             isAlive: exitStatus == nil,
             attachedClients: clientTokens.count,
             createdAt: createdAt,
+            clientQuietFor: clientTokens.values.map { Date().timeIntervalSince($0) }.min(),
             lastOutputAt: lastOutputAt
         )
     }
