@@ -768,3 +768,31 @@ never produced the liveness proof. Modelled on `QuietSessionSurvivalTests`, whic
 already had the idiom right.
 
 **Consulted.** Design doc §3.5 (never silently degrade). No mosh material.
+
+## 2026-08-01 — A controlling terminal for session children
+
+**Decision.** Spawn through a fixed `/bin/sh` trampoline that re-opens the slave
+after exec, so the child acquires the pty as its controlling terminal.
+
+**Source.** `/dev/tty` failed inside every session ("device not configured"),
+breaking sudo, ssh password prompts and `read -s`. The first attempt at this was
+parked with two regressions; both are now understood rather than worked around.
+
+**The measurement that mattered, and it corrected me.** The in-process test
+passes WITHOUT the trampoline — an ordinary process's spawn already confers a
+ctty — so my original verification (a shell-launched scratch daemon) proved
+nothing. The property breaks only under **launchd**, where the daemon has no
+session of its own (`SESS 0`). Verified with the identical binary under a
+throwaway LaunchAgent: absent → "device not configured", present → fine. The
+recipe is in docs/qa/ctty-trampoline-notes.md, because no unit test can cover it.
+
+**The regressions were one bug wearing two hats.** A child holding a ctty cannot
+finish exiting while the daemon keeps the slave open: it parks mid-exit with
+`p_stat == SRUN` and `waitpid` answering 0 forever, so exits were never observed
+and a missing executable never threw. `reap()` now releases the slave before
+waiting (after the final drain, so buffered output is still preserved — the whole
+reason the slave is held), `isChildAlive` recognises `P_WEXIT`, and a missing
+executable is caught by `access(X_OK)` before the spawn.
+
+**Consulted.** POSIX_SPAWN_SETSID, open(2) ctty acquisition rules, sys/proc.h
+`P_WEXIT`. No mosh material.
