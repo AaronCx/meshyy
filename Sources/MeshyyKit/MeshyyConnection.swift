@@ -294,7 +294,17 @@ public final class MeshyyConnection: @unchecked Sendable {
         stream.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed(let error):
-                self?.close(reason: "\(kind) stream failed: \(error)")
+                // FAIL, not close. `.closed` is for an end the CLIENT chose —
+                // reattaching, detaching, shutting down — and a session ignores it
+                // by design. A stream that died under us is the opposite: the app
+                // is left holding a transport that says "connected", swallows every
+                // byte written to it (the outbox drops the throw), and never
+                // reconnects, because the one event that would have driven recovery
+                // was filed as a deliberate close. That is the tab that looks fine
+                // and eats your typing — and dictation worst of all, since an
+                // utterance is one all-or-nothing burst where a lost keystroke
+                // would merely have looked like a typo.
+                self?.fail(reason: "\(kind) stream failed: \(error)")
             case .cancelled:
                 // Already on `queue` — see the note in `pump`.
                 self?.streams.removeValue(forKey: kind)
@@ -321,7 +331,9 @@ public final class MeshyyConnection: @unchecked Sendable {
                     self.decoders[kind] = decoder
                     for frame in frames { self.onFrame?(frame) }
                 } catch {
-                    self.close(reason: "protocol error on \(kind): \(error)")
+                    // Also a failure, not a choice: an undecodable stream is a dead
+                    // connection, and the client must be told so it can redial.
+                    self.fail(reason: "protocol error on \(kind): \(error)")
                     return
                 }
             }
