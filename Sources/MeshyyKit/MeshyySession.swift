@@ -119,6 +119,9 @@ public actor MeshyySession {
     private let pathWatcher = PathWatcher()
     private var heartbeat = HeartbeatMonitor()
     private var heartbeatTask: Task<Void, Never>?
+    /// True once this death has been announced to the consumer, so a dead path is
+    /// not re-reported every probe. Cleared by a pong and by a fresh attach.
+    private var announcedDeath = false
     /// False until the daemon proves it answers pings. See `startHeartbeat`.
     private var heartbeatConfirmed = false
 
@@ -353,6 +356,8 @@ public actor MeshyySession {
 
         case .pong(let nonce):
             heartbeat.received(nonce: nonce)
+            // The path answered, so a later silence is a NEW death worth announcing.
+            announcedDeath = false
             // The first answer is the proof that this daemon speaks ping at all. Until
             // one arrives the monitor cannot declare anything dead, or a client talking
             // to an older daemon would redial every few seconds forever — the classic
@@ -441,6 +446,7 @@ public actor MeshyySession {
         heartbeatTask?.cancel()
         heartbeat.reset()
         heartbeatConfirmed = false
+        announcedDeath = false
 
         let interval = heartbeat.interval
         heartbeatTask = Task { [weak self] in
@@ -474,10 +480,25 @@ public actor MeshyySession {
             let misses = heartbeat.missed
             heartbeat.reset()
             guard bootstrapProvider != nil else {
-                // No way to redial from in here, so the caller owns recovery. Keep
-                // probing rather than stopping: the probes are also what hold a healthy
-                // connection open, and a session that gives up on them guarantees the
-                // idle timeout it was trying to detect.
+                // No way to redial from in here, so the caller owns recovery — but the
+                // caller has to be TOLD, and this path used to return in silence. That
+                // is the same two-jobs-in-one-guard mistake the heartbeat itself made:
+                // "cannot redial" was treated as "nothing to report", so a consumer
+                // driving its own reconnect (a+Terminal does) was left holding a
+                // transport that still looked connected, swallowed every byte written
+                // to it, and never recovered. Detecting death and announcing it are
+                // one job; redialling is a different one.
+                //
+                // Announced once per death, not once per probe: a dead path stays
+                // dead, and a consumer does not need it repeated every second. The
+                // next pong clears the flag, so a later death is announced again.
+                if !announcedDeath {
+                    announcedDeath = true
+                    emit(.failed(reason: "heartbeat lost (\(misses) missed)"))
+                }
+                // Keep probing rather than stopping: the probes are also what hold a
+                // healthy connection open, and a session that gives up on them
+                // guarantees the idle timeout it was trying to detect.
                 return true
             }
             Task { await self.reconnect(because: .heartbeatLost(misses: misses)) }

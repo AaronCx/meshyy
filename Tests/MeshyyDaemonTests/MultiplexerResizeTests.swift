@@ -48,7 +48,7 @@ struct MuxSpec: CustomStringConvertible, Sendable {
     )
 }
 
-@Suite("Resize with screen and zellij", .serialized,
+@Suite("Resize with screen", .serialized,
        .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
 struct MultiplexerResizeTests {
 
@@ -110,8 +110,14 @@ struct MultiplexerResizeTests {
         return nil
     }
 
+    /// screen only, deliberately. zellij ignores keystrokes from a scripted pty —
+    /// verified with meshyy out of the picture entirely, so it is a property of
+    /// zellij and not something to work around here — which makes every
+    /// type-a-command probe unusable against it. zellij is covered instead by
+    /// `scripts/verify-zellij-resize.py`, which asks nothing of the pane and reads
+    /// its pty size from the process table.
     @Test("A pane inside the multiplexer tracks shrink and growth",
-          arguments: [MuxSpec.screen, MuxSpec.zellij])
+          arguments: [MuxSpec.screen])
     func paneTracksResize(mux: MuxSpec) async throws {
         // Quiet pass where the binary is absent (CI runners lack zellij); the dev
         // Mac has both and `make check` there is the gate that matters for this.

@@ -694,3 +694,77 @@ pre-tree-delivery code in exactly and only the job-control case.
 
 **Consulted.** POSIX job control and tty semantics (setpgid/tcsetpgrp/SIGWINCH);
 sysctl KERN_PROC on Darwin. No mosh material.
+
+## 2026-08-01 — Multiplexer matrix, and two bugs it surfaced
+
+**Decision.** (1) The local socket QUEUES on EAGAIN instead of spinning. (2)
+`childExited` takes a reentrancy flag set before its final drain. (3) The daemon
+exports `SHELL`.
+
+**Source.** Verifying the resize repair against every multiplexer the app
+supports. screen and tmux are covered by `MultiplexerResizeTests` /
+`TmuxResizeTests`; zellij ignores keystrokes from a scripted pty — verified with
+meshyy out of the picture entirely, so it is zellij's property and not something
+to work around — and is therefore covered by
+`scripts/verify-zellij-resize.py`, which asks the pane nothing and reads its pty
+size from the process table (60 -> 35 -> 60 rows across shrink and grow).
+
+Two findings came out of the harness rather than the code under test:
+
+*The daemon could go deaf.* A probe that slept instead of draining left a resize
+unapplied. Cause: `LocalClient.write` spun on EAGAIN inside the client's own
+queue, and that queue is where the client's INBOUND frames are read — so a client
+that stopped reading could never be heard again. The old comment ("costs this one
+client's queue and nothing else") was true and yet exactly wrong: that queue is
+also the read path. Verified red: the daemon held 80x24 through a resize to
+132x50 from a stalled reader.
+
+*A daemon-wide crash.* `drain -> childExited -> ingest -> drain` recursed until
+the stack died (SIGBUS in a full run). `childExited`'s own `exitStatus == nil`
+guard cannot close the cycle, because `exitStatus` is only assigned after the
+drain it guards. One exiting child would have taken every session with it.
+
+*`SHELL`.* zellij opens its panes with `$SHELL` and quietly fell back to bare
+`sh` without it — "meshyy gives me the wrong shell" while SSH, whose sshd sets
+it, looked fine.
+
+**Also parked, deliberately.** Session children have NO controlling terminal, so
+`/dev/tty` fails inside every session (sudo, ssh password prompts, `read -s`).
+A working fix exists on branch `ctty-trampoline` with two known regressions and a
+written-up next step (`docs/qa/ctty-trampoline-notes.md`); it is not merged
+because half a fix to the pty layer is worse than a documented gap.
+
+**Consulted.** POSIX EAGAIN/write semantics, Dispatch write sources, zellij's
+documented `$SHELL` use. No mosh material.
+
+## 2026-08-01 — A transport that dies must SAY so
+
+**Decision.** Two changes, one shape. `MeshyyConnection` reports `fail` rather
+than `close` when a stream dies or a stream's bytes stop decoding — `.closed` is
+for an end the CLIENT chose (reattach, detach, shutdown) and a session ignores it
+by design. And `MeshyySession.probeOnce` now EMITS `.failed` when it declares the
+path dead with no `bootstrapProvider` set, instead of returning in silence.
+
+**Source.** A user reported voice input dead under meshyy, healed by toggling to
+SSH and back. The mechanism: a+Terminal sets no provider (it drives its own
+reconnect), so the declare-dead branch took the "caller owns recovery" path and
+said nothing at all. The consumer was left holding a transport that still
+reported connected, swallowed every byte written to it (the outbox drops the
+throw), and never reconnected. Typing hid it — one lost keystroke reads as a
+typo — while a dictated utterance is one all-or-nothing burst and vanished
+whole.
+
+**This is the PR #20 mistake repeated one layer up.** That fix separated "cannot
+redial" from "stop probing"; this one separates "cannot redial" from "do not
+report". A guard that answers two questions at once keeps producing this bug —
+worth remembering the shape rather than just the instance.
+
+**Verified red.** `TransportDeathTests` brings a real session up (asserted live —
+the transcript shows the command running), stops the daemon's QUIC listener, and
+waits 20s: silence before, announced in ~4s after. The first two attempts at this
+test wedged and then reported nothing, both harness faults — a task-group race
+against the single-consumer `events` stream, and a byte-pipe child whose echo
+never produced the liveness proof. Modelled on `QuietSessionSurvivalTests`, which
+already had the idiom right.
+
+**Consulted.** Design doc §3.5 (never silently degrade). No mosh material.
