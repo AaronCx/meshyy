@@ -736,3 +736,35 @@ because half a fix to the pty layer is worse than a documented gap.
 
 **Consulted.** POSIX EAGAIN/write semantics, Dispatch write sources, zellij's
 documented `$SHELL` use. No mosh material.
+
+## 2026-08-01 — A transport that dies must SAY so
+
+**Decision.** Two changes, one shape. `MeshyyConnection` reports `fail` rather
+than `close` when a stream dies or a stream's bytes stop decoding — `.closed` is
+for an end the CLIENT chose (reattach, detach, shutdown) and a session ignores it
+by design. And `MeshyySession.probeOnce` now EMITS `.failed` when it declares the
+path dead with no `bootstrapProvider` set, instead of returning in silence.
+
+**Source.** A user reported voice input dead under meshyy, healed by toggling to
+SSH and back. The mechanism: a+Terminal sets no provider (it drives its own
+reconnect), so the declare-dead branch took the "caller owns recovery" path and
+said nothing at all. The consumer was left holding a transport that still
+reported connected, swallowed every byte written to it (the outbox drops the
+throw), and never reconnected. Typing hid it — one lost keystroke reads as a
+typo — while a dictated utterance is one all-or-nothing burst and vanished
+whole.
+
+**This is the PR #20 mistake repeated one layer up.** That fix separated "cannot
+redial" from "stop probing"; this one separates "cannot redial" from "do not
+report". A guard that answers two questions at once keeps producing this bug —
+worth remembering the shape rather than just the instance.
+
+**Verified red.** `TransportDeathTests` brings a real session up (asserted live —
+the transcript shows the command running), stops the daemon's QUIC listener, and
+waits 20s: silence before, announced in ~4s after. The first two attempts at this
+test wedged and then reported nothing, both harness faults — a task-group race
+against the single-consumer `events` stream, and a byte-pipe child whose echo
+never produced the liveness proof. Modelled on `QuietSessionSurvivalTests`, which
+already had the idiom right.
+
+**Consulted.** Design doc §3.5 (never silently degrade). No mosh material.
