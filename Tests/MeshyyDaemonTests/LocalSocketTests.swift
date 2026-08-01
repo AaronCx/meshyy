@@ -183,7 +183,9 @@ func withServer(
         config.shellArguments = ["-f", "-i"]
         config.bufferCapacity = bufferCapacity
         config.environment = [
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            // Homebrew included: zellij lives there, and its client re-spawns
+            // helpers by name.
+            "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "TERM": "xterm-256color",
             "HOME": NSHomeDirectory(),
         ]
@@ -626,6 +628,47 @@ struct LocalSocketTests {
 
             let session = await store.session(named: "paste")
             #expect(await session?.pendingWriteCount == 0, "the write queue did not drain")
+        }
+    }
+
+    /// A client that stops READING must never go mute.
+    ///
+    /// The daemon used to spin on EAGAIN inside the client's own queue while
+    /// writing — and that queue is also where the client's inbound frames are read.
+    /// So a client that stopped draining (a phone mid-redraw, a terminal whose
+    /// buffer filled) had its next RESIZE sit unread in the socket forever, and the
+    /// far side kept drawing at the old size with no way to recover: the black
+    /// space, arriving by a second route. A slow reader must fall behind, never
+    /// mute.
+    @Test("A control frame from a client that stopped reading is still processed")
+    func inputSurvivesAStalledReader() async throws {
+        try await withServer(child: .shell) { path, store in
+            let client = try TestClient(socketPath: path)
+            defer { client.close() }
+            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "stalled"))))
+            #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+            // Flood the client with far more than any socket buffer holds, and read
+            // NONE of it from here on.
+            client.send(.pty(0, Array("seq 1 400000\n".utf8)))
+            try await Task.sleep(for: .seconds(3))
+
+            // The size the daemon holds is the assertion: it can only change if the
+            // daemon actually read this frame off a socket it was busy writing to.
+            client.send(.control(.resize(cols: 132, rows: 50)))
+
+            var applied: TerminalSize?
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                applied = await store.session(named: "stalled")?.info.size
+                if applied == TerminalSize(cols: 132, rows: 50) { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            #expect(applied == TerminalSize(cols: 132, rows: 50), """
+                the daemon never processed a resize from a client that had stopped \
+                reading (size is \(String(describing: applied))) — one stalled reader \
+                and the session can never be resized again
+                """)
         }
     }
 
