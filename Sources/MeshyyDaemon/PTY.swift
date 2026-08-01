@@ -206,10 +206,24 @@ public final class PTY {
         )
 
         var pid: pid_t = 0
-        let argv = [executable] + arguments
+        // A TRAMPOLINE, because the file-action open does not make the pty the
+        // child's CONTROLLING terminal on Darwin — measured: children ran with no
+        // ctty at all, so `/dev/tty` answered "device not configured" inside every
+        // session, which kills anything that opens it (zellij's input thread, sudo,
+        // `read -s`, ssh password prompts), and the tty's job-control bookkeeping
+        // was never trustworthy (the black-space saga). Controlling-terminal
+        // acquisition happens in open(2), for a session leader, from ordinary
+        // process context — so the child re-opens its own slave AFTER exec, when it
+        // is unambiguously a session leader, and then execs the real program over
+        // itself. No extra process at steady state.
+        //
+        // §8 compliance: the script is a FIXED string; the slave path, program and
+        // its arguments all travel as positional argv, never interpolated.
+        let trampoline = #"exec <"$0" >"$0" 2>"$0" || exit 125; prog="$1"; shift; exec "$prog" "$@""#
+        let argv = ["/bin/sh", "-c", trampoline, slavePath, executable] + arguments
         let status = withCStringArray(argv) { argvPointers in
             withCStringArray(environment.map { "\($0.key)=\($0.value)" }) { envPointers in
-                posix_spawn(&pid, executable, &fileActions, &attributes, argvPointers, envPointers)
+                posix_spawn(&pid, "/bin/sh", &fileActions, &attributes, argvPointers, envPointers)
             }
         }
         guard status == 0 else {
