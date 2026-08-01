@@ -796,3 +796,31 @@ executable is caught by `access(X_OK)` before the spawn.
 
 **Consulted.** POSIX_SPAWN_SETSID, open(2) ctty acquisition rules, sys/proc.h
 `P_WEXIT`. No mosh material.
+
+## 2026-08-01 — A count cannot tell a live client from a corpse
+
+**Decision.** `SessionInfo` gains `clientQuietFor`, and `meshyyd list --json` a
+`client_quiet_ms` field: how long the daemon has gone without hearing from the
+most recently active client. Every inbound frame counts as proof of life,
+including pings — the only traffic a merely-watching client produces.
+
+**Source.** Reported as "the 'a session is still running' prompt doesn't appear
+for my FIRST session, but subsequent ones get it." A force-quit phone's QUIC peer
+survives on the daemon until `QUICServer`'s 30s idle timeout, still counted in
+`attachedClients` — so on a quick relaunch the user's own abandoned session reads
+as somebody else's live screen, is filtered out of the picker, and a new session
+opens silently instead. Relaunch after the timeout and the next session behaves,
+which is precisely the "first no, rest yes" shape.
+
+The earlier guess — that a dead LOCAL SOCKET client lingers — was wrong and was
+measured wrong before it was believed: killing a unix-socket client drops the
+count instantly. Only the QUIC path has the window, because only it waits on an
+idle timeout.
+
+**Why not just shorten the idle timeout.** 30s exists so a cellular stall is not
+a disconnect. Reporting quiet time instead lets a consumer decide with better
+evidence than the daemon can safely act on alone, and it costs nothing when the
+answer is boring.
+
+**Consulted.** Design doc §3.1 (never guess what the daemon can report). No mosh
+material.

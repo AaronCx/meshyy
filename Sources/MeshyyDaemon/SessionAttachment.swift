@@ -121,6 +121,13 @@ public final class SessionAttachment: @unchecked Sendable {
     // MARK: - Inbound
 
     public func receive(_ envelope: FrameEnvelope) {
+        // Any frame at all is proof this client still exists — including a ping,
+        // which is the only traffic a client that is merely WATCHING produces. A
+        // transport does not learn of a force-quit peer until its idle timeout,
+        // so this timestamp is the daemon's earliest honest evidence.
+        if let session = currentSession, let token = state.withLock({ $0.subscription }) {
+            Task { await session.noteClientActivity(token) }
+        }
         switch envelope.kind {
         case .control:
             guard let frame = try? ControlFrame.decode(envelope.payload) else {
