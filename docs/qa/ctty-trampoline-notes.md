@@ -1,51 +1,73 @@
-# The controlling-terminal gap (unfinished — do not ship as-is)
+# The controlling terminal, and how to re-verify it
 
-## What is wrong today
+## The property
 
-A session's child has **no controlling terminal**. Measured on a live daemon:
+A session's child must own its pty as a **controlling terminal**, or `/dev/tty`
+fails inside every meshyy session — which breaks `sudo`, ssh password prompts,
+`read -s`, and vim's shell escapes. Over plain SSH none of this appears, because
+sshd does the ctty dance itself, so it reads as "meshyy is broken".
 
-    $ echo probe > /dev/tty
-    zsh: device not configured: /dev/tty
-    $ ps -o pid,pgid,tpgid,stat,tty -p <child>
-      PID  PGID TPGID STAT TTY
-    66034 66034     0 Ss   ??        <- no tty, TPGID 0
+## Why the obvious test is not enough
 
-The file action `posix_spawn_file_actions_addopen(&fileActions, 0, slavePath, …)`
-does NOT confer a controlling terminal on Darwin, despite the header comment in
-`PTY.init` claiming it does. Anything that opens `/dev/tty` therefore fails
-inside every meshyy session: `sudo`, an ssh password prompt, `read -s`, vim's
-shell escapes, and zellij's input thread. It also means the pty's foreground-group
-bookkeeping names nobody, which is the second reason the resize saga was so hard
-to see (fixed independently by tree-wide signal delivery).
+`posix_spawn_file_actions_addopen(&fileActions, 0, slavePath, …)` on a
+`POSIX_SPAWN_SETSID` child DOES confer a ctty — **in an ordinary process**. An
+in-process `PTY` therefore passes `ControllingTerminalTests` whether or not the
+trampoline is present, so those tests are an ordinary regression guard, not the
+proof.
 
-Over plain SSH none of this appears — sshd does the ctty dance itself.
+The property broke only under **launchd**, where the daemon's own process has no
+session (`ps -o sess` reports `0`). That is the environment meshyyd actually runs
+in, and it is the one no unit test reproduces.
 
-## The approach on this branch, and why it is not merged
+## How to re-verify (do this before ever removing the trampoline)
+
+    # Same binary, thrown-away LaunchAgent, real launchd context.
+    mkdir -p /tmp/mshy-ld && chmod 700 /tmp/mshy-ld
+    cat > /tmp/mshy-ld/probe.plist <<'PLIST'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <plist version="1.0"><dict>
+      <key>Label</key><string>com.aaroncx.meshyyd-probe</string>
+      <key>ProgramArguments</key><array>
+        <string>REPO/.build/debug/meshyyd</string><string>serve</string>
+        <string>--socket</string><string>/tmp/mshy-ld/d.sock</string>
+      </array>
+      <key>RunAtLoad</key><true/>
+    </dict></plist>
+    PLIST
+    launchctl bootstrap gui/$(id -u) /tmp/mshy-ld/probe.plist
+    # then, in a session on that daemon:
+    #   echo TTY-$( (echo p > /dev/tty) 2>&1 && echo OK || echo FAIL)-END
+    launchctl bootout gui/$(id -u)/com.aaroncx.meshyyd-probe
+
+Measured 2026-08-01, identical binary both ways:
+
+| context | trampoline | `/dev/tty` |
+|---|---|---|
+| in-process test | absent | OK |
+| shell-launched daemon | absent | OK |
+| **launchd daemon** | **absent** | **FAIL — device not configured** |
+| **launchd daemon** | **present** | **OK** |
+
+## The trampoline, and the one thing it costs
 
 `/bin/sh -c 'exec <"$0" >"$0" 2>"$0" || exit 125; prog="$1"; shift; exec "$prog" "$@"'`
-with the slave path and the real program as positional argv (no interpolation, so
-§8 still holds). The child re-opens its own slave AFTER exec, when it is
-unambiguously a session leader, which is when Darwin grants the ctty. Verified:
-`/dev/tty` works, `ps` shows `ttysNNN` and `Ss+`, TPGID names the foreground job.
+with the slave path and the real program as positional argv — a fixed script, no
+interpolation, so design doc §8 still holds. The child re-opens its own slave
+AFTER exec, when it is unambiguously a session leader.
 
-**Two regressions it introduces, both real and both unfixed here:**
+**The cost, and it is not obvious.** A child that holds a ctty cannot finish
+exiting while the daemon keeps the slave open — it parks midway (`ps` shows `E`
+and a parenthesised name) with `p_stat` still `SRUN`, so `waitpid` answers 0
+forever and every dead session would report itself alive. Two consequences, both
+handled:
 
-1. `PTYTests.spawningNonexistentExecutableThrows` — `posix_spawn` now always
-   succeeds because it spawns `/bin/sh`; a missing program becomes a runtime
-   `exit 125` instead of a thrown error, so the daemon would create a session
-   around a dead child rather than reporting the failure. Needs an explicit
-   `access(executable, X_OK)` check before spawning.
-2. `PTYTests.childExitIsObservable` — a short-lived child (`/bin/echo done`) is no
-   longer seen to exit within 5s. Cause not yet established; suspect the extra
-   `exec` layer changes what `waitpid`/the process source observe. **Diagnose
-   before trusting anything else on this branch.**
+- `PTY.reap()` releases the slave before waiting. Order matters: callers reach it
+  after the final drain, so a short-lived child's last output is still preserved
+  (the reason the slave is held at all — see `slaveFD`).
+- `PTY.isChildAlive` checks `P_WEXIT` as well as `SZOMB`, because neither
+  `waitpid` nor `p_stat` distinguishes this state from a running child. It is a
+  read with no side effects: it must never release the slave itself, since the
+  output that slave protects may not have been read yet.
 
-Both suites pass with the trampoline removed, which is how `main` ships today.
-
-## Next steps
-
-- Add the executable-existence check, then re-run `PTYTests` in full.
-- Instrument the child-exit path (does the process source fire? does `reap()`
-  return?) rather than guessing.
-- Add a regression test asserting `/dev/tty` is usable inside a session — that is
-  the property this whole branch exists for, and nothing tests it today.
+A missing executable is also checked with `access(X_OK)` before spawning, because
+the trampoline means `posix_spawn` now succeeds against `/bin/sh` regardless.

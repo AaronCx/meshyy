@@ -66,6 +66,9 @@ public final class PTY {
     private let slaveFD: Int32
 
     private var closed = false
+    /// True once the daemon's own slave descriptor has been released. See
+    /// `releaseSlave` — held for the session's life, dropped at child exit.
+    private var slaveReleased = false
     /// True once `waitpid` has reaped the child.
     ///
     /// **Load-bearing.** Once a child is reaped its pid is free for the OS to
@@ -94,6 +97,16 @@ public final class PTY {
         size: TerminalSize = .default,
         rawMode: Bool = false
     ) throws {
+        // Checked HERE, before anything is opened, because the trampoline below
+        // spawns `/bin/sh` rather than `executable` — so `posix_spawn` succeeds
+        // whether or not the program exists, and a missing one would become a
+        // runtime `exit 125` inside a session the daemon had already built around
+        // it. A caller asking for a program that is not there deserves an error,
+        // not a session wrapped around a corpse.
+        guard access(executable, X_OK) == 0 else {
+            throw PTYError.spawnFailed(errno: errno == 0 ? ENOENT : errno)
+        }
+
         // O_NOCTTY: the *daemon* must not acquire this as its controlling
         // terminal. Only the child should.
         let master = posix_openpt(O_RDWR | O_NOCTTY)
@@ -429,9 +442,51 @@ public final class PTY {
     ///
     /// This, not end of file on the master, is how session exit is detected —
     /// see the note on `slaveFD`.
+    ///
+    /// `waitpid` alone is NOT enough here, and the reason is subtle: a child that
+    /// holds a controlling terminal cannot finish exiting while the daemon keeps
+    /// the slave open, so it parks as a zombie (`ps` shows `E`, "exiting") and
+    /// `waitpid(WNOHANG)` answers 0 — "still running" — forever. Measured: a
+    /// `/bin/echo` that had printed and gone still reported alive after 3s, and
+    /// releasing the slave reaped it instantly. So a zombie is checked for
+    /// explicitly, via the process table, which is a read with no side effects —
+    /// this property must never release the slave itself, because the buffered
+    /// output that slave is protecting has not necessarily been read yet.
     public var isChildAlive: Bool {
         var status: Int32 = 0
-        return waitpid(childPID, &status, WNOHANG) == 0
+        guard waitpid(childPID, &status, WNOHANG) == 0 else { return false }
+        return !isChildGone
+    }
+
+    /// True once the child has exited, or has begun exiting and cannot return.
+    ///
+    /// A zombie is the ordinary case. The second half is the ctty case measured
+    /// here: a session leader holding a controlling terminal the daemon still has
+    /// open parks midway through exit — `ps` shows `E` and a parenthesised name,
+    /// while `p_stat` is still SRUN and `waitpid` still answers 0. macOS flags
+    /// that state as `P_WEXIT` ("working on exiting"), which is the only signal
+    /// that distinguishes it from a live child.
+    private var isChildGone: Bool {
+        let wexit: Int32 = 0x0000_2000   // P_WEXIT, sys/proc.h
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, childPID]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&name, 4, &info, &size, nil, 0) == 0, size > 0 else { return false }
+        return info.kp_proc.p_stat == SZOMB || (info.kp_proc.p_flag & wexit) != 0
+    }
+
+    /// Drops the daemon's slave descriptor.
+    ///
+    /// Idempotent, and deliberately NOT called before the child's last output has
+    /// been read: releasing it is what lets an exiting session leader finish, but
+    /// on Darwin the last close of a slave also makes reads on the master return
+    /// EIO and DISCARD whatever was still buffered (see `slaveFD`). Both
+    /// properties hold only in this order — drain, release, reap — which is what
+    /// `reap()` and `PTYSession.childExited` do.
+    private func releaseSlave() {
+        guard !slaveReleased else { return }
+        slaveReleased = true
+        close(slaveFD)
     }
 
     /// The child's exit status once it has exited, else nil.
@@ -443,6 +498,10 @@ public final class PTY {
     /// again — see `reaped`.
     public func reap() -> Int32? {
         guard !reaped else { return nil }
+        // The child cannot finish exiting while the daemon holds its controlling
+        // terminal's slave open, so this is where that ends. Callers reach here
+        // AFTER the final drain, so nothing buffered is lost.
+        releaseSlave()
         var status: Int32 = 0
         guard waitpid(childPID, &status, WNOHANG) == childPID else { return nil }
         reaped = true
@@ -483,11 +542,17 @@ public final class PTY {
             }
 
             // Reap so the child does not sit as a zombie for the daemon's lifetime.
+            // The slave goes FIRST: a child holding this as its controlling
+            // terminal cannot finish exiting while the daemon keeps it open, so
+            // reaping before releasing would leave exactly the zombie this is
+            // trying to avoid. Teardown, unlike `reap()`, has no output left to
+            // protect — the session is over.
+            releaseSlave()
             var status: Int32 = 0
             if waitpid(childPID, &status, WNOHANG) == childPID { reaped = true }
         }
 
-        close(slaveFD)
+        releaseSlave()
         close(masterFD)
     }
 }
