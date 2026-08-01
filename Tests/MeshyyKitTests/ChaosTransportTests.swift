@@ -405,9 +405,16 @@ extension MeshyyKitSuite {
                 }
                 #expect(delivered.withLock { $0 }.contains(before), "no echo before the black hole")
 
-                // Go deaf. Long enough for the heartbeat (1s x 3) to notice, and with
-                // no error, no close and no path change to help it.
-                relay.blackHole(.both, for: .seconds(4))
+                // Go deaf, with no error, no close and no path change to help it.
+                //
+                // TEN seconds, not four. Detection takes 3-4s (heartbeat 1s x 3
+                // misses), so a 4s outage left no margin: on a loaded CI runner the
+                // heartbeat task is scheduled late, the path comes back before the
+                // third probe is missed, and the session correctly never declares
+                // anything dead — a red test reporting a mechanism that works.
+                // Failed exactly that way on CI while passing locally in 4.7s. The
+                // assertion is untouched; only the outage is long enough to be one.
+                relay.blackHole(.both, for: .seconds(10))
 
                 // The recovery must happen with NOTHING further from the user.
                 deadline = Date().addingTimeInterval(45)
