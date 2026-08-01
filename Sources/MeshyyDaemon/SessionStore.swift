@@ -149,6 +149,11 @@ public struct DaemonConfig: Sendable {
             environment["USER"] = String(cString: name)
             environment["LOGNAME"] = String(cString: name)
         }
+        // SHELL matters to programs that spawn shells of their own: zellij opens
+        // its panes with $SHELL and quietly fell back to bare `sh` without it —
+        // "meshyy gives me the wrong shell inside zellij" while SSH (whose sshd
+        // sets SHELL) looked fine. Same source of truth as `defaultShell`.
+        environment["SHELL"] = defaultShell
         return environment
     }
 }

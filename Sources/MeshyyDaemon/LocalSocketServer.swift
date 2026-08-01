@@ -253,6 +253,11 @@ final class LocalClient: @unchecked Sendable {
     private var decoder = FrameDecoder()
     private var attachment: SessionAttachment?
     private var closed = false
+    /// Bytes the socket has not taken yet, drained by `writeSource`. Unbounded on
+    /// purpose: this is one local client's backlog, and dropping frames here would
+    /// break the §6.4 byte-exactness the whole resume protocol rests on.
+    private var pendingWrite = [UInt8]()
+    private var writeSource: DispatchSourceWrite?
 
     init(
         fd: Int32,
@@ -481,26 +486,53 @@ final class LocalClient: @unchecked Sendable {
 
     /// Writes a frame, looping until the whole thing is out.
     ///
-    /// Retrying on EAGAIN is acceptable because the peer is a local process
-    /// reading as fast as it can; a slow local reader costs this one client's
-    /// queue and nothing else. EPIPE lands in the final branch and closes.
+    /// QUEUES on EAGAIN rather than spinning. Spinning looked harmless — "a slow
+    /// local reader costs this one client's queue and nothing else" — but that
+    /// queue is also where the client's INBOUND frames are read, so a client that
+    /// stopped reading blocked the daemon from ever processing its input. Measured:
+    /// a client that let its terminal buffer fill during a multiplexer's redraw had
+    /// its next RESIZE sit unprocessed in the socket, and the far side kept drawing
+    /// at the old height with no way to recover — the black space, arriving by a
+    /// second route. A slow reader must fall behind, never mute.
     private func write(_ envelope: FrameEnvelope) {
         let bytes = envelope.encoded
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
-            var offset = 0
-            while offset < bytes.count {
-                let written = bytes[offset...].withUnsafeBytes {
-                    Darwin.write(self.fd, $0.baseAddress, $0.count)
-                }
-                if written > 0 { offset += written; continue }
-                if errno == EAGAIN || errno == EWOULDBLOCK { usleep(1_000); continue }
-                if errno == EINTR { continue }
-                // EPIPE: the peer hung up mid-write. Routine, not exceptional.
-                self.closeLocked()
+            self.pendingWrite += bytes
+            self.flushPending()
+        }
+    }
+
+    /// Writes what the socket will take right now; parks the rest on a write
+    /// source. Never blocks the queue, so reads keep flowing either way.
+    private func flushPending() {
+        while !pendingWrite.isEmpty {
+            let written = pendingWrite.withUnsafeBytes {
+                Darwin.write(fd, $0.baseAddress, $0.count)
+            }
+            if written > 0 {
+                pendingWrite.removeFirst(written)
+                continue
+            }
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                armWriteSource()
                 return
             }
+            // EPIPE: the peer hung up mid-write. Routine, not exceptional.
+            closeLocked()
+            return
         }
+        writeSource?.cancel()
+        writeSource = nil
+    }
+
+    private func armWriteSource() {
+        guard writeSource == nil else { return }
+        let source = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.flushPending() }
+        source.resume()
+        writeSource = source
     }
 
     /// Named `closeConnection` rather than `close` so it cannot be confused with
@@ -514,6 +546,8 @@ final class LocalClient: @unchecked Sendable {
         closed = true
         readSource?.cancel()
         readSource = nil
+        writeSource?.cancel()
+        writeSource = nil
         let attachment = self.attachment
         self.attachment = nil
         // finish() calls back into closeTransport, which re-enters closeLocked —

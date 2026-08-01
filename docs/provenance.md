@@ -694,3 +694,45 @@ pre-tree-delivery code in exactly and only the job-control case.
 
 **Consulted.** POSIX job control and tty semantics (setpgid/tcsetpgrp/SIGWINCH);
 sysctl KERN_PROC on Darwin. No mosh material.
+
+## 2026-08-01 — Multiplexer matrix, and two bugs it surfaced
+
+**Decision.** (1) The local socket QUEUES on EAGAIN instead of spinning. (2)
+`childExited` takes a reentrancy flag set before its final drain. (3) The daemon
+exports `SHELL`.
+
+**Source.** Verifying the resize repair against every multiplexer the app
+supports. screen and tmux are covered by `MultiplexerResizeTests` /
+`TmuxResizeTests`; zellij ignores keystrokes from a scripted pty — verified with
+meshyy out of the picture entirely, so it is zellij's property and not something
+to work around — and is therefore covered by
+`scripts/verify-zellij-resize.py`, which asks the pane nothing and reads its pty
+size from the process table (60 -> 35 -> 60 rows across shrink and grow).
+
+Two findings came out of the harness rather than the code under test:
+
+*The daemon could go deaf.* A probe that slept instead of draining left a resize
+unapplied. Cause: `LocalClient.write` spun on EAGAIN inside the client's own
+queue, and that queue is where the client's INBOUND frames are read — so a client
+that stopped reading could never be heard again. The old comment ("costs this one
+client's queue and nothing else") was true and yet exactly wrong: that queue is
+also the read path. Verified red: the daemon held 80x24 through a resize to
+132x50 from a stalled reader.
+
+*A daemon-wide crash.* `drain -> childExited -> ingest -> drain` recursed until
+the stack died (SIGBUS in a full run). `childExited`'s own `exitStatus == nil`
+guard cannot close the cycle, because `exitStatus` is only assigned after the
+drain it guards. One exiting child would have taken every session with it.
+
+*`SHELL`.* zellij opens its panes with `$SHELL` and quietly fell back to bare
+`sh` without it — "meshyy gives me the wrong shell" while SSH, whose sshd sets
+it, looked fine.
+
+**Also parked, deliberately.** Session children have NO controlling terminal, so
+`/dev/tty` fails inside every session (sudo, ssh password prompts, `read -s`).
+A working fix exists on branch `ctty-trampoline` with two known regressions and a
+written-up next step (`docs/qa/ctty-trampoline-notes.md`); it is not merged
+because half a fix to the pty layer is worse than a documented gap.
+
+**Consulted.** POSIX EAGAIN/write semantics, Dispatch write sources, zellij's
+documented `$SHELL` use. No mosh material.

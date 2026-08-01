@@ -63,6 +63,8 @@ public actor PTYSession {
     private var lastTermios: TermiosState
     private var lastAltScreen = false
     private var exitStatus: Int32?
+    /// Reentrancy guard for `childExited` — see the note there.
+    private var exiting = false
 
     /// Derives agent status and quick-action availability from the output stream.
     /// Never inspects commands, and never names an agent itself — identity is data
@@ -253,7 +255,14 @@ public actor PTYSession {
     /// fires, and reporting the exit before reading it would lose the last thing
     /// the session ever said.
     private func childExited() {
-        guard exitStatus == nil else { return }
+        // `exitStatus` is set below, AFTER the final drain — so it cannot guard this
+        // path against itself: the drain ingests, the ingest sees EOF with
+        // `exitStatus` still nil, and calls back in here. That recursion ran until
+        // the stack died (SIGBUS, `drain → childExited → ingest → drain …`), taking
+        // the whole daemon with it — every session, not just the exiting one. A
+        // separate flag, set before the drain, is what actually closes the cycle.
+        guard !exiting, exitStatus == nil else { return }
+        exiting = true
         drain()
 
         let status = pty.reap() ?? 0
