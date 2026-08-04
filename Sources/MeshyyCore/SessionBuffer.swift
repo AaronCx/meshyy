@@ -27,7 +27,23 @@ public enum ResumeDecision: Sendable, Equatable {
     /// Neither the offset nor an anchor survives. The client must clear and ask
     /// the multiplexer to repaint (design doc §6.3). Costs ~4 ms per
     /// docs/benchmarks.md — not a path worth engineering around.
-    case mustRedraw(earliestAvailable: UInt64, skipped: UInt64)
+    ///
+    /// `bytes` is the whole surviving window, exactly what a FRESH attach on the
+    /// same buffer would get. It used to be empty, and the two failures that
+    /// caused were both silent:
+    ///
+    ///  * A client that fell out of the ring got NOTHING, forever. Measured: a
+    ///    fresh attach on an unchanging wrapped ring delivered 262144 bytes,
+    ///    while a resume one byte too old delivered 0 — and since the client's
+    ///    offset then stayed a full ring behind, its next attach was too old
+    ///    again. A ratchet: attach after attach, never a byte, never a screen.
+    ///  * `replayBase` announced `earliestAvailable` while replaying nothing, so
+    ///    the client's offset ended up exactly one ring capacity stale and the
+    ///    next replay overlapped bytes it had already drawn — duplication, which
+    ///    §6.4 exists to make impossible.
+    ///
+    /// Replaying the window fixes both: the base is where the bytes really start.
+    case mustRedraw(earliestAvailable: UInt64, bytes: [UInt8], skipped: UInt64)
 
     /// No prior offset: the client has never seen this session.
     ///
@@ -49,7 +65,8 @@ public enum ResumeDecision: Sendable, Equatable {
         case .replay(_, let bytes): bytes
         case .replayFromAnchor(_, let bytes, _): bytes
         case .fresh(_, let bytes): bytes
-        case .mustRedraw, .impossible: []
+        case .mustRedraw(_, let bytes, _): bytes
+        case .impossible: []
         }
     }
 
@@ -60,9 +77,9 @@ public enum ResumeDecision: Sendable, Equatable {
         case .replay(let from, _): from
         case .replayFromAnchor(let anchor, _, _): anchor
         case .fresh(let from, _): from
-        // Nothing is replayed, so the client restarts from the oldest byte the
-        // daemon can still vouch for.
-        case .mustRedraw(let earliest, _): earliest
+        // Where the replayed window actually begins — which is the oldest byte
+        // the daemon can still vouch for.
+        case .mustRedraw(let earliest, _, _): earliest
         case .impossible(let latest): latest
         }
     }
@@ -132,9 +149,14 @@ public struct SessionBuffer: Sendable {
                     skipped: anchor > offset ? anchor - offset : 0
                 )
             }
+            // The whole surviving window, exactly as `freshAttach` would send it.
+            // Announcing a base while sending nothing is what left a fallen-behind
+            // client blank forever and its offset a ring capacity stale.
+            let window = ring.window
             return .mustRedraw(
-                earliestAvailable: earliest,
-                skipped: earliest > offset ? earliest - offset : 0
+                earliestAvailable: window.from,
+                bytes: (try? ring.replay(from: window.from)) ?? [],
+                skipped: window.from > offset ? window.from - offset : 0
             )
         } catch {
             // RingBuffer.replay throws only the two cases above. Anything else

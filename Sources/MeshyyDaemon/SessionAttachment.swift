@@ -306,7 +306,7 @@ public final class SessionAttachment: @unchecked Sendable {
             break
         case .replayFromAnchor(let anchor, _, _):
             send(.control(.resumeTooOld(ptyID: 0, earliestOffset: anchor)))
-        case .mustRedraw(let earliest, _):
+        case .mustRedraw(let earliest, _, _):
             send(.control(.resumeTooOld(ptyID: 0, earliestOffset: earliest)))
         case .impossible(let latest):
             send(.control(.error(

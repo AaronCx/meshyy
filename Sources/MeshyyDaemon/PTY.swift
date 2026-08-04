@@ -463,9 +463,26 @@ public final class PTY {
     /// output that slave is protecting has not necessarily been read yet.
     public var isChildAlive: Bool {
         var status: Int32 = 0
-        guard waitpid(childPID, &status, WNOHANG) == 0 else { return false }
+        let waited = waitpid(childPID, &status, WNOHANG)
+        guard waited == 0 else {
+            // waitpid REAPED the child just now. Recording that is not bookkeeping
+            // pedantry: once reaped the pid is free for the OS to reuse, and
+            // `terminate()`'s `!reaped` branch signals the process GROUP — so
+            // leaving the flag false lets a later teardown fire SIGHUP and SIGKILL
+            // at whatever now owns that pid. The same hazard `reaped` was
+            // introduced for, re-armed by a property that looked read-only.
+            if waited == childPID {
+                reaped = true
+                exitStatusIfReaped = status
+            }
+            return false
+        }
         return !isChildGone
     }
+
+    /// The status `isChildAlive` collected, if it was the one to reap. Handed to
+    /// `reap()` so an exit observed by a poll still carries its status.
+    private var exitStatusIfReaped: Int32?
 
     /// True once the child has exited, or has begun exiting and cannot return.
     ///
@@ -506,6 +523,10 @@ public final class PTY {
     /// Records the reap, because from this point the pid must never be signalled
     /// again — see `reaped`.
     public func reap() -> Int32? {
+        if let collected = exitStatusIfReaped {
+            exitStatusIfReaped = nil
+            return collected
+        }
         guard !reaped else { return nil }
         // The child cannot finish exiting while the daemon holds its controlling
         // terminal's slave open, so this is where that ends. Callers reach here
@@ -534,31 +555,78 @@ public final class PTY {
         // unrelated process group. Skipping the signal is safe: a reaped child is
         // already gone, and anything it spawned was orphaned when it died.
         if !reaped {
-            kill(-childPID, SIGHUP)
+            // The slave goes FIRST, before the signal. A child holding it as its
+            // controlling terminal cannot finish exiting while the daemon keeps it
+            // open — so with the old ordering the grace loop below watched a child
+            // that was structurally unable to leave, always ran its full 250 ms,
+            // and then reaped nothing. Teardown has no buffered output left to
+            // protect; the session is over.
+            releaseSlave()
+            // EVERY process group in the session, not just the shell's.
+            //
+            // The controlling terminal this daemon now gives its children turns on
+            // job control, and a job-control shell puts each foreground job in its
+            // OWN process group — so `kill(-childPID, …)` reaches the shell and
+            // misses the very thing the user was running. That job keeps the slave
+            // open, the shell can then never finish exiting, and `waitpid` answers
+            // 0 forever: measured, 12 of 12 sessions with a foreground job left a
+            // permanent zombie, while idle sessions closed cleanly.
+            //
+            // The tree is captured BEFORE any signal, because it disappears as the
+            // processes die. Same enumeration the resize path uses.
+            let groups = sessionProcessGroups()
+            for group in groups { kill(-group, SIGHUP) }
 
             // SIGHUP is a request. A process is entitled to ignore it, and some do —
             // so escalate rather than assume, or `close(session)` becomes a polite
             // suggestion that leaks processes.
+            // Watch the CHILD, not its process group. `kill(-pid, 0)` on a group
+            // whose leader is a zombie answers EPERM rather than ESRCH — measured —
+            // so the old test could never observe the exit and every kill paid the
+            // full grace period with the actor blocked.
             let deadline = Date().addingTimeInterval(gracePeriod.timeInterval)
+            var status: Int32 = 0
             while Date() < deadline {
-                if kill(-childPID, 0) != 0 && errno == ESRCH { break }
+                if waitpid(childPID, &status, WNOHANG) == childPID {
+                    reaped = true
+                    break
+                }
                 usleep(10_000)
             }
-            // Re-check `reaped`: the process source may have reaped concurrently
-            // while this loop was sleeping.
-            if !reaped, kill(-childPID, 0) == 0 {
-                kill(-childPID, SIGKILL)
+            // UNCONDITIONAL. This used to be guarded by `kill(-childPID, 0) == 0`,
+            // which is never true exactly when it matters: a process group whose
+            // leader is mid-exit answers EPERM, not 0 — measured — so the guard
+            // read "the group is gone, nothing to kill" about a group that was
+            // very much still there, the SIGKILL never fired, and the shell later
+            // exited into a zombie nobody would ever reap (12 of 12 sessions with
+            // a foreground job leaked one).
+            //
+            // Sending it unconditionally is safe: the pid cannot have been reused,
+            // because `reaped` is false and nothing has waited for it. Signalling
+            // an already-dead group is a no-op.
+            if !reaped {
+                for group in groups { kill(-group, SIGKILL) }
             }
 
-            // Reap so the child does not sit as a zombie for the daemon's lifetime.
-            // The slave goes FIRST: a child holding this as its controlling
-            // terminal cannot finish exiting while the daemon keeps it open, so
-            // reaping before releasing would leave exactly the zombie this is
-            // trying to avoid. Teardown, unlike `reap()`, has no output left to
-            // protect — the session is over.
-            releaseSlave()
-            var status: Int32 = 0
-            if waitpid(childPID, &status, WNOHANG) == childPID { reaped = true }
+            // Keep waiting after the SIGKILL rather than polling once. A single
+            // non-blocking poll raced the exit and lost 54 times out of 54 when the
+            // session had a foreground job, leaving a zombie nothing would ever
+            // reap: `close()` cancels the exit watcher before calling this, so when
+            // these loops give up there is no second chance.
+            //
+            // SIGKILL cannot be caught, so this is bounded by how long the kernel
+            // needs to tear the process down — but the budget is deliberately much
+            // larger than the SIGHUP grace period, because being slightly slow to
+            // close a session costs a moment while leaking a zombie costs one per
+            // closed session for the daemon's lifetime. Still bounded, never
+            // blocking: this runs on the store's actor.
+            let reapDeadline = Date().addingTimeInterval(2)
+            while !reaped, Date() < reapDeadline {
+                let waited = waitpid(childPID, &status, WNOHANG)
+                if waited == childPID { reaped = true; break }
+                if waited < 0 { break }   // ECHILD: someone else reaped it
+                usleep(5_000)
+            }
         }
 
         releaseSlave()

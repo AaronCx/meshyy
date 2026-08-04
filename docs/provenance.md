@@ -857,3 +857,46 @@ counting the bytes that came back, and comparing two daemon versions, located it
 
 **Consulted.** POSIX open(2) access modes, sh `<>` redirection, tmux's own
 verbose server log. No mosh material.
+
+## 2026-08-04 — A too-old resume must still be given the window
+
+**Decision.** `ResumeDecision.mustRedraw` now carries the surviving window's
+bytes, and `replayBase` names where those bytes actually start. The reference
+`ClientModel` was corrected to match.
+
+**Source.** The stress sweep, verified by reading and then by a planted
+violation. On the no-anchor path a resume whose offset had been evicted returned
+`.mustRedraw` with NO bytes while announcing `replayBase = earliestAvailable` —
+where a FRESH attach on the identical buffer replayed the whole window. Two
+silent failures in one branch:
+
+ * A client that fell out of the ring got nothing, and because its offset was
+   then a full ring capacity stale, its next attach was too old as well. A
+   ratchet: attach after attach, never a byte and never a screen. Measured on a
+   256 KB ring — fresh attach 262144 bytes, resume one byte too old 0 bytes.
+ * The stale base is also how the same bytes reach a client twice, which is
+   exactly what §6.4 exists to forbid.
+
+Verified red with the old branch restored: three attaches, zero bytes each, and
+the client still a ring behind.
+
+**Also on the teardown path, all measured:** `terminate` watched the process
+GROUP for the child's exit, but `kill(-pid, 0)` on a group whose leader is
+exiting answers EPERM rather than ESRCH — so the exit could never be observed,
+every close paid the full 250 ms grace period on the store's actor, and the
+SIGKILL escalation (guarded by that same test) never fired. It now watches the
+child, signals unconditionally, signals every process group in the session (a
+job-control shell puts each job in its own group, so the old signal missed the
+very thing the user was running), and `isChildAlive` records a reap it performs
+rather than discarding it — that discard re-armed the pid-reuse hazard `reaped`
+exists to prevent.
+
+**NOT fixed, and written down rather than half-claimed:** closing a session that
+has a foreground job still leaks a zombie, 12 of 12. Four attempts did not move
+it; `waitpid` answers 0 for two seconds after SIGKILL, so the child is parked
+mid-exit with its terminal held by something not yet identified. Reproduction and
+the most promising lead (the trampoline re-opens fds AFTER exec, so they are not
+covered by `POSIX_SPAWN_CLOEXEC_DEFAULT` and may be inherited by grandchildren)
+are in docs/qa/zombie-on-close.md.
+
+**Consulted.** POSIX waitpid/kill semantics, sys/proc.h. No mosh material.
