@@ -15,5 +15,5 @@ public enum Meshyy {
     public static let alpn = "meshyy/1"
 
     /// Human-readable build identity, reported in `Hello`/`Welcome`.
-    public static let version = "0.1.12"
+    public static let version = "0.1.13"
 }
