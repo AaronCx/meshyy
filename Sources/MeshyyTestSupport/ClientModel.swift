@@ -52,11 +52,15 @@ public struct ClientModel: Sendable {
             delivered += bytes
             ackedOffset = anchor + UInt64(bytes.count)
 
-        case .mustRedraw(let earliest, let skipped):
+        case .mustRedraw(let earliest, let bytes, let skipped):
             reportedHoles.append((at: ackedOffset, skipped: skipped))
-            // Clear and ask the multiplexer to repaint: deliver nothing from the
-            // buffer, and restart from the oldest byte the daemon can vouch for.
-            ackedOffset = earliest
+            // The hole is announced, and then the surviving window is delivered —
+            // exactly what a fresh attach gets on the same buffer. Delivering
+            // NOTHING here (which this modelled, and the daemon did) left a client
+            // that had fallen out of the ring blank forever, and its offset a full
+            // ring capacity stale so the next resume was too old again.
+            delivered += bytes
+            ackedOffset = earliest + UInt64(bytes.count)
 
         case .impossible:
             complaints.append("daemon reported an impossible offset — client bug")

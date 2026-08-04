@@ -196,7 +196,7 @@ struct StreamEqualityTests {
         var daemon = SessionBuffer(capacity: 128)
         daemon.write(Array(repeating: UInt8(ascii: "x"), count: 1000))
         let decision = daemon.resume(from: 0)
-        guard case .mustRedraw(let earliest, let skipped) = decision else {
+        guard case .mustRedraw(let earliest, _, let skipped) = decision else {
             Issue.record("expected mustRedraw, got \(decision)")
             return
         }
