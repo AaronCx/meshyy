@@ -73,6 +73,46 @@ struct ControllingTerminalTests {
             """)
     }
 
+    /// All three standard descriptors must be READ-WRITE, as a terminal's are.
+    ///
+    /// Sounds like pedantry; it was a black screen. tmux's server writes the redraw
+    /// to the terminal fd its client hands over, and that fd is fd 0. The first
+    /// trampoline opened fd 0 read-only (`exec <"$0"`), so those writes failed,
+    /// tmux's output buffer never drained — "redraw deferred (395 left)", 4051
+    /// times in its own server log — and every `tmux attach` painted nothing. Plain
+    /// output and even vim were byte-identical, because they write to stdout, which
+    /// is why nothing else noticed. Measured with lsof: the file-action version gave
+    /// `0u 1u 2u`, the broken trampoline `0r 1w 2w`.
+    ///
+    /// Asserted with `fcntl(F_GETFL)` rather than a shell redirection: `echo >&0`
+    /// passes even against the bug, because the shell re-opens the terminal by name
+    /// instead of duplicating the descriptor — a test that could not fail.
+    @Test("All three standard descriptors are read-write, as a terminal's are")
+    func standardDescriptorsAreReadWrite() throws {
+        let python = "/usr/bin/python3"
+        guard FileManager.default.isExecutableFile(atPath: python) else { return }
+        let check = """
+            import fcntl, os
+            modes = []
+            for fd in (0, 1, 2):
+                mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+                modes.append({os.O_RDONLY: 'r', os.O_WRONLY: 'w', os.O_RDWR: 'rw'}[mode])
+            print('FDMODES-' + ','.join(modes) + '-END')
+            """
+        let pty = try PTY(
+            executable: python,
+            arguments: ["-c", check],
+            environment: ["PATH": "/usr/bin:/bin"]
+        )
+        defer { pty.terminate() }
+        let output = try awaitOutput(pty, marker: "-END")
+        #expect(output.contains("FDMODES-rw,rw,rw-END"), """
+            a session's descriptors are not all read-write (saw \(output.debugDescription)) \
+            — tmux writes its redraw to fd 0, so anything less is a black screen on \
+            every attach
+            """)
+    }
+
     /// The half that costs something: a child holding a ctty cannot finish
     /// exiting while the daemon keeps the slave open, so an exit must still be
     /// observable — otherwise every dead session reports itself alive forever.

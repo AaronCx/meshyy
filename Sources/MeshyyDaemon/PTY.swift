@@ -232,7 +232,16 @@ public final class PTY {
         //
         // §8 compliance: the script is a FIXED string; the slave path, program and
         // its arguments all travel as positional argv, never interpolated.
-        let trampoline = #"exec <"$0" >"$0" 2>"$0" || exit 125; prog="$1"; shift; exec "$prog" "$@""#
+        // `<>` — READ-WRITE on fd 0, then dup'd to 1 and 2, which is exactly what the
+        // file-action version did (`addopen(0, …, O_RDWR)` + two `dup2`s). Opening
+        // fd 0 read-only instead, as the first version of this did, breaks any
+        // program that WRITES to its stdin — and tmux is precisely such a program:
+        // its server writes the redraw to the terminal fd the client handed over,
+        // which is fd 0. The write failed, tmux's output buffer never drained
+        // ("redraw deferred (395 left)", 4051 times in its own log), and the user
+        // got a black screen on every `tmux attach` while plain output and even vim
+        // were byte-identical to before. One character of shell redirection.
+        let trampoline = #"exec <>"$0" >&0 2>&0 || exit 125; prog="$1"; shift; exec "$prog" "$@""#
         let argv = ["/bin/sh", "-c", trampoline, slavePath, executable] + arguments
         let status = withCStringArray(argv) { argvPointers in
             withCStringArray(environment.map { "\($0.key)=\($0.value)" }) { envPointers in

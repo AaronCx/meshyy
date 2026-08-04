@@ -824,3 +824,36 @@ answer is boring.
 
 **Consulted.** Design doc §3.1 (never guess what the daemon can report). No mosh
 material.
+
+## 2026-08-04 — fd 0 must be read-write, or tmux paints nothing
+
+**Decision.** The ctty trampoline opens the slave with `<>` (read-write) on fd 0
+and dups it to 1 and 2 — exactly what the file-action version did
+(`addopen(0, …, O_RDWR)` plus two `dup2`s).
+
+**Source.** A user-reported BLACK SCREEN: `tmux attach` inside a meshyy session
+connected, registered a client, and drew nothing. Bisected across daemon
+versions with a real pty harness: v0.1.11 produced 1457 bytes on attach, v0.1.12
+produced 67 — and plain output (2574 B) and even vim (462 B) were byte-identical
+between them, because those write to stdout.
+
+The first trampoline used `exec <"$0" >"$0" 2>"$0"`, which opens fd 0 READ-ONLY.
+tmux's server writes the redraw to the terminal descriptor its client hands over,
+and that descriptor is fd 0. The writes failed, so tmux's output buffer never
+drained — its own server log says `redraw deferred (395 left)` 4051 times — and
+the client sat attached and blank. `lsof` on the session's shell: the file-action
+version `0u 1u 2u`, the broken trampoline `0r 1w 2w`, the fix `0u 1u 2u`.
+
+**The test that could not fail.** The first regression test used
+`echo X >&0` and passed against the bug: a shell re-opens the terminal by NAME
+for that redirection rather than duplicating the descriptor. The assertion is now
+`fcntl(F_GETFL) & O_ACCMODE` on all three descriptors, which is what was actually
+wrong — verified red (`FDMODES-r,w,w`) against the broken trampoline.
+
+**Method note.** Every layer said "fine" — the client attached, tmux's own client
+log showed no error, the daemon kept reading (an `echo` before AND after the
+attach both worked), and input reached tmux (a Ctrl-B d detached it). Only
+counting the bytes that came back, and comparing two daemon versions, located it.
+
+**Consulted.** POSIX open(2) access modes, sh `<>` redirection, tmux's own
+verbose server log. No mosh material.
