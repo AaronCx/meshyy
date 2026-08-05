@@ -567,10 +567,15 @@ public final class PTY {
             // The controlling terminal this daemon now gives its children turns on
             // job control, and a job-control shell puts each foreground job in its
             // OWN process group — so `kill(-childPID, …)` reaches the shell and
-            // misses the very thing the user was running. That job keeps the slave
-            // open, the shell can then never finish exiting, and `waitpid` answers
-            // 0 forever: measured, 12 of 12 sessions with a foreground job left a
-            // permanent zombie, while idle sessions closed cleanly.
+            // misses the very thing the user was running, which is then orphaned
+            // onto launchd rather than dying with its session.
+            //
+            // This is correct on its own and was ALSO once believed to explain the
+            // zombie leak, on the theory that the surviving job held the slave open.
+            // It does not: `lsof` on the slave path while this loop spun showed
+            // nothing holding it, and the leak reproduced 12 of 12 with the whole
+            // tree signalled. See `discardPendingOutput` for what was really
+            // happening — do not read this paragraph as the cause.
             //
             // The tree is captured BEFORE any signal, because it disappears as the
             // processes die. Same enumeration the resize path uses.
@@ -584,13 +589,28 @@ public final class PTY {
             // whose leader is a zombie answers EPERM rather than ESRCH — measured —
             // so the old test could never observe the exit and every kill paid the
             // full grace period with the actor blocked.
+            //
+            // OBSERVE the exit here; do NOT reap it. The difference is the
+            // escalation below, which signals the child's own process group: a
+            // reaped pid is free for the kernel to hand to someone else, while a
+            // child that has exited and NOT been waited for keeps its pid, so the
+            // group stays unambiguously ours. `isChildGone` is exactly that
+            // read — `SZOMB` or `P_WEXIT`, no side effects.
+            //
+            // This mattered the moment `discardPendingOutput` started working. The
+            // loop used to reap here, which was harmless only because it could
+            // never succeed — the child was parked on the unread master for the
+            // whole grace period. With the park gone the shell reaps in ~10 ms,
+            // `reaped` turns true, and the `if !reaped` escalation below is skipped
+            // entirely: measured, a job that IGNORES SIGHUP then outlived its
+            // session 12 of 12 times and was reparented onto launchd, where the
+            // code before the drain had killed it. Trading a zombie for an orphan
+            // is not a fix, and not reaping here is what keeps both closed.
             let deadline = Date().addingTimeInterval(gracePeriod.timeInterval)
             var status: Int32 = 0
             while Date() < deadline {
-                if waitpid(childPID, &status, WNOHANG) == childPID {
-                    reaped = true
-                    break
-                }
+                discardPendingOutput()
+                if isChildGone { break }
                 usleep(10_000)
             }
             // UNCONDITIONAL. This used to be guarded by `kill(-childPID, 0) == 0`,
@@ -614,6 +634,10 @@ public final class PTY {
             // reap: `close()` cancels the exit watcher before calling this, so when
             // these loops give up there is no second chance.
             //
+            // Draining here as well as in the grace loop: a child that ignored
+            // SIGHUP can still emit into the tty on its way out under SIGKILL, and
+            // an undrained byte parks it exactly as before.
+            //
             // SIGKILL cannot be caught, so this is bounded by how long the kernel
             // needs to tear the process down — but the budget is deliberately much
             // larger than the SIGHUP grace period, because being slightly slow to
@@ -622,6 +646,7 @@ public final class PTY {
             // blocking: this runs on the store's actor.
             let reapDeadline = Date().addingTimeInterval(2)
             while !reaped, Date() < reapDeadline {
+                discardPendingOutput()
                 let waited = waitpid(childPID, &status, WNOHANG)
                 if waited == childPID { reaped = true; break }
                 if waited < 0 { break }   // ECHILD: someone else reaped it
@@ -631,6 +656,71 @@ public final class PTY {
 
         releaseSlave()
         close(masterFD)
+
+        // LAST CHANCE, and it is not belt-and-braces decoration.
+        //
+        // Closing the master hangs the tty up, which is the one thing that can
+        // release a child the drain above failed to free — an uninterruptible
+        // write, a disc wait, anything that outlived the budget. Measured before
+        // `discardPendingOutput` existed: the child became reapable a uniform 5 ms
+        // after this `close`, every time, and `terminate` had already returned by
+        // then, so nothing ever waited again. That is the zombie.
+        //
+        // Cheap because it is the path that no longer runs: with the drain in
+        // place the child is reaped inside the grace loop and `reaped` is already
+        // true, so this loop is skipped entirely.
+        var finalStatus: Int32 = 0
+        let hangupDeadline = Date().addingTimeInterval(0.25)
+        while !reaped, Date() < hangupDeadline {
+            let waited = waitpid(childPID, &finalStatus, WNOHANG)
+            if waited == childPID { reaped = true; break }
+            if waited < 0 { break }   // ECHILD: someone else reaped it
+            usleep(5_000)
+        }
+    }
+
+    /// Reads and throws away whatever the tty has queued for the master.
+    ///
+    /// **This is the zombie-on-close bug, and it is not about descriptors at all.**
+    /// A session leader exiting with a controlling terminal is held inside the
+    /// kernel's exit path until that terminal's OUTPUT queue has drained — and a
+    /// pty's output queue only drains when somebody reads the master. `PTYSession`
+    /// cancels its read source before calling `terminate`, so from that moment
+    /// nobody does.
+    ///
+    /// Measured, 12 of 12: killing the foreground job makes zsh write its job
+    /// notice — exactly 27 bytes, `"zsh: hangup     sleep 900\r\n"` — into that
+    /// queue on its way out. With no reader the queue never empties, so zsh parks
+    /// mid-exit (`ps` shows `?Es`, `p_flag & P_WEXIT`, `waitpid(WNOHANG)` answers 0)
+    /// for the full 2.26 s budget. It came unstuck 5 ms after `close(masterFD)` on
+    /// the last line of `terminate` — by which point the exit watcher was cancelled
+    /// and nothing was left to wait. One permanent zombie per closed session.
+    ///
+    /// An idle session closes cleanly for the same reason it always did: with no
+    /// job to report there are no bytes in the queue and nothing to wait for. That
+    /// is the entire difference between the two cases, and why four fixes aimed at
+    /// signals and at the SLAVE all missed — the process holding the child was the
+    /// daemon itself, holding an unread master.
+    ///
+    /// Discarding is correct **here and only here**: `terminate` is teardown, the
+    /// slave has already been released, and `PTYSession.close` finishes every
+    /// subscriber stream immediately after. The short-lived-child guarantee lives
+    /// on the other path — `reap()` via `childExited`, which drains into the buffer
+    /// first — and is untouched by this.
+    ///
+    /// Bounded like `PTYSession.maximumBytesPerDrain`, for the same reason: a child
+    /// that ignored SIGHUP and is still producing must not be able to hold the
+    /// actor here. The fd is O_NONBLOCK, so an empty queue returns EAGAIN at once.
+    private func discardPendingOutput() {
+        var scratch = [UInt8](repeating: 0, count: 65536)
+        var total = 0
+        while total < (1 << 20) {
+            let count = scratch.withUnsafeMutableBytes { pointer in
+                Darwin.read(masterFD, pointer.baseAddress, pointer.count)
+            }
+            guard count > 0 else { return }   // EAGAIN, EIO or EOF: nothing queued
+            total += count
+        }
     }
 }
 
