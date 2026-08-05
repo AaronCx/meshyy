@@ -346,6 +346,76 @@ struct PTYTests {
         }
     }
 
+    /// Pins the zombie-on-close fix (docs/qa/zombie-on-close.md).
+    ///
+    /// **The mechanism, stated so nobody re-derives it the hard way.** A session
+    /// leader exiting with a controlling terminal is held inside the kernel's exit
+    /// path until that terminal's OUTPUT queue has drained, and a pty's output
+    /// queue only drains when somebody reads the master. `PTYSession.close`
+    /// cancels its read source before calling `terminate`, so from that instant
+    /// nobody does. A child that writes anything while dying therefore parks in
+    /// `P_WEXIT` — `waitpid(WNOHANG)` answers 0, `ps` shows `?Es` — until
+    /// `terminate`'s very last line closes the master and hangs the tty up. That
+    /// is a second or two after both reap loops gave up, and the exit watcher is
+    /// already cancelled, so the child becomes a zombie nothing will ever wait on.
+    ///
+    /// The reproducer is therefore three things at once, and drops to zero if any
+    /// one is missing: the child must WRITE during teardown, nothing must READ the
+    /// master while it does, and the child must be the session leader holding the
+    /// ctty. Measured: this shape left a zombie every run before the fix, while
+    /// the otherwise identical `quiet-hup` child that exits silently never did.
+    ///
+    /// A `trap ... HUP` child rather than a real shell with a foreground job: in
+    /// the wild the bytes are zsh's `zsh: hangup     sleep 900` job notice, but
+    /// reproducing that needs an interactive login shell whose rc files talk on
+    /// the way out — measured, a hermetic `zsh -l` with no dotfiles reaps cleanly
+    /// and would have made this test pass against the bug it exists to catch. The
+    /// trap makes the write explicit and owes nothing to anyone's dotfiles.
+    @Test("terminate reaps a child that writes while dying on an unread tty")
+    func terminateReapsChildParkedOnUnreadTTY() throws {
+        for attempt in 1...3 {
+            // Writes on SIGHUP and exits. `terminate` sends that SIGHUP, so the
+            // bytes land in the tty at exactly the moment nothing is reading.
+            let pty = try PTY(
+                executable: "/bin/sh",
+                arguments: [
+                    "-c",
+                    "trap 'printf MESHYY_PARTING_WORDS; exit 0' HUP;"
+                        + " printf MESHYY_UP; while :; do sleep 0.05; done",
+                ],
+                environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            )
+            let child = pty.childPID
+
+            // Read while the child is "live", as the daemon's read source does,
+            // so the queue is empty going in and the only bytes in it are the
+            // parting ones. Then stop, and never read again.
+            let (found, output) = try readUntil(pty, marker: "MESHYY_UP", timeout: 15)
+            guard found else {
+                Issue.record("attempt \(attempt): child never started; got \(output.debugDescription)")
+                pty.terminate()
+                return
+            }
+
+            pty.terminate()
+
+            // terminate must leave NOTHING behind. ECHILD means it reaped the
+            // child itself; the child's own pid coming back means this test just
+            // reaped the zombie terminate walked away from, and 0 means the child
+            // is still parked mid-exit with nobody left to wait for it.
+            var status: Int32 = 0
+            let waited = waitpid(child, &status, WNOHANG)
+            #expect(
+                waited == -1 && errno == ECHILD,
+                """
+                attempt \(attempt): terminate() left pid \(child) unreaped \
+                (waitpid returned \(waited), errno \(errno)) — a zombie for the \
+                daemon's lifetime. See PTY.discardPendingOutput.
+                """
+            )
+        }
+    }
+
     @Test("terminate signals the whole process group, not just the shell")
     func terminateKillsGroup() throws {
         // `sh -c` again: an interactive shell would add job-control chatter and
@@ -382,6 +452,59 @@ struct PTYTests {
             usleep(50_000)
         }
         #expect(reaped, "pid \(grandchild) survived terminate() — the group was not signalled")
+    }
+
+    /// The other half of the zombie fix, and the reason `terminate`'s grace loop
+    /// observes the child's exit instead of reaping it.
+    ///
+    /// Draining the master let the shell finish exiting inside the grace period for
+    /// the first time. That immediately created a NEW leak: the loop reaped the
+    /// child, `reaped` turned true, and the SIGKILL escalation — guarded on
+    /// `!reaped` — was skipped altogether. Anything that ignored the SIGHUP then
+    /// outlived its session and was reparented onto launchd. Measured against the
+    /// drain-only fix: 12 of 12 sessions leaked both the `sh` and its `sleep`,
+    /// where the code before the drain had killed them. One leak traded for
+    /// another, with every zombie assertion still green — which is why this is a
+    /// separate test.
+    ///
+    /// A descendant that IGNORES SIGHUP is the whole point: SIG_IGN survives fork
+    /// and exec, so the backgrounded `sleep` inherits it and only the escalation
+    /// can end it. The shell exits at once so the grace loop takes its early exit —
+    /// the exact path that used to reap.
+    @Test("terminate escalates to SIGKILL even when the child exits during the grace period")
+    func terminateKillsSighupProofChildAfterCleanExit() throws {
+        let pty = try PTY(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                #"trap "" HUP; sleep 300 & printf 'MESHYY%s_%s\n' _IMMORTAL "$!"; exit 0"#,
+            ],
+            environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        )
+        let (found, output) = try readUntil(pty, marker: "MESHYY_IMMORTAL_")
+        #expect(found, "got \(output.debugDescription)")
+
+        guard let range = output.range(of: "MESHYY_IMMORTAL_"),
+              let grandchild = pid_t(output[range.upperBound...].prefix { $0.isNumber })
+        else {
+            Issue.record("no pid after the marker in \(output.debugDescription)")
+            pty.terminate()
+            return
+        }
+
+        pty.terminate()
+
+        var gone = false
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if kill(grandchild, 0) != 0 && errno == ESRCH { gone = true; break }
+            usleep(50_000)
+        }
+        #expect(gone, """
+            pid \(grandchild) ignored SIGHUP and survived terminate() — the SIGKILL \
+            escalation was skipped because the grace loop reaped the child. An \
+            orphan on launchd for as long as the machine is up.
+            """)
     }
 
     /// Pins the fix for a latent daemon bug: SIG_IGN is inherited across fork and
