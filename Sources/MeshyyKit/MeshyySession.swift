@@ -44,6 +44,12 @@ public enum MeshyySessionEvent: Sendable {
     /// One-tap actions currently answerable (design doc §7.3). Empty withdraws.
     case quickActions([QuickAction])
     case ended(reason: String)
+    /// The pty child exited — the user typed `exit`, or their program ended.
+    /// SEPARATE from `.ended` because the correct reactions are opposite: an
+    /// ended transport is something to reconnect; an exited session is over,
+    /// and "recovering" it manufactures a fresh shell the user never asked
+    /// for.
+    case exited(status: Int32)
     /// Something went wrong that the user should see.
     case failed(reason: String)
 }
@@ -409,8 +415,12 @@ public actor MeshyySession {
         case .quickActions(let actions):
             emit(.quickActions(actions))
 
-        case .bye(let reason):
-            emit(.ended(reason: reason))
+        case .bye(let reason, let exitStatus):
+            if let exitStatus {
+                emit(.exited(status: exitStatus))
+            } else {
+                emit(.ended(reason: reason))
+            }
             connection?.close(reason: reason)
             connection = nil
 

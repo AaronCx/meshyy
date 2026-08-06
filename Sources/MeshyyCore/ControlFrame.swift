@@ -128,7 +128,12 @@ public enum ControlFrame: Sendable, Equatable {
     /// string rather than re-modelled so the bytes the client sees are exactly the
     /// bytes the daemon produced.
     case bootstrapResponse(json: String)
-    case bye(reason: String)
+    /// The session is over. `exitStatus` is set when — and only when — the
+    /// reason is the pty child exiting: the one ending a client must NOT treat
+    /// as a drop to recover from. Everything else (shutdown, kill, a client
+    /// asking to leave) leaves it nil. Additive CBOR key, so a 0.1.15 peer
+    /// reads the frame fine and just doesn't see the status.
+    case bye(reason: String, exitStatus: Int32? = nil)
     case error(code: Int, message: String)
     /// A frame this build does not know. Design doc §5.3: ignore it, but keep it
     /// visible so a receiver can log or count what it skipped.
@@ -294,8 +299,11 @@ extension ControlFrame {
             pairs.append((.text("prefix"), .text(prefix)))
         case .bootstrapResponse(let json):
             pairs.append((.text("json"), .text(json)))
-        case .bye(let reason):
+        case .bye(let reason, let exitStatus):
             pairs.append((.text("reason"), .text(reason)))
+            if let exitStatus {
+                pairs.append((.text("exit"), .int(Int(exitStatus))))
+            }
         case .error(let code, let message):
             pairs.append((.text("code"), .int(code)))
             pairs.append((.text("msg"), .text(message)))
@@ -444,7 +452,10 @@ extension ControlFrame {
         case "booted":
             return .bootstrapResponse(json: try requiredText("json"))
         case "bye":
-            return .bye(reason: item["reason"]?.stringValue ?? "")
+            return .bye(
+                reason: item["reason"]?.stringValue ?? "",
+                exitStatus: item["exit"]?.intValue.map(Int32.init)
+            )
         case "error":
             return .error(
                 code: item["code"]?.intValue ?? 0,
