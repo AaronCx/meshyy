@@ -38,14 +38,14 @@ Reading how it works is not.
 make lint      # licence allowlist + privacy grep + MIT header + clean-room check
 make build     # swift build
 make test      # EVERYTHING, incl. the real-shell/PTY/QUIC integration suites
-make test-ci   # what CI runs: deterministic suites only
 make check     # lint + build + test
 ```
 
-**`make check` before every push is not optional here.** CI does not gate the QUIC
-transport or client-session suites — they are not stable on a shared runner, so they
-are gated on `MESHYY_INTEGRATION_TESTS=1`, which only `make test` sets. A green CI
-badge does not cover them. See docs/qa/known-debt.md.
+**`make check` before every push is not optional here.** Since 1b-zero CI runs
+`swift test` unfiltered — the QUIC and client-session suites run on every merge
+(a bounded capability probe is the only gate), so a green badge covers them.
+`make check` stays mandatory because it also runs the lint gates and catches a
+red before it burns a CI round-trip. See docs/qa/known-debt.md.
 
 Baseline: all green, zero known-flaky tests. If something is red, it is a real
 regression — do not push past it.

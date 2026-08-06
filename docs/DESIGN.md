@@ -551,10 +551,10 @@ rather than left implied:
   physical iPhone with the §6.4 property asserted. Loopback cannot produce a
   radio transition or a jetsam kill, so this is not something the in-tree suite
   can discharge.
-- **Integration.** The shipping a+Terminal target does not speak meshyy today —
-  M2 was accepted against the test harness. Until it does, M4's device clauses
-  cannot be run at all, which makes integration a prerequisite rather than a
-  later step. Recorded in `docs/provenance.md`.
+- **Integration.** *(Done — kept for the record.)* a+Terminal speaks meshyy as
+  an opt-in transport, merged to its main and shipping on TestFlight since
+  build 62 (2026-08-06). M4's device clauses are therefore unblocked: the only
+  thing between here and discharging them is a physical iPhone and a human.
 - **M6 tier 2** and **M7**, both open and unstarted by intent. That is the
   correct end state, not an incomplete one.
 
