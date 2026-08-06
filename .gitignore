@@ -6,3 +6,4 @@ DerivedData/
 # macOS Finder duplicate junk — never commit these
 * 2.*
 *\ 2
+/main

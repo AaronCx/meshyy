@@ -42,6 +42,7 @@ headers:
 ## Design doc §0.1: structural proof no mosh source entered the tree.
 cleanroom:
 	@scripts/check-clean-room.sh
+	@scripts/check-no-binaries.sh
 
 ## Every test target runs on merge; no unimported test dependencies.
 testcoverage:
