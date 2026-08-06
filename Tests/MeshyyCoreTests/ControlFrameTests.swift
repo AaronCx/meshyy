@@ -198,6 +198,8 @@ struct ControlFrameTests {
          "a3617466746f6f6f6c646370747900686561726c69657374191000"),
         ("bye", .bye(reason: "client requested"),
          "a261746362796566726561736f6e70636c69656e7420726571756573746564"),
+        ("bye_exit", .bye(reason: "session exited with status 0", exitStatus: 0),
+         "a361746362796566726561736f6e781c73657373696f6e206578697465642077697468207374617475732030646578697400"),
         ("error", .error(code: 7, message: "token expired"),
          "a36174656572726f7264636f646507636d73676d746f6b656e2065787069726564"),
         ("qa_offer",

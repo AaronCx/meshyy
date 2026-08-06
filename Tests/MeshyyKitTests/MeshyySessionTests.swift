@@ -74,6 +74,7 @@ private final class EventLog: @unchecked Sendable {
             case .agent(let kind, _, _): "agent(\(kind))"
             case .quickActions(let actions): "qa(\(actions.count))"
             case .ended(let reason): "ended(\(reason))"
+            case .exited(let status): "exited(\(status))"
             case .failed(let reason): "FAILED(\(reason))"
             case .reconnecting(let trigger): "reconnecting(\(trigger))"
             case .geometryReset: "geometryReset"
@@ -127,6 +128,35 @@ private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
 extension MeshyyKitSuite {
     @Suite("Client session bookkeeping")
     struct MeshyySessionTests {
+
+        @Test("Typing exit ends as .exited, never as a drop to recover from")
+        func aCleanExitIsNotADrop() async throws {
+            try await withHarness(child: .shell) { daemon in
+                let session = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
+                let log = EventLog()
+                await log.attach(to: session)
+
+                let boot = try daemon.bootstrap(session: "cleanexit")
+                try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
+                try await session.send(markerCommand("ALIVE_FIRST"))
+                #expect(await log.wait { log.text.contains("ALIVE_FIRST") })
+
+                try await session.send(Array("exit\n".utf8))
+
+                // The one assertion that maps to the bug: the app decides
+                // close-the-tab vs reconnect on exactly this distinction, and a
+                // clean exit surfaced as .ended sent every `exit` into a fresh
+                // shell the user never asked for.
+                #expect(await log.wait {
+                    log.all.contains { if case .exited = $0 { return true }; return false }
+                }, "exit never surfaced as .exited: \(log.summary)")
+                let plainEnds = log.all.filter {
+                    if case .ended = $0 { return true }; return false
+                }
+                #expect(plainEnds.isEmpty,
+                        "a clean exit must not ALSO read as a drop: \(log.summary)")
+            }
+        }
 
         @Test("consumedOffset counts exactly the bytes delivered, starting at the replay base")
         func offsetTracksDeliveredBytes() async throws {

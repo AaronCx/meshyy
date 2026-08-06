@@ -403,7 +403,10 @@ public final class SessionAttachment: @unchecked Sendable {
         case .quickActions(let actions):
             send(.control(.quickActions(actions)))
         case .exited(let status):
-            send(.control(.bye(reason: "session exited with status \(status)")))
+            send(.control(.bye(
+                reason: "session exited with status \(status)",
+                exitStatus: status
+            )))
             finish()
         }
     }
