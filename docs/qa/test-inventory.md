@@ -1,5 +1,25 @@
 # Test inventory
 
+## Current state (2026-08-06)
+
+| | |
+|---|---|
+| test functions | 227 (`@Test`, counted from the tree) |
+| running on merge | **all 227** — CI runs `swift test` unfiltered since 1b-zero |
+| gated | none; a bounded capability probe is the only skip, with a stated reason |
+| abrupt-loss coverage | `AbruptLossTests` + `ChaosTransportTests` (loss, reorder, latency, hard drops) |
+| adversarial coverage | `AdversarialTests` — the nine 1g cases |
+| execution levels | model (no I/O) → unix socket → real QUIC, each suite naming its level |
+| invariant | §6.4 `StreamEqualityTests` / `CorpusOverTransportTests`, never weakened |
+
+**Rule:** update the table above when coverage changes; append history below it,
+never rewrite it. The addenda under "History" are the record of how the suite
+got here and read in order.
+
+---
+
+# History
+
 Audit for hardening PR 1a. **Audit only — nothing was changed.**
 
 Counted from `swift test list` and by reading each test, not from names.

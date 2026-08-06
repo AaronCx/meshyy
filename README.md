@@ -5,9 +5,12 @@ A resumable, roaming-tolerant terminal transport for
 
 Clean-room. MIT. Not mosh-compatible, deliberately.
 
-**Status: in development.** M0 spikes done, `MeshyyCore` landing. Nothing is
-shippable yet. See `docs/DESIGN.md` for the full design and `docs/benchmarks.md`
-for the measurements it rests on.
+**Status: integrated and on TestFlight.** M1–M5 and M6 tier 1 are merged and
+green; a+Terminal speaks meshyy as an opt-in transport and ships it on
+TestFlight. What remains is M4's device acceptance (radio transitions and
+jetsam need a physical iPhone, not a loopback suite) and M6 tier 2 / M7, open
+by intent — see `docs/DESIGN.md` §10.1. Design in `docs/DESIGN.md`,
+measurements in `docs/benchmarks.md`.
 
 ---
 
