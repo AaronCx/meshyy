@@ -71,6 +71,7 @@ private final class EventLog: @unchecked Sendable {
             case .screenRebuilt(let from, let at): "rebuilt(\(from)->\(at))"
             case .termios: "termios"
             case .screenMode(let alt): "screen(alt:\(alt))"
+            case .modes(let active): "modes(\(active.sorted()))"
             case .agent(let kind, _, _): "agent(\(kind))"
             case .quickActions(let actions): "qa(\(actions.count))"
             case .ended(let reason): "ended(\(reason))"
@@ -128,6 +129,42 @@ private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
 extension MeshyyKitSuite {
     @Suite("Client session bookkeeping")
     struct MeshyySessionTests {
+
+        @Test("A late-attaching client is told the modes the program armed long ago")
+        func modesSurviveToAFreshClient() async throws {
+            try await withHarness(child: .shell) { daemon in
+                // The program arms mouse + SGR + paste, witnessed by NOBODY:
+                // no client is attached while these bytes flow, exactly like
+                // tmux arming its modes while only the daemon's pty listens.
+                let arming = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
+                let armLog = EventLog()
+                await armLog.attach(to: arming)
+                let boot = try daemon.bootstrap(session: "coldmodes")
+                try await arming.attach(bootstrap: boot, sshHost: "127.0.0.1")
+                try await arming.send(Array("printf '\\e[?1000;1006h\\e[?2004h'\n".utf8))
+                try await arming.send(markerCommand("MODES_ARMED"))
+                #expect(await armLog.wait { armLog.text.contains("MODES_ARMED") })
+                await arming.detach(reason: "app force-quit")
+
+                // A brand-new client — the relaunch's fresh emulator — attaches.
+                // The escapes above are consumed history; only the modes frame
+                // can tell it what the program believes.
+                let fresh = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
+                let freshLog = EventLog()
+                await freshLog.attach(to: fresh)
+                let reboot = try daemon.bootstrap(session: "coldmodes")
+                try await fresh.attach(bootstrap: reboot, sshHost: "127.0.0.1")
+
+                #expect(await freshLog.wait {
+                    freshLog.all.contains {
+                        if case .modes(let active) = $0 {
+                            return active.isSuperset(of: [1000, 1006, 2004])
+                        }
+                        return false
+                    }
+                }, "the fresh client was never told the armed modes: \(freshLog.summary)")
+            }
+        }
 
         @Test("Typing exit ends as .exited, never as a drop to recover from")
         func aCleanExitIsNotADrop() async throws {

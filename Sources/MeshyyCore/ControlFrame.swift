@@ -134,6 +134,14 @@ public enum ControlFrame: Sendable, Equatable {
     /// asking to leave) leaves it nil. Additive CBOR key, so a 0.1.15 peer
     /// reads the frame fine and just doesn't see the status.
     case bye(reason: String, exitStatus: Int32? = nil)
+    /// The tracked DEC private modes currently set on the session (mouse,
+    /// focus, bracketed paste, cursor keys — ScreenScanner.trackedModes).
+    /// Sent on attach and on change, so an emulator built AFTER the escapes
+    /// flowed — an app relaunch resuming a held session — can be told what the
+    /// program believes about its terminal. Sorted, so the wire bytes are
+    /// deterministic. Additive: an older peer sees an unknown frame and
+    /// ignores it (§5.3).
+    case modes(active: [Int])
     case error(code: Int, message: String)
     /// A frame this build does not know. Design doc §5.3: ignore it, but keep it
     /// visible so a receiver can log or count what it skipped.
@@ -223,6 +231,7 @@ public enum ControlFrame: Sendable, Equatable {
         case .bootstrapResponse: "booted"
         case .resumeTooOld: "tooold"
         case .bye: "bye"
+        case .modes: "modes"
         case .error: "error"
         case .unknown(let type, _): type
         }
@@ -299,6 +308,8 @@ extension ControlFrame {
             pairs.append((.text("prefix"), .text(prefix)))
         case .bootstrapResponse(let json):
             pairs.append((.text("json"), .text(json)))
+        case .modes(let active):
+            pairs.append((.text("active"), .array(active.map { .int($0) })))
         case .bye(let reason, let exitStatus):
             pairs.append((.text("reason"), .text(reason)))
             if let exitStatus {
@@ -451,6 +462,9 @@ extension ControlFrame {
             return .bootstrapNewInGroup(prefix: try requiredText("prefix"))
         case "booted":
             return .bootstrapResponse(json: try requiredText("json"))
+        case "modes":
+            let items = item["active"]?.arrayValue ?? []
+            return .modes(active: items.compactMap(\.intValue))
         case "bye":
             return .bye(
                 reason: item["reason"]?.stringValue ?? "",

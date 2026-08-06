@@ -398,6 +398,8 @@ public final class SessionAttachment: @unchecked Sendable {
             send(.control(.termios(state)))
         case .screenMode(let alt):
             send(.control(.screenMode(alt: alt)))
+        case .modes(let active):
+            send(.control(.modes(active: active.sorted())))
         case .agent(let kind, let agentID, let detail):
             send(.control(.agentEvent(kind: kind, agentID: agentID, detail: detail)))
         case .quickActions(let actions):
