@@ -24,7 +24,27 @@ public struct ScreenScanner: Sendable {
         case fullClear(offset: UInt64)
         /// Alternate screen entered or left.
         case altScreen(active: Bool, offset: UInt64)
+        /// A tracked DEC private mode was set or reset — see `trackedModes`.
+        case mode(Int, active: Bool)
     }
+
+    /// The DEC private modes a fresh emulator must be told about to be usable,
+    /// beyond what replay happens to contain (§6.3 extension).
+    ///
+    /// A program announces these ONCE — tmux arms mouse reporting when its
+    /// client attaches, and its client here is the daemon's pty, which never
+    /// re-attaches. An app-side emulator built after that moment (relaunch,
+    /// resume) starts with everything off and no bytes left in the ring to
+    /// teach it: measured, mouse reporting stayed off after every relaunch
+    /// while tmux believed it was on — scroll input simply vanished. mosh
+    /// answers this with a full server-side emulator; tracking the handful of
+    /// modes that constitute input behavior gets the part users hit.
+    ///
+    ///   1     application cursor keys (DECCKM) — arrows send SS3
+    ///   1000  mouse press/release   1002  + drag   1003  + motion
+    ///   1004  focus reporting       1006  SGR mouse encoding
+    ///   2004  bracketed paste
+    public static let trackedModes: Set<Int> = [1, 1000, 1002, 1003, 1004, 1006, 2004]
 
     /// Parser position. Only enough to reassemble one CSI sequence.
     private enum State: Sendable, Equatable {
@@ -37,8 +57,9 @@ public struct ScreenScanner: Sendable {
 
     /// A CSI parameter run longer than this is not a sequence meshyy cares
     /// about, so the scanner gives up on it rather than growing without bound.
-    /// The longest sequence of interest is `ESC[?1049h` — four parameter bytes.
-    private static let maximumParameterBytes = 24
+    /// Combined mode sets are real — tmux emits `ESC[?1000;1006h` — so the
+    /// ceiling covers every tracked mode in one sequence with headroom.
+    private static let maximumParameterBytes = 48
 
     private var state: State = .ground
     /// Absolute offset of the ESC that began the sequence in progress.
@@ -48,6 +69,8 @@ public struct ScreenScanner: Sendable {
     /// anchor design doc §6.3 replays from when the client's offset is too old.
     public private(set) var lastFullRedrawOffset: UInt64?
     public private(set) var altScreenActive = false
+    /// Tracked modes currently set — the state a fresh emulator needs.
+    public private(set) var activeModes: Set<Int> = []
 
     public init() {}
 
@@ -79,8 +102,9 @@ public struct ScreenScanner: Sendable {
 
             case .csi(var parameters):
                 if (0x40...0x7E).contains(byte) {
-                    // Final byte: the sequence is complete.
-                    if let event = Self.classify(
+                    // Final byte: the sequence is complete. Plural, because a
+                    // combined set (`ESC[?1000;1006h`) is several events.
+                    for event in Self.classify(
                         parameters: parameters,
                         final: byte,
                         offset: sequenceStart
@@ -114,34 +138,49 @@ public struct ScreenScanner: Sendable {
             // restores the primary screen from *its* memory, and nothing in the
             // byte stream after that point rebuilds what was there.
             if active { lastFullRedrawOffset = offset }
+        case .mode(let mode, let active):
+            if active { activeModes.insert(mode) } else { activeModes.remove(mode) }
         }
     }
 
-    /// Maps a completed CSI sequence to an event, or nil for the vast majority
-    /// that are neither a full clear nor an alt-screen toggle.
+    /// Maps a completed CSI sequence to its events — empty for the vast
+    /// majority that are neither a clear, an alt-screen toggle, nor a tracked
+    /// mode change.
     private static func classify(
         parameters: [UInt8],
         final: UInt8,
         offset: UInt64
-    ) -> Event? {
+    ) -> [Event] {
         switch final {
         case 0x4A: // 'J' — erase in display
             // CSI 2 J clears the visible screen, CSI 3 J the scrollback.
             // A bare CSI J (erase below the cursor) is not a full redraw.
             let text = String(decoding: parameters, as: UTF8.self)
-            return (text == "2" || text == "3") ? .fullClear(offset: offset) : nil
+            return (text == "2" || text == "3") ? [.fullClear(offset: offset)] : []
 
         case 0x68, 0x6C: // 'h' set / 'l' reset — private modes
-            guard parameters.first == 0x3F else { return nil } // '?'
-            let mode = String(decoding: parameters.dropFirst(), as: UTF8.self)
-            // 1049 is what tmux, vim and every modern TUI use. 47 and 1047 are
-            // the older spellings, still emitted by some curses builds — cheap
-            // to accept, and missing one would leave prediction on inside a TUI.
-            guard ["1049", "1047", "47"].contains(mode) else { return nil }
-            return .altScreen(active: final == 0x68, offset: offset)
+            guard parameters.first == 0x3F else { return [] } // '?'
+            let active = final == 0x68
+            // A single sequence can carry several modes (`?1000;1006h`), and
+            // each is its own event.
+            return String(decoding: parameters.dropFirst(), as: UTF8.self)
+                .split(separator: ";")
+                .compactMap { piece -> Event? in
+                    // 1049 is what tmux, vim and every modern TUI use. 47 and
+                    // 1047 are the older spellings, still emitted by some
+                    // curses builds — cheap to accept, and missing one would
+                    // leave prediction on inside a TUI.
+                    if ["1049", "1047", "47"].contains(String(piece)) {
+                        return .altScreen(active: active, offset: offset)
+                    }
+                    if let mode = Int(piece), trackedModes.contains(mode) {
+                        return .mode(mode, active: active)
+                    }
+                    return nil
+                }
 
         default:
-            return nil
+            return []
         }
     }
 

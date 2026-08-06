@@ -63,6 +63,41 @@ struct ScreenScannerTests {
     /// The subtle one. PTY reads split wherever the kernel decides, so a
     /// sequence straddling two reads must still be recognised. Every split point
     /// of every sequence of interest is checked.
+    @Test("Tracked input modes are remembered, dropped on reset, and combined sequences count each")
+    func modesAreTracked() {
+        var scanner = ScreenScanner()
+        // tmux arming a mouse client: combined set, two modes in one sequence.
+        scanner.scan(Array("\u{1B}[?1000;1006h".utf8), startingAt: 0)
+        #expect(scanner.activeModes == [1000, 1006])
+        scanner.scan(Array("\u{1B}[?2004h\u{1B}[?1004h".utf8), startingAt: 14)
+        #expect(scanner.activeModes == [1000, 1006, 2004, 1004])
+        // Leaving copy-mode style: one reset drops only its mode.
+        scanner.scan(Array("\u{1B}[?1006l".utf8), startingAt: 30)
+        #expect(scanner.activeModes == [1000, 2004, 1004])
+        // A mode nobody tracks changes nothing.
+        scanner.scan(Array("\u{1B}[?2031h".utf8), startingAt: 38)
+        #expect(scanner.activeModes == [1000, 2004, 1004])
+    }
+
+    @Test("A combined set split across chunks still lands every mode")
+    func combinedSetSurvivesChunkBoundary() {
+        var scanner = ScreenScanner()
+        let sequence = Array("\u{1B}[?1000;1002;1006h".utf8)
+        for (index, byte) in sequence.enumerated() {
+            scanner.scan([byte], startingAt: UInt64(index))
+        }
+        #expect(scanner.activeModes == [1000, 1002, 1006])
+    }
+
+    @Test("Alt screen arriving in a combined sequence still anchors the redraw")
+    func altScreenInCombinedSequence() {
+        var scanner = ScreenScanner()
+        scanner.scan(Array("\u{1B}[?1049;1000h".utf8), startingAt: 100)
+        #expect(scanner.altScreenActive)
+        #expect(scanner.activeModes == [1000])
+        #expect(scanner.lastFullRedrawOffset == 100)
+    }
+
     @Test("A sequence split across chunk boundaries is still detected")
     func splitAcrossChunks() {
         for sequence in [clearScreen, clearScrollback, enterAlt, leaveAlt] {
@@ -78,8 +113,8 @@ struct ScreenScannerTests {
                 switch events.first {
                 case .fullClear(let offset), .altScreen(_, let offset):
                     #expect(offset == 0, "split at \(split) reported offset \(offset), want 0")
-                case nil:
-                    break
+                case .mode, nil:
+                    break   // mode events carry no offset
                 }
             }
         }

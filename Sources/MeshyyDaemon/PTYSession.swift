@@ -15,6 +15,10 @@ public enum SessionEvent: Sendable, Equatable {
     case termios(TermiosState)
     /// An alternate-screen application started or stopped.
     case screenMode(alt: Bool)
+    /// The set of tracked DEC private modes changed (mouse, focus, paste,
+    /// cursor keys — ScreenScanner.trackedModes). Carries the whole current
+    /// set: idempotent to apply, impossible to mis-order.
+    case modes(active: Set<Int>)
     /// Agent status derived from the output stream (design doc §5, M5).
     case agent(kind: AgentEventKind, agentID: String?, detail: String?)
     /// One-tap actions now answerable, or an empty list withdrawing a previous
@@ -354,6 +358,7 @@ public actor PTYSession {
 
     private func ingest(chunks: [[UInt8]], reachedEOF: Bool) {
         if !chunks.isEmpty { lastOutputAt = Date() }
+        var modesChanged = false
         for chunk in chunks {
             let offset = buffer.totalWritten
             let events = buffer.write(chunk)
@@ -375,8 +380,16 @@ public actor PTYSession {
                     // The anchor is buffer bookkeeping, but a clear also means the
                     // matched prompt has left the screen.
                     applyAgentChanges(agentMonitor.screenChanged())
+                case .mode:
+                    // Coalesced below: one event per chunk however many modes
+                    // a combined sequence flipped.
+                    modesChanged = true
                 }
             }
+        }
+
+        if modesChanged {
+            emit(.modes(active: buffer.activeModes))
         }
 
         // EOF on the master should be unreachable while the daemon holds a slave
@@ -424,6 +437,7 @@ public actor PTYSession {
         // have to wait for the next change to know whether to predict.
         continuation.yield(.termios(lastTermios))
         continuation.yield(.screenMode(alt: lastAltScreen))
+        continuation.yield(.modes(active: buffer.activeModes))
         continuation.yield(.quickActions(agentMonitor.offeredActions.map(\.advertised)))
         if let exitStatus {
             continuation.yield(.exited(status: exitStatus))

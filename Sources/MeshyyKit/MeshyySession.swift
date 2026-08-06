@@ -40,6 +40,12 @@ public enum MeshyySessionEvent: Sendable {
     /// nothing echoes locally.
     case termios(TermiosState)
     case screenMode(alt: Bool)
+    /// The daemon's record of the tracked DEC private modes currently set.
+    /// Feed the matching escapes to a FRESH emulator before consuming replay —
+    /// locally generated, so never counted as resumed output (§6.4 stays a
+    /// statement about pty bytes). An emulator that lived through the stream
+    /// already agrees with every one of these; applying them again is a no-op.
+    case modes(active: Set<Int>)
     case agent(kind: AgentEventKind, agentID: String?, detail: String?)
     /// One-tap actions currently answerable (design doc §7.3). Empty withdraws.
     case quickActions([QuickAction])
@@ -404,6 +410,9 @@ public actor MeshyySession {
 
         case .screenMode(let alt):
             emit(.screenMode(alt: alt))
+
+        case .modes(let active):
+            emit(.modes(active: Set(active)))
 
         case .agentEvent(let kind, let agentID, let detail):
             // Retained, not merely forwarded: the quick-action gate below is defined

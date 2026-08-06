@@ -108,6 +108,9 @@ public struct SessionBuffer: Sendable {
     public var totalWritten: UInt64 { ring.totalWritten }
     public var window: (from: UInt64, to: UInt64) { ring.window }
     public var altScreenActive: Bool { scanner.altScreenActive }
+    /// Tracked DEC private modes currently set — what a fresh emulator must be
+    /// told before replay means anything to it.
+    public var activeModes: Set<Int> { scanner.activeModes }
     public var capacity: Int { ring.capacity }
 
     /// Records output read from the PTY. Returns the screen events it contained,
