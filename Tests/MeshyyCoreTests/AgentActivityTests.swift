@@ -57,6 +57,41 @@ struct AgentActivityTests {
         #expect(monitor.status == .waiting)
     }
 
+    @Test("Quiet with the busy marker on screen is still WORKING, not waiting")
+    func quietWhileBusyMarkerShows() {
+        var monitor = AgentActivityMonitor(candidates: [AgentProfile.defaults[0]])
+        let start = ContinuousClock().now
+
+        // The agent works, then runs a silent tool call — a build, a CI
+        // watch — with its spinner (and the busy marker) re-printing near the
+        // end of the stream. The user's report: the phone said the agent
+        // needed a human who it did not need.
+        var frames: [UInt8] = []
+        for _ in 0..<20 {
+            frames += Array("\u{1B}[2K* Running tests… (esc to interrupt)\r".utf8)
+        }
+        #expect(monitor.observe(frames, now: start).status == .working)
+
+        // Minutes of quiet: STILL working — the marker is the agent's own
+        // statement that it is mid-work.
+        #expect(monitor.tick(now: start.advanced(by: .seconds(3))).status == nil)
+        #expect(monitor.status == .working)
+        #expect(monitor.tick(now: start.advanced(by: .seconds(120))).status == nil)
+        #expect(monitor.status == .working)
+
+        // The tool call ends; the agent draws its input box, which occupies
+        // the end of the stream (and pushes the stale marker out of the busy
+        // window). Quiet NOW means waiting.
+        var prompt: [UInt8] = Array("\u{1B}[2K".utf8)
+        prompt += Array(String(repeating: "\u{2500}", count: 60).utf8)
+        prompt += Array("\n> Try \"fix the login bug\"\n".utf8)
+        prompt += Array(String(repeating: "\u{2500}", count: 60).utf8)
+        prompt += Array("\n  ? for shortcuts\n".utf8)
+        monitor.observe(prompt, now: start.advanced(by: .seconds(121)))
+        #expect(monitor.tick(now: start.advanced(by: .seconds(124))).status == .waiting)
+        #expect(monitor.status == .waiting)
+    }
+
     @Test("A keystroke echo never reaches the burst threshold")
     func keystrokesAreNotWork() {
         var monitor = AgentActivityMonitor(candidates: [claudeCode])
