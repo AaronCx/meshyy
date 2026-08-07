@@ -375,3 +375,48 @@ public struct AgentActivityMonitor: Sendable {
         return String(result)
     }
 }
+
+extension AgentProfile {
+    /// The built-in agents, shared by daemon and client.
+    ///
+    /// One table on purpose: the daemon OFFERS actions from it (id + label on
+    /// the wire, never bytes), and a client RESOLVES a tapped id against it
+    /// locally — so a forged offer, or a fake prompt provoking a real one,
+    /// still cannot choose what a tap sends. Splitting the table would let
+    /// the two ends drift until a tap resolves to nothing, which reads to
+    /// the user as a dead button.
+    public static var defaults: [AgentProfile] {
+        [
+            AgentProfile(
+                id: "claude-code",
+                displayName: "Claude Code",
+                detectionMarkers: ["esc to interrupt", "claude code"],
+                quickActions: [
+                    QuickActionDefinition(
+                        id: "approve-once",
+                        label: "Yes",
+                        matches: ["do you want", "1. yes"],
+                        sends: Array("1\r".utf8)
+                    ),
+                    QuickActionDefinition(
+                        id: "approve-always",
+                        label: "Yes, always",
+                        matches: ["do you want", "2. yes, and don't ask again"],
+                        sends: Array("2\r".utf8)
+                    ),
+                    QuickActionDefinition(
+                        id: "deny",
+                        label: "No",
+                        // The escape key is what Claude Code itself documents on
+                        // screen, so this is the same keystroke a user would send.
+                        matches: ["do you want", "no, and tell claude"],
+                        sends: Array("\u{1B}".utf8)
+                    ),
+                ]
+            ),
+            // Empty markers: the burst/quiet heuristic runs from the start and
+            // reports status for ANY agent, with no name claimed.
+            AgentProfile.generic,
+        ]
+    }
+}
