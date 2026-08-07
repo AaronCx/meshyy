@@ -285,8 +285,15 @@ trip would mean persisting session content to disk, which is a privacy decision
 The daemon keeps a per-session ring buffer of raw PTY output with a monotonic
 byte offset. Default 4 MB, configurable.
 
-- Client sends `Ack {offset}` periodically, at most every 250ms.
-- On reconnect, client sends `Hello {resume_from: offset}`.
+- Client sends `Ack {offset}` periodically, at most every 250ms. *(Corrected
+  after the 1g audit: the daemon FILES these and consults nothing from them —
+  `ackedOffset` lives on the attachment, dies with it, and no replay decision
+  reads it. The ack exists as a diagnostic floor, not a protocol input.)*
+- On reconnect, client sends `Hello {resume_from: offset}`, and THAT offset —
+  alone — drives the replay. Deliberate: the client's own offset being the
+  single source of truth is what makes resume robust against a lying or buggy
+  peer; a forged ack cannot move another client's replay point. See
+  `docs/qa/test-inventory.md` §1g and SECURITY.md.
 - Daemon replays from that offset. The client feeds the bytes to SwiftTerm
   exactly as if they had arrived live. Scrollback stays correct, which mosh
   cannot do because it syncs screen state and hands scrollback to tmux.
