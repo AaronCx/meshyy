@@ -22,8 +22,8 @@ public actor TokenActor {
         self.store = TokenStore(ttl: ttl)
     }
 
-    public func issue(sessionID: String) -> String {
-        store.issue(sessionID: sessionID, now: clock.now)
+    public func issue(sessionID: String) throws -> String {
+        try store.issue(sessionID: sessionID, now: clock.now)
     }
 
     public func redeem(

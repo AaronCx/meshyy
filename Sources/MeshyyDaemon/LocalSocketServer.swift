@@ -471,7 +471,7 @@ final class LocalClient: @unchecked Sendable {
                     )
                 }
                 let info = await session.info
-                let token = await tokens.issue(sessionID: info.sessionID)
+                let token = try await tokens.issue(sessionID: info.sessionID)
                 let response = BootstrapResponse(
                     port: port,
                     token: token,

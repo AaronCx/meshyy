@@ -158,7 +158,7 @@ public struct DaemonIdentity: @unchecked Sendable {
             )
         }
 
-        var serial = TokenStore.secureRandom(16)
+        var serial = try TokenStore.secureRandom(16)
         serial[0] &= 0x7F // positive without needing a pad byte
 
         let template = X509Template(
