@@ -243,9 +243,14 @@ final class QUICPeer: @unchecked Sendable {
     /// decoder across streams would interleave two length prefixes and desync both.
     private var decoders: [ObjectIdentifier: FrameDecoder] = [:]
     private var streams: [ObjectIdentifier: NWConnection] = [:]
-    /// Which stream to answer a given channel on, learned from where its frames
-    /// arrived. Replying on the stream a channel came in on is what preserves
-    /// §5.2's benefit: PTY bytes never queue behind a blob upload.
+    /// Which stream to answer a given LANE on, learned from where its frames
+    /// arrived (see `ChannelKind.wireLane`). Control and pty share one lane so
+    /// their relative order survives the wire: a `modes` frame that could
+    /// overtake — or be overtaken by — the output around it silently undoes
+    /// the very state it asserts, and switching pty output onto a second
+    /// stream mid-session let NEW bytes overtake OLD ones under flow-control
+    /// stall. Blobs keep their own lane, which is all §5.2 ever needed: a
+    /// bulk upload must not head-of-line block the terminal.
     private var streamForKind: [ChannelKind: NWConnection] = [:]
     private var closed = false
     /// Frames handed to Network framework but not yet on the wire.
@@ -365,9 +370,14 @@ final class QUICPeer: @unchecked Sendable {
         decoders[key] = decoder
 
         for frame in frames {
-            // Bind the channel to this stream the first time it is seen, so replies
-            // go back the way they came.
-            if streamForKind[frame.kind] == nil { streamForKind[frame.kind] = stream }
+            // Bind the LANE to this stream the first time it is seen, so replies
+            // go back the way they came. Keyed on the lane rather than the raw
+            // kind: an older client that opens a separate pty stream for its
+            // keystrokes must not pull this daemon's output onto it — output
+            // stays ordered behind the control frames on the hello stream.
+            if streamForKind[frame.kind.wireLane] == nil {
+                streamForKind[frame.kind.wireLane] = stream
+            }
             attachment?.receive(frame)
         }
     }
@@ -375,7 +385,7 @@ final class QUICPeer: @unchecked Sendable {
     private func write(_ envelope: FrameEnvelope) {
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
-            let target = self.streamForKind[envelope.kind]
+            let target = self.streamForKind[envelope.kind.wireLane]
                 ?? self.streamForKind[.control]
                 ?? self.streams.values.first
             guard let target else { return } // nothing open yet; the client will retry

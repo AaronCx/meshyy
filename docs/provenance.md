@@ -900,3 +900,30 @@ covered by `POSIX_SPAWN_CLOEXEC_DEFAULT` and may be inherited by grandchildren)
 are in docs/qa/zombie-on-close.md.
 
 **Consulted.** POSIX waitpid/kill semantics, sys/proc.h. No mosh material.
+
+## 2026-08-07 — One wire lane for control and pty frames (scroll-invest)
+
+**Decision.** Control frames and pty frames travel on a single QUIC stream in
+both directions; only blobs get a separate stream (`ChannelKind.wireLane`).
+
+**Why.** QUIC orders bytes within a stream and promises nothing across
+streams (RFC 9000 §2.2). The protocol's ordering promises span the two kinds:
+`modes`/`termios` frames correct the pty bytes around them, and an inbound
+`resize` is ordered against keystrokes — the daemon's serialised work queue
+can only preserve an order the wire actually delivered. The previous routing
+(reply on the stream a KIND first arrived on) additionally switched daemon
+output from the hello stream to a second stream the moment the client first
+typed, so under flow-control stall NEW pty bytes could overtake OLD ones — a
+§6.4 violation invisible on loopback. Found while investigating inconsistent
+scroll-mode state in a+Terminal: an overtaken `modes` frame silently undoes
+the arming it asserts.
+
+**Compatibility.** The envelope carries the channel identity (§5.2's design:
+"the channel's identity is in the envelope rather than in a stream id"), so
+either peer may send any kind on any stream; old daemon + new client and new
+daemon + old client both interoperate, and the daemon keys its reply binding
+on the lane so an old client's separate pty stream cannot pull output off the
+ordered control stream.
+
+**Consulted.** RFC 9000 (stream ordering); Network framework NWConnectionGroup
+docs. No mosh material.
