@@ -185,3 +185,25 @@ the id is the continuity claim a client can compare to turn "resuming" into
 "your session is gone; this is a new one."
 
 Reverted after the run; `git diff` clean; suite green.
+
+---
+
+## 2026-08-07 — heartbeat tick counter (audit PR 4)
+
+**Mutant: bug #2 restored.** `startHeartbeat` was given back its original
+early return — no redial provider, no probes — the exact defect that once
+surfaced as "Reconnecting" flashes every few seconds and three unrelated-
+looking symptoms.
+
+```
+RED in 2.06s -> "The heartbeat keeps ticking, counted in milliseconds not
+                 symptoms" — "minted 0 probes in 2s at a 20ms interval —
+                 it is not running, which is bug #2 by another name"
+```
+
+`QuietSessionSurvivalTests` stays exactly as it is: it asserts the session
+SURVIVES, this asserts probes are GENERATED, and neither replaces the other —
+the survival test can only notice this defect by waiting out the full idle
+timeout; the counter names it in milliseconds.
+
+Reverted after the run; `git diff` clean; suite green.

@@ -166,6 +166,32 @@ extension MeshyyKitSuite {
             }
         }
 
+        @Test("The heartbeat keeps ticking, counted in milliseconds not symptoms")
+        func heartbeatTicksClimb() async throws {
+            try await withHarness(child: .bytePipe) { daemon in
+                // 20ms probes: the assertion below fails within two seconds if
+                // the heartbeat silently stops running — bug #2's shape — where
+                // the survival test needs the whole idle timeout to notice.
+                let session = MeshyySession(
+                    size: TerminalSize(cols: 80, rows: 24),
+                    heartbeatInterval: .milliseconds(20)
+                )
+                let boot = try daemon.bootstrap(session: "ticker")
+                try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
+
+                let deadline = Date().addingTimeInterval(2)
+                var seen: UInt64 = 0
+                while Date() < deadline, seen < 5 {
+                    seen = await session.heartbeatTicks
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                #expect(seen >= 5, Comment(rawValue:
+                    "the heartbeat minted \(seen) probes in 2s at a 20ms interval "
+                        + "— it is not running, which is bug #2 by another name"))
+                await session.detach(reason: "test over")
+            }
+        }
+
         @Test("Typing exit ends as .exited, never as a drop to recover from")
         func aCleanExitIsNotADrop() async throws {
             try await withHarness(child: .shell) { daemon in

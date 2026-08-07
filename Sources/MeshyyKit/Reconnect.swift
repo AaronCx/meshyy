@@ -273,6 +273,13 @@ public struct HeartbeatMonitor: Sendable {
     /// Nonces sent and not yet answered, oldest first.
     private var outstanding: [UInt64] = []
     private var nextNonce: UInt64 = 1
+    /// Probes minted over this monitor's life. Purely observational — bug #2
+    /// was a heartbeat that silently stopped RUNNING, and the survival test
+    /// that guards it can only fail by waiting out the full idle timeout. A
+    /// counter that must keep climbing names that defect directly, in
+    /// milliseconds. Never reset: reset() forgets unanswered probes, not the
+    /// fact that probing is alive.
+    public private(set) var ticks: UInt64 = 0
 
     public init(interval: Duration = .seconds(1), missesBeforeDead: Int = 3) {
         self.interval = interval
@@ -288,6 +295,7 @@ public struct HeartbeatMonitor: Sendable {
     public mutating func nextPing() -> ControlFrameNonce {
         let nonce = nextNonce
         nextNonce &+= 1
+        ticks &+= 1
         outstanding.append(nonce)
         return ControlFrameNonce(value: nonce)
     }
