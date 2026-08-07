@@ -157,8 +157,15 @@ public actor MeshyySession {
     /// Whether the agent is waiting on a human right now.
     public var isAwaitingInput: Bool { agentStatus == .waiting }
 
-    public init(size: TerminalSize = .default) {
+    /// Probes minted so far. The direct assertion for "the heartbeat is
+    /// actually running" — see HeartbeatMonitor.ticks.
+    public var heartbeatTicks: UInt64 { heartbeat.ticks }
+
+    public init(size: TerminalSize = .default, heartbeatInterval: Duration? = nil) {
         self.size = size
+        if let heartbeatInterval {
+            heartbeat.interval = heartbeatInterval
+        }
         let (stream, continuation) = AsyncStream<MeshyySessionEvent>.makeStream(
             // Unbounded: dropping PTY output to relieve backpressure would break the
             // §6.4 invariant. A slow consumer must fall behind, never lose bytes.
