@@ -31,6 +31,14 @@ public struct AgentProfile: Sendable, Equatable, Codable {
     public var detectionMarkers: [String]
     /// Quiet period after which sustained output is read as "waiting".
     public var quietInterval: Duration
+    /// Substrings that mean the agent is STILL WORKING even though the pty has
+    /// gone quiet. Claude Code shows "esc to interrupt" for the whole life of a
+    /// tool call — including a build or a CI watch that prints nothing for
+    /// minutes. Quiet alone read that as "waiting for input" and the phone said
+    /// the agent needed a human who it did not need: the false-notification
+    /// report, and the same lie on the Live Activity. Empty means quiet alone
+    /// decides, which is all a generic profile can promise.
+    public var busyMarkers: [String]
     /// Bytes inside one quiet window that read as "working". A keystroke echo is a
     /// handful of bytes and never reaches this.
     public var burstThreshold: Int
@@ -43,6 +51,7 @@ public struct AgentProfile: Sendable, Equatable, Codable {
         detectionMarkers: [String] = [],
         quietInterval: Duration = .seconds(2),
         burstThreshold: Int = 200,
+        busyMarkers: [String] = [],
         quickActions: [QuickActionDefinition] = []
     ) {
         self.id = id
@@ -50,6 +59,7 @@ public struct AgentProfile: Sendable, Equatable, Codable {
         self.detectionMarkers = detectionMarkers
         self.quietInterval = quietInterval
         self.burstThreshold = burstThreshold
+        self.busyMarkers = busyMarkers
         self.quickActions = quickActions
     }
 
@@ -61,7 +71,7 @@ public struct AgentProfile: Sendable, Equatable, Codable {
     // the JSON shape is obvious to anyone hand-writing a profile.
     enum CodingKeys: String, CodingKey {
         case id, displayName, detectionMarkers, quietIntervalMilliseconds
-        case burstThreshold, quickActions
+        case burstThreshold, busyMarkers, quickActions
     }
 
     public init(from decoder: any Decoder) throws {
@@ -76,6 +86,9 @@ public struct AgentProfile: Sendable, Equatable, Codable {
         ) ?? 2000
         quietInterval = .milliseconds(milliseconds)
         burstThreshold = try container.decodeIfPresent(Int.self, forKey: .burstThreshold) ?? 200
+        busyMarkers = try container.decodeIfPresent(
+            [String].self, forKey: .busyMarkers
+        ) ?? []
         quickActions = try container.decodeIfPresent(
             [QuickActionDefinition].self, forKey: .quickActions
         ) ?? []
@@ -88,6 +101,7 @@ public struct AgentProfile: Sendable, Equatable, Codable {
         try container.encode(detectionMarkers, forKey: .detectionMarkers)
         try container.encode(Int(quietInterval.milliseconds), forKey: .quietIntervalMilliseconds)
         try container.encode(burstThreshold, forKey: .burstThreshold)
+        try container.encode(busyMarkers, forKey: .busyMarkers)
         try container.encode(quickActions, forKey: .quickActions)
     }
 }
@@ -250,10 +264,33 @@ public struct AgentActivityMonitor: Sendable {
                 changes.actions = []
             }
         } else if status == .working {
-            status = .waiting
-            changes.status = .waiting
+            // Quiet is not waiting when the agent SAYS it is busy: a tool
+            // call that prints nothing for minutes — a build, a CI watch —
+            // leaves the busy marker on screen the whole time. Only a quiet
+            // window with the marker GONE reads as "waiting for a human".
+            if !tailShowsBusyMarker() {
+                status = .waiting
+                changes.status = .waiting
+            }
         }
         return changes
+    }
+
+    /// True when the detected profile's busy marker sits near the END of the
+    /// stream — the agent's own statement that it is mid-work, however quiet
+    /// the pty.
+    ///
+    /// Bounded to the last 512 stripped bytes, deliberately: the tail is a
+    /// byte buffer, not a screen, so text a redraw erased still lingers in
+    /// it. Checking the whole tail would keep reading "busy" long after the
+    /// agent stopped — the opposite lie. While actually working the marker
+    /// keeps re-printing (spinner frames), holding it near the end; when the
+    /// agent stops, its input prompt is what occupies the end instead.
+    private func tailShowsBusyMarker() -> Bool {
+        guard let profile = detected, !profile.busyMarkers.isEmpty else { return false }
+        let stripped = Self.stripANSI(String(decoding: promptTail, as: UTF8.self)).lowercased()
+        let window = String(stripped.suffix(512))
+        return profile.busyMarkers.contains { window.contains($0.lowercased()) }
     }
 
     /// Withdraws every offer and resets the burst window.
@@ -391,6 +428,8 @@ extension AgentProfile {
                 id: "claude-code",
                 displayName: "Claude Code",
                 detectionMarkers: ["esc to interrupt", "claude code"],
+                // On screen for the whole life of a tool call, however silent.
+                busyMarkers: ["esc to interrupt"],
                 quickActions: [
                     QuickActionDefinition(
                         id: "approve-once",
