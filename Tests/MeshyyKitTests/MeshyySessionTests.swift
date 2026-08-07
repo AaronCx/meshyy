@@ -166,6 +166,34 @@ extension MeshyyKitSuite {
             }
         }
 
+        @Test("An offer that outruns its status event still lands on an answerable palette")
+        func offerImpliesWaiting() async throws {
+            // Pure client-side: inject the frames in the racy order the wire
+            // can produce — actions BEFORE the waiting status — and require
+            // the gate to accept the tap anyway. The daemon only offers
+            // while waiting, so the offer is itself the evidence.
+            let session = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
+            _ = await session.handle(FrameEnvelope(
+                kind: .control,
+                payload: ControlFrame.quickActions([
+                    QuickAction(id: "approve-once", label: "Yes")
+                ]).encoded
+            ))
+            #expect(await session.isAwaitingInput,
+                    "a live offer with a refused gate is a dead button")
+            // And the resolution path accepts it (throws only if the gate or
+            // the table are wrong; there is no connection, so the send itself
+            // is what must NOT be reached — hence the expected send failure).
+            do {
+                try await session.performQuickAction(
+                    id: "approve-once", from: AgentProfile.defaults)
+            } catch let error as MeshyySession.QuickActionError {
+                Issue.record("the gate refused a live offer: \(error)")
+            } catch {
+                // Send failed on the nil connection — the gate PASSED.
+            }
+        }
+
         @Test("The heartbeat keeps ticking, counted in milliseconds not symptoms")
         func heartbeatTicksClimb() async throws {
             try await withHarness(child: .bytePipe) { daemon in

@@ -429,6 +429,17 @@ public actor MeshyySession {
             emit(.agent(kind: kind, agentID: agentID, detail: detail))
 
         case .quickActions(let actions):
+            // A non-empty offer IS evidence the agent is waiting: the daemon
+            // only offers while its monitor says waiting, and withdraws on any
+            // change. Deriving the status here closes an ordering race the
+            // gate below otherwise loses — an offer that arrives a frame
+            // before its status event produced a palette whose every tap was
+            // refused as "the agent is working": a dead button, from the
+            // user's chair. Withdrawal deliberately does NOT flip the status
+            // back; the status events own that.
+            if !actions.isEmpty {
+                agentStatus = .waiting
+            }
             emit(.quickActions(actions))
 
         case .bye(let reason, let exitStatus):
