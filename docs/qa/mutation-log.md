@@ -161,3 +161,27 @@ Stronger in both directions than the inequality, which would have waved through
 every defect that makes the offset read *low* — mutant B among them.
 
 Reverted after each run; `git diff` clean; full suite green at 142 tests.
+
+---
+
+## 2026-08-07 — daemon restart (audit PR 3)
+
+**Mutant: accept an unknown QUIC token as a fresh session.** In
+`SessionAttachment`'s `.bootstrapToken` authority, the redeem-failure path was
+replaced with `attachOrCreate(name: hello.session ?? "mutant")` — the daemon
+silently handing a fresh shell to a client whose token it has never seen,
+which is exactly what a client reconnecting across a daemon restart would
+receive as fake continuity.
+
+```
+RED -> "A restarted daemon refuses a stale QUIC token as unknown, not as an
+        empty session" — both expectations fire: no refusal observed, and
+        session bytes reached a client that should have received none.
+```
+
+The companion test pins the other half: re-bootstrapping a dead session's
+NAME after a restart may mint a new session, but its `sessionID` must differ —
+the id is the continuity claim a client can compare to turn "resuming" into
+"your session is gone; this is a new one."
+
+Reverted after the run; `git diff` clean; suite green.
