@@ -166,6 +166,41 @@ extension MeshyyKitSuite {
             }
         }
 
+        @Test("A withdrawn offer reaches the wire, not just the daemon's model")
+        func withdrawalReachesTheClient() async throws {
+            try await withHarness(child: .shell) { daemon in
+                let session = MeshyySession(size: TerminalSize(cols: 80, rows: 24))
+                let log = EventLog()
+                await log.attach(to: session)
+                let boot = try daemon.bootstrap(session: "withdraw")
+                try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
+
+                // The prompt the claude-code profile matches: marker + question.
+                try await session.send(Array(("printf 'claude code - esc to interrupt\\n"
+                    + "Do you want to make this edit?\\n 1. Yes\\n'\n").utf8))
+                #expect(await log.wait(timeout: 15) {
+                    log.all.contains {
+                        if case .quickActions(let a) = $0 { return !a.isEmpty }
+                        return false
+                    }
+                }, "the offer never arrived: \(log.summary)")
+
+                // The moment passes: flood the tail past the 2 KiB match window.
+                try await session.send(Array("seq 1 5000\n".utf8))
+                #expect(await log.wait(timeout: 15) {
+                    // An EMPTY offer arriving AFTER the non-empty one.
+                    var sawOffer = false
+                    for event in log.all {
+                        if case .quickActions(let a) = event {
+                            if !a.isEmpty { sawOffer = true }
+                            else if sawOffer { return true }
+                        }
+                    }
+                    return false
+                }, "the withdrawal never left the daemon: \(log.summary)")
+            }
+        }
+
         @Test("An offer that outruns its status event still lands on an answerable palette")
         func offerImpliesWaiting() async throws {
             // Pure client-side: inject the frames in the racy order the wire
