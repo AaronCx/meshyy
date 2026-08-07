@@ -90,40 +90,12 @@ public struct DaemonConfig: Sendable {
     /// The quick actions' `matches` are deliberately narrow: §7.4 warns that a
     /// loose match offers a button at the wrong moment, which is worse than
     /// offering none, so each requires the prompt text AND its specific option.
-    public static var defaultAgentProfiles: [AgentProfile] {
-        [
-            AgentProfile(
-                id: "claude-code",
-                displayName: "Claude Code",
-                detectionMarkers: ["esc to interrupt", "claude code"],
-                quickActions: [
-                    QuickActionDefinition(
-                        id: "approve-once",
-                        label: "Yes",
-                        matches: ["do you want", "1. yes"],
-                        sends: Array("1\r".utf8)
-                    ),
-                    QuickActionDefinition(
-                        id: "approve-always",
-                        label: "Yes, always",
-                        matches: ["do you want", "2. yes, and don't ask again"],
-                        sends: Array("2\r".utf8)
-                    ),
-                    QuickActionDefinition(
-                        id: "deny",
-                        label: "No",
-                        // The escape key is what Claude Code itself documents on
-                        // screen, so this is the same keystroke a user would send.
-                        matches: ["do you want", "no, and tell claude"],
-                        sends: Array("\u{1B}".utf8)
-                    ),
-                ]
-            ),
-            // Empty markers: the burst/quiet heuristic runs from the start and
-            // reports status for ANY agent, with no name claimed.
-            AgentProfile.generic,
-        ]
-    }
+    /// The canonical defaults moved to MeshyyCore (`AgentProfile.defaults`) so
+    /// the iOS client can resolve a tapped action id against the SAME table
+    /// that produced the offer — ids and bytes have one source of truth, and
+    /// the wire still never carries bytes. This alias keeps existing daemon
+    /// call sites and configs working unchanged.
+    public static var defaultAgentProfiles: [AgentProfile] { AgentProfile.defaults }
 
     public static var defaultShell: String {
         // The user's login shell, or sh. Read from the password database rather
