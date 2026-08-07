@@ -370,8 +370,13 @@ public final class MeshyyConnection: @unchecked Sendable {
     public func send(_ envelope: FrameEnvelope) throws {
         try queue.sync {
             guard group != nil, !closed else { throw ConnectionError.notConnected }
-            if streams[envelope.kind] == nil { try openStream(for: envelope.kind) }
-            guard let stream = streams[envelope.kind] ?? streams[.control] else {
+            // Routed by LANE, not by kind: control and pty share one stream so
+            // the wire preserves their relative order — keystrokes must not
+            // overtake a resize, and the daemon must see input in the order it
+            // was typed. See `ChannelKind.wireLane`.
+            let lane = envelope.kind.wireLane
+            if streams[lane] == nil { try openStream(for: lane) }
+            guard let stream = streams[lane] ?? streams[.control] else {
                 throw ConnectionError.notConnected
             }
             stream.send(content: Data(envelope.encoded), completion: .contentProcessed { _ in })

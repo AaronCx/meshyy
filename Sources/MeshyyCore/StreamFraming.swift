@@ -21,6 +21,27 @@ public enum ChannelKind: UInt8, Sendable, Equatable, CaseIterable {
     case pty = 1
     /// File and image attachments, client to server.
     case blob = 2
+
+    /// The QUIC stream a frame of this kind travels on.
+    ///
+    /// Control and PTY share ONE stream, deliberately. QUIC guarantees order
+    /// within a stream and none across streams, and the protocol's ordering
+    /// promises span the two kinds in both directions: a `modes`/`termios`
+    /// frame corrects the output around it (a frame that arrives before the
+    /// stale bytes it corrects is overtaken and the correction is silently
+    /// undone), and an inbound `resize` is ordered against keystrokes (the
+    /// daemon's work queue serialises them — which only means something if
+    /// the wire did not already reorder them). Splitting the kinds across
+    /// streams made every one of those an ordering bug waiting on packet
+    /// loss; a client under flow-control stall could even see NEW pty bytes
+    /// overtake OLD ones when the daemon switched output streams mid-session.
+    ///
+    /// Blobs keep their own stream: §5.2's point is that a bulk upload must
+    /// not head-of-line block the terminal, and nothing orders blobs against
+    /// pty bytes.
+    public var wireLane: ChannelKind {
+        self == .blob ? .blob : .control
+    }
 }
 
 /// One framed chunk on a byte-stream transport.
