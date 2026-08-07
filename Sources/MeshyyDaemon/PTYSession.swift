@@ -438,6 +438,16 @@ public actor PTYSession {
         continuation.yield(.termios(lastTermios))
         continuation.yield(.screenMode(alt: lastAltScreen))
         continuation.yield(.modes(active: buffer.activeModes))
+        // The agent status rides along too: a client attaching INTO a waiting
+        // agent (relaunch, auto-resume) otherwise gets the offer with a stale
+        // "working" gate and refuses its own palette.
+        if lastAgentStatus != .none {
+            continuation.yield(.agent(
+                kind: lastAgentStatus == .working ? .working : .waiting,
+                agentID: agentMonitor.detected?.id,
+                detail: agentMonitor.detected?.displayName
+            ))
+        }
         continuation.yield(.quickActions(agentMonitor.offeredActions.map(\.advertised)))
         if let exitStatus {
             continuation.yield(.exited(status: exitStatus))
