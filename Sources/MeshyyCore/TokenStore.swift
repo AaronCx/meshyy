@@ -12,6 +12,7 @@
 // deterministically instead of with sleeps.
 
 import Foundation
+import Security
 
 /// Issues and redeems bootstrap tokens.
 ///
@@ -61,10 +62,10 @@ public struct TokenStore: Sendable {
     public mutating func issue(
         sessionID: String,
         now: ContinuousClock.Instant,
-        randomBytes: (Int) -> [UInt8] = TokenStore.secureRandom
-    ) -> String {
+        randomBytes: (Int) throws -> [UInt8] = TokenStore.secureRandom
+    ) rethrows -> String {
         sweepExpired(now: now)
-        let token = Self.encode(randomBytes(Self.tokenBytes))
+        let token = Self.encode(try randomBytes(Self.tokenBytes))
         issued[token] = Issued(sessionID: sessionID, expiresAt: now.advanced(by: ttl))
         return token
     }
@@ -127,16 +128,32 @@ public struct TokenStore: Sendable {
 
     /// A fresh base64url secret of `bytes` length. Used for tokens and for the
     /// daemon keychain's password, which wants the same properties.
-    public static func randomSecret(bytes: Int = TokenStore.tokenBytes) -> String {
-        encode(secureRandom(bytes))
+    public static func randomSecret(bytes: Int = TokenStore.tokenBytes) throws -> String {
+        encode(try secureRandom(bytes))
     }
 
-    public static func secureRandom(_ count: Int) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: count)
-        var generator = SystemRandomNumberGenerator()
-        for index in bytes.indices {
-            bytes[index] = UInt8.random(in: 0...255, using: &generator)
+    /// The CSPRNG refused. Thrown rather than swallowed: token minting has no
+    /// meaningful degraded mode, and a partially filled buffer presented as
+    /// entropy is strictly worse than a loud failure.
+    public struct EntropyUnavailable: Error, CustomStringConvertible {
+        public let status: Int32
+        public var description: String {
+            "SecRandomCopyBytes failed (\(status)); refusing to mint from a partial buffer"
         }
+    }
+
+    /// `SecRandomCopyBytes`, not `UInt8.random(in:using:)`. The loop it
+    /// replaces was CORRECT — SystemRandomNumberGenerator is CSPRNG-backed on
+    /// Apple platforms — but a reviewer skimming an auth path sees a loop of
+    /// `random(in:)` and has to stop and reason about it. The system call
+    /// states the intent in its name, and a non-zero status throws rather
+    /// than returning a partially filled buffer as if it were entropy. The
+    /// injectable `randomBytes` parameter is kept — determinism in tests is
+    /// worth more than this swap.
+    public static func secureRandom(_ count: Int) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let status = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        guard status == errSecSuccess else { throw EntropyUnavailable(status: status) }
         return bytes
     }
 
