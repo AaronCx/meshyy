@@ -1,5 +1,7 @@
 # meshyy
 
+[![CI](https://github.com/AaronCx/meshyy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AaronCx/meshyy/actions/workflows/ci.yml)
+
 A resumable, roaming-tolerant terminal transport for
 [a+Terminal](https://github.com/AaronCx/a-plus-terminal).
 
