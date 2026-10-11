@@ -741,10 +741,14 @@ extension MeshyyKitSuite {
         /// compared, and each seed costs a fresh attach plus a live re-arm.
         private static let tmuxSeeds: [UInt64] = Array(1...10)
 
-        /// The relay for the ordering loops: 30 ms each way, and half the
-        /// datagrams held back until the next one overtakes them.
+        /// The relay for the ordering loops: 30 ms each way plus up to 40 ms of
+        /// independent per-datagram jitter, and half the datagrams held back
+        /// until the next one overtakes them. The jitter is what matters: a
+        /// held datagram is released microseconds behind the one that passed
+        /// it, which no far-side reader can resolve, while jitter lets a later
+        /// datagram arrive tens of milliseconds earlier.
         private static func reordering(_ seed: UInt64) -> ChaosProfile {
-            ChaosProfile(delay: .milliseconds(30), reorder: 0.5, seed: seed)
+            ChaosProfile(delay: .milliseconds(30), jitter: .milliseconds(40), reorder: 0.5, seed: seed)
         }
 
         /// The gap between the keyboard-dismiss resize and the swipe, 0-10 ms,
