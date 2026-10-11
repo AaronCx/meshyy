@@ -927,3 +927,29 @@ ordered control stream.
 
 **Consulted.** RFC 9000 (stream ordering); Network framework NWConnectionGroup
 docs. No mosh material.
+
+## 2026-10-11 — A debug-gated mode trace, and a pong-inclusive inbound clock
+
+**Decision.** `meshyyd serve --trace-modes` (or `MESHYY_TRACE_MODES=1`) records,
+per session, every drain in which the pty output set or reset a tracked DEC mode,
+every alternate-screen change, and what each attaching client was told — as a
+memory-only ring of the last 500 entries (`meshyyd list --json` → `mode_trace`)
+and as one stderr line each. Every `list --json` row also carries the current
+`modes`. On the client, `MeshyySession.lastInboundFrameAt` is stamped on arrival
+of every frame, heartbeat pongs included, and is readable synchronously.
+
+**Why.** a+Terminal's scroll was reported broken under meshyy four times, and
+each "fix" was verified only against a theory. The phone now records what its
+emulator believed at each swipe; this records what the far side actually armed,
+in wall-clock time, so the two can be lined up after the fact instead of guessed
+at. An entry flags `transient_mouse_off` when its drain disarmed the mouse on the
+way to its final state — tmux's redraw pulse — because a pulse split across two
+reads is a window a swipe can land in. The inbound clock counts pongs because an
+idle healthy session produces no events at all, so an events-only clock cannot
+tell it from a silently dead path in the 3–4 s before the heartbeat says so.
+
+**Privacy.** Mode numbers, a screen flag, byte offsets and times — never pty
+content (design doc §9: logs opt-in, local, content redacted). Off by default.
+
+**Consulted.** xterm ctlseqs (DEC private modes 1000/1002/1003/1006); Swift
+`Synchronization.Mutex` docs. No mosh material.
