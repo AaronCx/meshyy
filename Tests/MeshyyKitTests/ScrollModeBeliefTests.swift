@@ -411,6 +411,13 @@ extension MeshyyKitSuite {
                 await session.shutdown()
             }
         }
+    }
+
+    /// No tmux, no network: the hand-fed client ordering check. Its own suite so
+    /// the tmux capability gate above cannot skip it — it ran nowhere in CI while
+    /// it sat inside that suite.
+    @Suite("Scroll-mode belief: client-side ordering")
+    struct ScrollClientOrderingTests {
 
         @Test("Client-side ordering: modes never reorder against the output around them")
         func clientOrderingIsPreserved() async throws {
