@@ -216,10 +216,16 @@ struct SwipeRecord: CustomStringConvertible {
     let bytes: Int
     let outcome: ScrollOutcome
     let sendError: String?
+    /// Scrollback lines above the screen when the swipe was sent.
+    let history: Int
+    /// Seconds from the send until tmux first showed any effect; nil if it
+    /// never did (or nothing was sent).
+    let landedAfter: TimeInterval?
 
     var description: String {
         "\(side)[\(step)] belief{\(belief)} route=\(route.rawValue) row=\(row) "
-            + "sent=\(bytes)B \(outcome)" + (sendError.map { " SEND-ERROR \($0)" } ?? "")
+            + "sent=\(bytes)B hist=\(history) landed=\(landedAfter.map { "\(Int($0 * 1000))ms" } ?? "never") "
+            + "\(outcome)" + (sendError.map { " SEND-ERROR \($0)" } ?? "")
     }
 }
 
@@ -345,19 +351,33 @@ extension EmulatorBelief {
     var summary: String { "mouse=\(mouseOn ? 1 : 0) alt=\(alt ? 1 : 0) ckm=\(applicationCursor ? 1 : 0)" }
 }
 
-/// Performs one swipe on `side` exactly as a+Terminal would — route from the
-/// belief at this instant, bytes from the replica — and waits for tmux's
-/// verdict to stop changing.
-func swipe(
+/// One swipe's emission: what the belief said and what went out.
+struct SentSwipe {
+    let belief: EmulatorBelief
+    let route: AppScrollBridge.Route
+    let row: Int
+    let bytes: [UInt8]
+    let offset: Int
+    let history: Int
+    let sentAt: Date
+    let sendError: String?
+}
+
+/// Routes and sends one swipe on `side` exactly as a+Terminal would — route
+/// from the belief at this instant, bytes from the replica — without waiting
+/// for tmux. Fails the test if the pane has nothing to scroll back to, since a
+/// swipe over an empty history cannot show a scroll whatever the transport.
+func emitSwipe(
     _ side: SwipeSide,
-    step: String,
     on bench: OracleBench,
     ticks: Int = 3,
     row requestedRow: Int? = nil,
-    settle: TimeInterval = 0.5,
-    timeout: TimeInterval = 6,
-    until done: ((ScrollOutcome) -> Bool)? = nil
-) async -> SwipeRecord {
+    sourceLocation: SourceLocation = #_sourceLocation
+) async -> SentSwipe {
+    let history = bench.tmux.historySize()
+    #expect(history >= 5 * ticks,
+            "\(side.name): the pane has \(history) lines of scrollback — too few for a swipe to show a scroll",
+            sourceLocation: sourceLocation)
     let belief = side.belief()
     let rows = side.rows()
     // The view is `rows` cells of 20 pt; an unspecified swipe is mid-screen.
@@ -367,32 +387,74 @@ func swipe(
     let bytes = AppScrollBridge.bytes(route, up: true, ticks: ticks, col: 40, row: row,
                                       applicationCursor: belief.applicationCursor)
     let offset = bench.transcriptCount
+    let sentAt = Date()
     var sendError: String?
     do {
         if !bytes.isEmpty { try await side.deliver(bytes) }
     } catch {
         sendError = "\(error)"
     }
+    return SentSwipe(belief: belief, route: route, row: row, bytes: bytes, offset: offset,
+                     history: history, sentAt: sentAt, sendError: sendError)
+}
 
-    // Settled = unchanged for `settle` seconds (or `done` holds), bounded.
-    let began = Date()
-    var last = bench.outcome(since: offset)
+/// Waits for tmux's verdict on `sent` and records it.
+///
+/// Bytes take time to land, so "nothing happened" is only concluded after a
+/// full `timeout` with no change at all; once anything changes, the verdict is
+/// the state once it has been still for `settle` (or as soon as `done` holds).
+/// A native swipe sends nothing, so there it is still for `quiet` and done.
+func verdict(
+    _ sent: SentSwipe,
+    side: SwipeSide,
+    step: String,
+    on bench: OracleBench,
+    settle: TimeInterval = 0.5,
+    quiet: TimeInterval = 1.0,
+    timeout: TimeInterval = 6,
+    until done: ((ScrollOutcome) -> Bool)? = nil
+) async -> SwipeRecord {
+    let baseline = ScrollOutcome(inMode: 0, scrollPosition: nil, received: "")
+    var last = bench.outcome(since: sent.offset)
+    var landedAt: Date? = last == baseline ? nil : Date()
     var lastChange = Date()
-    while Date().timeIntervalSince(began) < timeout {
-        try? await Task.sleep(for: .milliseconds(50))
-        let now = bench.outcome(since: offset)
+    while Date().timeIntervalSince(sent.sentAt) < timeout {
+        if let done, done(last) { break }
+        let stillFor = Date().timeIntervalSince(lastChange)
+        if done == nil {
+            if landedAt != nil, stillFor >= settle { break }
+            if sent.bytes.isEmpty, stillFor >= quiet { break }
+        }
+        try? await Task.sleep(for: .milliseconds(25))
+        let now = bench.outcome(since: sent.offset)
         if now != last {
             last = now
             lastChange = Date()
-        }
-        if let done, done(now) { break }
-        if done == nil, Date().timeIntervalSince(lastChange) >= settle,
-           Date().timeIntervalSince(began) >= settle {
-            break
+            if landedAt == nil, now != baseline { landedAt = Date() }
         }
     }
-    return SwipeRecord(side: side.name, step: step, belief: belief.summary, route: route,
-                       row: row, bytes: bytes.count, outcome: last, sendError: sendError)
+    return SwipeRecord(side: side.name, step: step, belief: sent.belief.summary, route: sent.route,
+                       row: sent.row, bytes: sent.bytes.count, outcome: last, sendError: sent.sendError,
+                       history: sent.history,
+                       landedAfter: landedAt.map { $0.timeIntervalSince(sent.sentAt) })
+}
+
+/// One swipe, sent and judged by tmux.
+func swipe(
+    _ side: SwipeSide,
+    step: String,
+    on bench: OracleBench,
+    ticks: Int = 3,
+    row requestedRow: Int? = nil,
+    settle: TimeInterval = 0.5,
+    timeout: TimeInterval = 6,
+    until done: ((ScrollOutcome) -> Bool)? = nil,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async -> SwipeRecord {
+    let sent = await emitSwipe(side, on: bench, ticks: ticks, row: requestedRow,
+                               sourceLocation: sourceLocation)
+    return await verdict(sent, side: side, step: step, on: bench, settle: settle,
+                         timeout: timeout, until: done)
 }
 
 /// Out of copy mode and confirmed out, so the next swipe starts from zero.
@@ -487,7 +549,8 @@ extension MeshyyKitSuite {
         private func report(_ oracle: SwipeRecord, _ subject: SwipeRecord, relay: ChaosUDPProxy?,
                             note: String = "") {
             print("MEASURE scrollOracle \(subject.step): ssh \(oracle.outcome) via \(oracle.route.rawValue) | "
-                  + "meshyy \(subject.outcome) via \(subject.route.rawValue) belief{\(subject.belief)}"
+                  + "meshyy \(subject.outcome) via \(subject.route.rawValue) belief{\(subject.belief)} "
+                  + "landed=\(subject.landedAfter.map { "\(Int($0 * 1000))ms" } ?? "never") hist=\(subject.history)"
                   + (note.isEmpty ? "" : " \(note)")
                   + (relay.map { " relay{\($0.snapshot().summary)}" } ?? ""))
         }
@@ -553,7 +616,7 @@ extension MeshyyKitSuite {
                 // the file header. Swiping into that race measures tmux.)
                 let keyboardOracle = try await openOracle(bench)
                 var oracleCycles: [SwipeRecord] = []
-                for flip in 0..<4 {
+                for flip in 0..<Self.keyboardFlips {
                     let size = flip % 2 == 0 ? Self.short : Self.tall
                     await resetScroll(bench)
                     try keyboardOracle.resize(to: size)
@@ -564,7 +627,7 @@ extension MeshyyKitSuite {
                 keyboardOracle.close()
 
                 try await attachTmux(subject, bench)
-                for flip in 0..<4 {
+                for flip in 0..<Self.keyboardFlips {
                     let size = flip % 2 == 0 ? Self.short : Self.tall
                     await resetScroll(bench)
                     try await subject.resize(size)
@@ -591,12 +654,16 @@ extension MeshyyKitSuite {
                 // 4. Reconnect in the middle of an output burst.
                 let burst = "i=0; while [ $i -lt 120 ]; do clear; seq $i $((i+40)); "
                     + "sleep 0.01; i=$((i+1)); done; seq 1 400; " + bench.transcriber
+                // Both legs drop 0.5 s into the burst and are back 0.3 s later,
+                // while it is still repainting; `midBurst` proves that held.
                 let burstOracle = try await openOracle(bench)
                 bench.paneRun(burst)
                 try await Task.sleep(for: .milliseconds(500))
                 burstOracle.close()
-                #expect(await bench.waitForTranscriber(), "the burst never finished (ssh leg)")
+                try await Task.sleep(for: .milliseconds(300))
+                let oracleMidBurst = bench.paneCommand() != "dd"
                 let reOracle = try await openOracle(bench)
+                #expect(await bench.waitForTranscriber(), "the burst never finished (ssh leg)")
                 await resetScroll(bench)
                 let burstOracleRecord = await swipe(reOracle.side, step: "\(variant) reconnect-mid-burst", on: bench)
                 reOracle.close()
@@ -605,40 +672,141 @@ extension MeshyyKitSuite {
                 bench.paneRun(burst)
                 try await Task.sleep(for: .milliseconds(500))
                 await subject.session.detach(reason: "suspended mid-burst")
-                #expect(await bench.waitForTranscriber(), "the burst never finished (meshyy leg)")
+                try await Task.sleep(for: .milliseconds(300))
+                let subjectMidBurst = bench.paneCommand() != "dd"
                 try await subject.attach(daemon, name: "oracle", relayPort: relayPort)
+                #expect(await bench.waitForTranscriber(), "the burst never finished (meshyy leg)")
                 await Self.settle(subject, mouse: mouse)
                 await resetScroll(bench)
                 let burstSubject = await swipe(subject.side, step: "\(variant) reconnect-mid-burst", on: bench)
-                report(burstOracleRecord, burstSubject, relay: relay)
+                #expect(oracleMidBurst && subjectMidBurst,
+                        "a reconnect landed after the burst had finished, so this step tested an idle resume")
+                report(burstOracleRecord, burstSubject, relay: relay,
+                       note: "midBurst ssh=\(oracleMidBurst) meshyy=\(subjectMidBurst)")
                 // Same emulator across the reconnect (the app keeps its terminal
                 // view), so it keeps the alt belief it saw live: no known issue.
                 judge(burstOracleRecord, burstSubject, bench: bench, relay: relay)
 
-                // 5. Path drop: the relay goes deaf both ways for 4 s and a
-                // swipe lands 0.5 s into it. The oracle is step 1's outcome;
-                // the record says whether the bytes arrived late, were lost,
-                // or errored.
-                try await attachTmux(subject, bench)
-                await resetScroll(bench)
-                let hole = Date()
-                relay.blackHole(.both, for: .seconds(4))
-                try await Task.sleep(for: .milliseconds(500))
-                let dropped = await swipe(subject.side, step: "\(variant) path-drop", on: bench,
-                                          timeout: 20, until: { bench.isCorrectScroll($0) })
-                let landedAfter = Date().timeIntervalSince(hole)
-                let fate: String
-                if let error = dropped.sendError {
-                    fate = "errored (\(error))"
-                } else if bench.isCorrectScroll(dropped.outcome) {
-                    fate = "delivered late, \(Int(landedAfter * 1000))ms after the hole opened"
-                } else {
-                    fate = "lost"
+                // 5. Path drop: the relay goes deaf both ways and a swipe is
+                // sent 0.5 s into it. ssh is the oracle (step 1's outcome):
+                // over TCP a stalled path only delays bytes, in order. The
+                // heartbeat declares the path dead after 3 missed 1 s probes,
+                // inside the hole, so what happens to the swipe depends on who
+                // acts on that verdict and whether the old path ever returns:
+                //   heal          4 s hole, the library alone: nobody redials,
+                //                 the connection rides out the hole;
+                //   heal-redial   4 s hole, handled as a+Terminal does today:
+                //                 `.failed` ends its transport and it redials
+                //                 with a fresh emulator (establish() resets the
+                //                 terminal) on the same path;
+                //   path-change   the old path never returns (a Wi-Fi to
+                //                 cellular move without connection migration):
+                //                 same app handling, the redial goes out over
+                //                 a second relay — the new path.
+                // Each MEASURE line records whether the swipe was delivered
+                // late, lost, or errored, with the PR A trace fields at the
+                // instant it was sent. path-change is last: it kills `relay`.
+                for leg in PathLeg.allCases {
+                    let step = "\(variant) path-drop-\(leg.rawValue)"
+                    try await attachTmux(subject, bench)
+                    await resetScroll(bench)
+                    let oldLog = subject.log
+                    let failuresBefore = Self.failures(oldLog)
+                    let hole = Date()
+                    if leg == .pathChange {
+                        relay.halfOpen(.both)
+                    } else {
+                        relay.blackHole(.both, for: .seconds(4))
+                    }
+                    try await Task.sleep(for: .milliseconds(500))
+                    let inboundAge = subject.session.lastInboundFrameAt.map { Date().timeIntervalSince($0) }
+                    let sent = await emitSwipe(subject.side, on: bench)
+
+                    var redial = "none"
+                    var newPath: ChaosUDPProxy?
+                    if leg != .heal {
+                        // Act on `.failed` the way the app's pump does, if it
+                        // comes before the swipe has landed.
+                        let quiet = ScrollOutcome(inMode: 0, scrollPosition: nil, received: "")
+                        await poll(timeout: 8) {
+                            Self.failures(oldLog) > failuresBefore || bench.outcome(since: sent.offset) != quiet
+                        }
+                        if Self.failures(oldLog) > failuresBefore {
+                            let failedAt = Date().timeIntervalSince(hole)
+                            await subject.session.shutdown(reason: "app: transport failed, redialling")
+                            var dialPort = relayPort
+                            if leg == .pathChange {
+                                let fresh = ChaosUDPProxy(targetHost: "127.0.0.1", targetPort: daemon.quicPort,
+                                                          profile: ChaosProfile(seed: 13))
+                                dialPort = try fresh.start()
+                                newPath = fresh
+                            }
+                            var attempts = 0
+                            var recovered: SubjectClient?
+                            while recovered == nil, Date().timeIntervalSince(hole) < 25 {
+                                attempts += 1
+                                let candidate = await SubjectClient()
+                                do {
+                                    // MeshyyTransport attaches with a 4 s timeout.
+                                    var bootstrap = try daemon.bootstrap(session: "oracle")
+                                    bootstrap.port = dialPort
+                                    try await candidate.session.attach(bootstrap: bootstrap, sshHost: "127.0.0.1",
+                                                                       timeout: .seconds(4))
+                                    recovered = candidate
+                                } catch {
+                                    await candidate.session.shutdown()
+                                }
+                            }
+                            #expect(recovered != nil, "\(step): the app-style redial never came back")
+                            if let recovered {
+                                subject = recovered
+                                await Self.settle(recovered, mouse: mouse)
+                            }
+                            redial = "failed@\(Int(failedAt * 1000))ms redialled@"
+                                + "\(Int(Date().timeIntervalSince(hole) * 1000))ms attempts=\(attempts)"
+                        }
+                    }
+
+                    let dropped = await verdict(sent, side: subject.side, step: step, on: bench,
+                                                timeout: 20, until: { bench.isCorrectScroll($0) })
+                    let fate: String
+                    if let error = dropped.sendError {
+                        fate = "errored (\(error))"
+                    } else if bench.isCorrectScroll(dropped.outcome), let landed = dropped.landedAfter {
+                        fate = "delivered late, \(Int((landed + 0.5) * 1000))ms after the hole opened"
+                    } else if dropped.landedAfter == nil {
+                        fate = "lost"
+                    } else {
+                        fate = "garbled"
+                    }
+                    report(attachOracle, dropped, relay: newPath ?? relay,
+                           note: "fate=\(fate) inboundAgeAtSwipe=\(inboundAge.map { "\(Int($0 * 1000))ms" } ?? "nil") "
+                               + "failedEvents=\(Self.failures(oldLog) - failuresBefore) redial=\(redial) "
+                               + "oldEvents{\(oldLog.summary.suffix(160))}")
+                    // A swipe written into a path that never returns dies with
+                    // the connection the app abandons: the deferred path-change
+                    // divergence. Every other leg must match the oracle outright.
+                    judge(attachOracle, dropped, bench: bench, relay: newPath ?? relay,
+                          knownIssue: leg == .pathChange ? Self.pathChangeIssue : nil)
+                    if leg == .heal {
+                        #expect((dropped.landedAfter ?? .infinity) < 15,
+                                "the swipe took \(dropped.landedAfter ?? -1)s to land after a 4s hole")
+                    }
+
+                    // The next swipe, once recovered. After a redial this is a
+                    // fresh emulator, so with tmux mouse off the screenMode
+                    // divergence applies.
+                    try await Task.sleep(for: .seconds(1))
+                    await resetScroll(bench)
+                    let after = await swipe(subject.side, step: "\(step)-after", on: bench)
+                    report(attachOracle, after, relay: newPath ?? relay)
+                    judge(attachOracle, after, bench: bench, relay: newPath ?? relay,
+                          knownIssue: redial != "none" && !mouse ? Self.screenModeIssue : nil)
+                    if let newPath {
+                        await subject.session.shutdown()
+                        newPath.stop()
+                    }
                 }
-                report(attachOracle, dropped, relay: relay,
-                       note: "fate=\(fate) events{\(subject.log.summary.suffix(160))}")
-                judge(attachOracle, dropped, bench: bench, relay: relay)
-                #expect(landedAfter < 15, "the swipe took \(landedAfter)s to land after a 4s hole")
 
                 await subject.session.shutdown()
             }
@@ -723,6 +891,33 @@ extension MeshyyKitSuite {
                 return Date().timeIntervalSince(last.at) > 0.3
             }
         }
+
+        /// The deferred path-change divergence: input written into a
+        /// connection the app then abandons is not carried to the redial.
+        private static let pathChangeIssue = """
+            a+Terminal ends its meshyy transport on .failed (heartbeat lost, \
+            3 missed probes) and redials with no connection migration; a swipe \
+            sent into a path that never returns dies with the old connection. \
+            The oracle here is the intended outcome (the swipe scrolls), not \
+            literal ssh, whose TCP connection would not survive a path change \
+            at all — \
+            deferred, see docs/qa/scroll-divergence-audit.md in a+Terminal
+            """
+
+        /// The path-drop legs, in the order they run (see step 5).
+        enum PathLeg: String, CaseIterable {
+            case heal
+            case healRedial = "heal-redial"
+            case pathChange = "path-change"
+        }
+
+        /// How many `.failed` events a log holds.
+        private static func failures(_ log: BeliefLog) -> Int {
+            log.all.filter { if case .failed = $0.event { true } else { false } }.count
+        }
+
+        /// Keyboard show/hide flips: five full cycles.
+        private static let keyboardFlips = 10
 
         /// The deferred `.screenMode` divergence, named where it bites.
         private static let screenModeIssue = """

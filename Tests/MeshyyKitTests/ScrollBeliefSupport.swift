@@ -311,6 +311,14 @@ struct ScrollTmux {
         return (inMode, position)
     }
 
+    /// Lines of scrollback above the visible screen. A swipe can only scroll
+    /// if there is something to scroll to, so the oracle suite checks this
+    /// before every swipe rather than assuming the seed survived.
+    func historySize() -> Int {
+        let raw = run(["display", "-p", "-t", "p", "#{history_size}"]) ?? ""
+        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
+    }
+
     /// Heights of every attached client, as tmux sizes them.
     func clientHeights() -> [Int] {
         (run(["list-clients", "-F", "#{client_height}"]) ?? "")
