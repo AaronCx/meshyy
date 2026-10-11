@@ -46,6 +46,12 @@ jobs:
         run: swift --version && xcodebuild -version
       - name: Build
         run: swift build
+      - name: Install tmux
+        # The tmux-driven suites (scroll-mode belief, tmux resize) skip without a
+        # tmux binary, and the runner image has none, so they ran nowhere on merge.
+        # The SSH-oracle suite still skips here — no probe key or sshd on a runner —
+        # and says so in its skip reason.
+        run: brew install tmux && tmux -V
       - name: Test
         # Runs everything, including the PTY, socket and QUIC suites. They were
         # gated until 1b-zero; the fix was to stop asserting on a real interactive
