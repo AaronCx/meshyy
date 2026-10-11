@@ -31,6 +31,10 @@ struct ModeTraceTests {
     /// pulse that disarms and re-arms inside ONE write. The pulse must be visible
     /// (transient_mouse_off) even though the set it ends on is unchanged — a pulse
     /// split across two reads is exactly where a phone's swipe can find the mouse off.
+    ///
+    /// Each step waits for the previous one to be recorded before the next is
+    /// released (the child blocks on `read`). Sleeps were not enough: on a loaded CI
+    /// runner all three writes landed in one drain and the steps blurred into one.
     @Test("Arming, the alt screen, a redraw pulse and an attach are all recorded")
     func recordsTransitions() async throws {
         let lines = Mutex<[String]>([])
@@ -38,8 +42,9 @@ struct ModeTraceTests {
             name: "trace-modes",
             executable: "/bin/sh",
             arguments: ["-c", """
-                printf '\\033[?1000;1006h'; sleep 0.4
-                printf '\\033[?1049h'; sleep 0.4
+                stty -echo
+                printf '\\033[?1000;1006h'; read step
+                printf '\\033[?1049h'; read step
                 printf '\\033[?1006l\\033[?1000l\\033[?1006h\\033[?1000h'; sleep 30
                 """],
             environment: ["PATH": "/usr/bin:/bin"],
@@ -49,25 +54,39 @@ struct ModeTraceTests {
         await session.start()
         defer { Task { await session.close() } }
 
-        var trace: [ModeTraceEntry] = []
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
-            trace = await session.info.modeTrace ?? []
-            if trace.contains(where: { $0.source == .pty && $0.transientMouseOff }) { break }
-            try await Task.sleep(for: .milliseconds(50))
+        func waitForTrace(
+            _ what: String,
+            until done: ([ModeTraceEntry]) -> Bool
+        ) async throws -> [ModeTraceEntry] {
+            var trace: [ModeTraceEntry] = []
+            let deadline = Date().addingTimeInterval(20)
+            while Date() < deadline {
+                trace = await session.info.modeTrace ?? []
+                if done(trace) { return trace }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            Issue.record("never recorded \(what): \(trace)")
+            return trace
         }
 
+        var trace = try await waitForTrace("the arming") { $0.contains { $0.source == .pty } }
+        try await session.send(Array("\n".utf8))
+        trace = try await waitForTrace("the alt screen") { $0.contains { $0.source == .alt } }
+        try await session.send(Array("\n".utf8))
+        trace = try await waitForTrace("the pulse") { $0.filter { $0.source == .pty }.count >= 2 }
+
         let pty = trace.filter { $0.source == .pty }
-        #expect(pty.first?.modes == [1000, 1006] && pty.first?.transientMouseOff == false,
+        #expect(pty.first?.modes == [1000, 1006] && pty.first?.transientMouseOff == false
+                && pty.first?.flips == 2,
                 "the first arming was not recorded as a clean arm: \(trace)")
         #expect(trace.contains { $0.source == .alt && $0.altScreen },
                 "entering the alt screen was not recorded: \(trace)")
         let pulse = pty.last
-        #expect(pulse?.transientMouseOff == true && pulse?.flips == 4
+        #expect(pty.count == 2 && pulse?.transientMouseOff == true && pulse?.flips == 4
                 && pulse?.modes == [1000, 1006] && pulse?.altScreen == true,
                 "a disarm/re-arm pulse must be recorded as transient, ending armed: \(trace)")
         // Wall-clock, so it can be lined up against a phone's record.
-        #expect(trace.allSatisfy { abs($0.at.timeIntervalSinceNow) < 30 })
+        #expect(trace.allSatisfy { abs($0.at.timeIntervalSinceNow) < 60 })
 
         let (_, _, token) = await session.attach(resumeFrom: nil)
         let afterAttach = await session.info.modeTrace ?? []
