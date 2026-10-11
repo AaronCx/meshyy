@@ -88,3 +88,11 @@ process does, so an immediate check reports a healthy daemon as missing.
 - When you add a CI gate, plant a violation and confirm it fails. The privacy
   gate shipped once as a regex that silently ate the `//` in `https://` and
   passed vacuously; `scripts/check-privacy.py` is a real scanner because of it.
+
+## "Fixed" means Aaron confirmed it on a device
+
+Never report a user-visible bug as fixed, resolved or "gone" on the strength of
+tests, the simulator or CI. Those prove the theory you tested, not the bug he
+hit. Until Aaron confirms on a named TestFlight build, the status is:
+"fixed in harness, unconfirmed on device (build N)". Every report names the
+build number and what he should try.

@@ -42,7 +42,9 @@ enum MeshyydCLI {
                 socketPath: socketPath,
                 shell: option("shell"),
                 buffer: option("buffer").flatMap(Int.init),
-                allInterfaces: arguments.contains("--all-interfaces")
+                allInterfaces: arguments.contains("--all-interfaces"),
+                traceModes: arguments.contains("--trace-modes")
+                    || ProcessInfo.processInfo.environment["MESHYY_TRACE_MODES"] == "1"
             )
         case "attach":
             // Design doc §5.1 step 2: the client runs
@@ -92,6 +94,7 @@ enum MeshyydCLI {
                 meshyyd \(Meshyy.version)
 
                   serve     [--socket PATH] [--shell PATH] [--buffer BYTES] [--all-interfaces]
+                            [--trace-modes]
                   attach    [--session NAME | --new-in-group PREFIX] [--socket PATH] [--json]
                   bootstrap [--session NAME | --new-in-group PREFIX] [--socket PATH]
                   list      [--socket PATH] [--json]
@@ -120,12 +123,14 @@ enum MeshyydCLI {
         socketPath: String,
         shell: String?,
         buffer: Int?,
-        allInterfaces: Bool
+        allInterfaces: Bool,
+        traceModes: Bool
     ) async {
         var config = DaemonConfig()
         if let shell { config.shell = shell }
         if let buffer { config.bufferCapacity = buffer }
         config.bindAllInterfaces = allInterfaces
+        config.traceModes = traceModes
 
         // Design doc §9: meshyy ships NO endpoint. Notifications exist only if the
         // user wrote ~/.meshyy/notify.json.
@@ -168,6 +173,8 @@ enum MeshyydCLI {
         print("shell: \(config.shell) \(config.shellArguments.joined(separator: " "))")
         print("ring buffer: \(config.bufferCapacity) bytes per session")
         print("agents: \(config.agentProfiles.map(\.id).joined(separator: ", "))")
+        // Mode numbers and timestamps only; see ModeTrace.swift.
+        print("mode trace: \(config.traceModes ? "on (stderr + list --json)" : "off")")
         // The endpoint itself is never printed: it may carry a token in its path or
         // headers, and design doc §9 keeps secrets out of logs.
         print("notifications: \(notifyConfig == nil ? "off (no ~/.meshyy/notify.json)" : "configured")")

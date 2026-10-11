@@ -54,6 +54,13 @@ public struct SessionInfo: Sendable, Equatable {
     public var clientQuietFor: TimeInterval?
     /// When the PTY last produced output. Nil for a session that has said nothing.
     public var lastOutputAt: Date?
+    /// The tracked DEC private modes the pty output currently has set, sorted —
+    /// what tmux (or whatever runs) has armed on the terminal, as the daemon parsed
+    /// it. Mode numbers only, never content.
+    public var activeModes: [Int] = []
+    /// Recent mode observations, oldest first, when the daemon runs with
+    /// `--trace-modes`; nil otherwise.
+    public var modeTrace: [ModeTraceEntry]?
 }
 
 /// A PTY, the replay buffer behind it, and the watchers design doc §7.1 needs.
@@ -113,6 +120,12 @@ public actor PTYSession {
     private var clientTokens: [UUID: Date] = [:]
     private let createdAt = Date()
     private var lastOutputAt: Date?
+    /// Debug-gated record of mode transitions (see ModeTrace.swift). Nil when off,
+    /// so an untraced daemon pays nothing for it.
+    private var modeTrace: ModeTraceLog?
+    /// Writes each trace entry as a stderr line too, so the record outlives the
+    /// daemon process. Injected so tests can capture lines instead.
+    private let modeTraceSink: (@Sendable (String) -> Void)?
 
     /// Design doc §7.1: poll termios at 50ms while a prediction is outstanding,
     /// 500ms otherwise. The daemon does not know about outstanding predictions,
@@ -131,9 +144,13 @@ public actor PTYSession {
         size: TerminalSize = .default,
         bufferCapacity: Int = RingBuffer.defaultCapacity,
         agentProfiles: [AgentProfile] = [],
-        rawMode: Bool = false
+        rawMode: Bool = false,
+        traceModes: Bool = false,
+        modeTraceSink: (@Sendable (String) -> Void)? = nil
     ) throws {
         self.agentMonitor = AgentActivityMonitor(candidates: agentProfiles)
+        self.modeTrace = traceModes ? ModeTraceLog() : nil
+        self.modeTraceSink = traceModes ? modeTraceSink : nil
         self.name = name
         self.sessionID = Self.makeSessionID()
         self.size = size
@@ -359,6 +376,8 @@ public actor PTYSession {
     private func ingest(chunks: [[UInt8]], reachedEOF: Bool) {
         if !chunks.isEmpty { lastOutputAt = Date() }
         var modesChanged = false
+        var modeFlips = 0
+        var transientMouseOff = false
         for chunk in chunks {
             let offset = buffer.totalWritten
             let events = buffer.write(chunk)
@@ -372,6 +391,7 @@ public actor PTYSession {
                     if active != lastAltScreen {
                         lastAltScreen = active
                         emit(.screenMode(alt: active))
+                        traceModes(.alt, flips: 0, transientMouseOff: false)
                     }
                     // Design doc §7.3: withdraw any offer on an alt-screen
                     // transition. The text a match was based on is gone.
@@ -380,16 +400,21 @@ public actor PTYSession {
                     // The anchor is buffer bookkeeping, but a clear also means the
                     // matched prompt has left the screen.
                     applyAgentChanges(agentMonitor.screenChanged())
-                case .mode:
+                case .mode(let mode, let active):
                     // Coalesced below: one event per chunk however many modes
                     // a combined sequence flipped.
                     modesChanged = true
+                    modeFlips += 1
+                    if !active, mouseDisarmingModes.contains(mode) {
+                        transientMouseOff = true
+                    }
                 }
             }
         }
 
         if modesChanged {
             emit(.modes(active: buffer.activeModes))
+            traceModes(.pty, flips: modeFlips, transientMouseOff: transientMouseOff)
         }
 
         // EOF on the master should be unreachable while the daemon holds a slave
@@ -404,6 +429,26 @@ public actor PTYSession {
         guard let observed, observed != lastTermios else { return }
         lastTermios = observed
         emit(.termios(observed))
+    }
+
+    /// Appends the current mode state to the trace, if tracing is on.
+    private func traceModes(
+        _ source: ModeTraceEntry.Source,
+        flips: Int,
+        transientMouseOff: Bool
+    ) {
+        guard modeTrace != nil else { return }
+        let entry = ModeTraceEntry(
+            at: Date(),
+            source: source,
+            modes: buffer.activeModes.sorted(),
+            altScreen: lastAltScreen,
+            offset: buffer.totalWritten,
+            flips: flips,
+            transientMouseOff: transientMouseOff
+        )
+        modeTrace?.append(entry)
+        modeTraceSink?(entry.logLine(session: name))
     }
 
     private func emit(_ event: SessionEvent) {
@@ -432,7 +477,12 @@ public actor PTYSession {
             bufferingPolicy: .unbounded
         )
         subscribers[token] = continuation
-        if !observer { clientTokens[token] = Date() }
+        if !observer {
+            clientTokens[token] = Date()
+            // What this client is about to be told — the belief a fresh emulator
+            // starts from, which is the one most likely to be wrong.
+            traceModes(.attach, flips: 0, transientMouseOff: false)
+        }
         // Tell a new subscriber the current state immediately, so it does not
         // have to wait for the next change to know whether to predict.
         continuation.yield(.termios(lastTermios))
@@ -567,7 +617,9 @@ public actor PTYSession {
             attachedClients: clientTokens.count,
             createdAt: createdAt,
             clientQuietFor: clientTokens.values.map { Date().timeIntervalSince($0) }.min(),
-            lastOutputAt: lastOutputAt
+            lastOutputAt: lastOutputAt,
+            activeModes: buffer.activeModes.sorted(),
+            modeTrace: modeTrace?.entries
         )
     }
 

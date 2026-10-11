@@ -23,6 +23,10 @@ public struct DaemonConfig: Sendable {
     /// Put the PTY in raw mode before the child starts, so the session is a
     /// transparent byte pipe. See `deterministicEcho`.
     public var rawMode: Bool
+    /// Record every tracked-mode transition per session, with wall-clock times, in
+    /// memory (`meshyyd list --json` → `mode_trace`) and as stderr lines. Off by
+    /// default: design doc §9, logs are opt-in. See ModeTrace.swift.
+    public var traceModes: Bool
 
     public init(
         shell: String = DaemonConfig.defaultShell,
@@ -31,7 +35,8 @@ public struct DaemonConfig: Sendable {
         bufferCapacity: Int = RingBuffer.defaultCapacity,
         bindAllInterfaces: Bool = false,
         agentProfiles: [AgentProfile] = DaemonConfig.defaultAgentProfiles,
-        rawMode: Bool = false
+        rawMode: Bool = false,
+        traceModes: Bool = false
     ) {
         self.shell = shell
         self.shellArguments = shellArguments
@@ -40,6 +45,7 @@ public struct DaemonConfig: Sendable {
         self.bindAllInterfaces = bindAllInterfaces
         self.agentProfiles = agentProfiles
         self.rawMode = rawMode
+        self.traceModes = traceModes
     }
 
     /// A session whose child is a pure byte pipe: whatever is written to the PTY
@@ -241,7 +247,11 @@ public actor SessionStore {
             size: size,
             bufferCapacity: config.bufferCapacity,
             agentProfiles: config.agentProfiles,
-            rawMode: config.rawMode
+            rawMode: config.rawMode,
+            traceModes: config.traceModes,
+            modeTraceSink: { line in
+                FileHandle.standardError.write(Data((line + "\n").utf8))
+            }
         )
         await session.start()
         sessions[name] = session

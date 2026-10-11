@@ -207,3 +207,26 @@ the survival test can only notice this defect by waiting out the full idle
 timeout; the counter names it in milliseconds.
 
 Reverted after the run; `git diff` clean; suite green.
+
+---
+
+## 2026-10-11 — mode trace and inbound clock (scroll trace, PR A)
+
+**Mutant 1: the pulse goes unrecorded.** `PTYSession.ingest` never sets
+`transientMouseOff` (the disarm check short-circuited with `if false, …`).
+
+```
+RED in 10.06s -> "Arming, the alt screen, a redraw pulse and an attach are all
+                 recorded" — "a disarm/re-arm pulse must be recorded as
+                 transient, ending armed"
+```
+
+**Mutant 2: pongs stop counting.** `MeshyySession.attach` no longer stamps
+`inboundStamp` in the frame callback.
+
+```
+RED in 1.16s -> "lastInboundFrameAt keeps moving on an idle session, carried by
+                 pongs alone" — lastInboundFrameAt → nil
+```
+
+Both reverted after the run; `git diff` clean; suites green.

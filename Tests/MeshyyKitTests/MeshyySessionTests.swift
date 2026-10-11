@@ -166,6 +166,41 @@ extension MeshyyKitSuite {
             }
         }
 
+        /// The idle-but-healthy case is the one that matters: no output, no events,
+        /// yet the daemon still answers every heartbeat. A clock that only moved on
+        /// events would call this session silent, and a phone's swipe trace could not
+        /// tell an idle shell from a dead path.
+        @Test("lastInboundFrameAt keeps moving on an idle session, carried by pongs alone")
+        func inboundClockCountsPongs() async throws {
+            try await withHarness(child: .shell) { daemon in
+                let session = MeshyySession(
+                    size: TerminalSize(cols: 80, rows: 24),
+                    heartbeatInterval: .milliseconds(300)
+                )
+                #expect(session.lastInboundFrameAt == nil, "nothing has arrived before attach")
+                let log = EventLog()
+                await log.attach(to: session)
+                let boot = try daemon.bootstrap(session: "inbound-clock")
+                try await session.attach(bootstrap: boot, sshHost: "127.0.0.1")
+                try await session.send(markerCommand("SETTLED"))
+                #expect(await log.wait { log.text.contains("SETTLED") })
+
+                // Let the shell go quiet, then watch only the clock.
+                try await Task.sleep(for: .seconds(1))
+                let eventsBefore = log.all.count
+                let first = try #require(session.lastInboundFrameAt)
+                try await Task.sleep(for: .seconds(1.5))
+                let later = try #require(session.lastInboundFrameAt)
+
+                #expect(log.all.count == eventsBefore,
+                        "the session was not idle; the test proves nothing: \(log.summary)")
+                #expect(later > first, "an idle session's clock stood still despite pongs")
+                #expect(Date().timeIntervalSince(later) < 1.0,
+                        "with a 300 ms heartbeat the newest frame is never a second old")
+                await session.shutdown(reason: "test over")
+            }
+        }
+
         @Test("A withdrawn offer reaches the wire, not just the daemon's model")
         func withdrawalReachesTheClient() async throws {
             try await withHarness(child: .shell) { daemon in

@@ -2,7 +2,13 @@
 # meshyy — install meshyyd as a per-user launchd agent.
 # Copyright (c) 2026 Aaron Character. MIT licence — see LICENSE.
 #
-# Usage: scripts/install-agent.sh [--release] [--uninstall]
+# Usage: scripts/install-agent.sh [--release] [--trace-modes] [--uninstall]
+#
+#   --trace-modes  start the daemon with mode tracing on: every tracked DEC mode
+#                  transition per session goes to ~/.meshyy/meshyyd.err and to
+#                  `meshyyd list --json` (mode_trace), stamped with wall-clock time.
+#                  Mode numbers only, never session content. For lining a phone's
+#                  scroll trace up against what the far side actually armed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -10,15 +16,24 @@ LABEL="com.aaroncx.meshyyd"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/.meshyy"
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+CONFIG=debug
+TRACE_MODES=false
+UNINSTALL=false
+for arg in "$@"; do
+    case "$arg" in
+        --release) CONFIG=release ;;
+        --trace-modes) TRACE_MODES=true ;;
+        --uninstall) UNINSTALL=true ;;
+        *) echo "error: unknown option $arg" >&2; exit 2 ;;
+    esac
+done
+
+if [[ "$UNINSTALL" == true ]]; then
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST"
     echo "uninstalled $LABEL"
     exit 0
 fi
-
-CONFIG=debug
-[[ "${1:-}" == "--release" ]] && CONFIG=release
 
 BINARY="$PWD/.build/$CONFIG/meshyyd"
 if [[ ! -x "$BINARY" ]]; then
@@ -31,6 +46,11 @@ chmod 700 "$LOG_DIR"
 
 sed -e "s|__BINARY__|$BINARY|g" -e "s|__LOG_DIR__|$LOG_DIR|g" \
     launchd/$LABEL.plist > "$PLIST"
+if [[ "$TRACE_MODES" == true ]]; then
+    # One more argument after `serve`. The template stays a valid plist either way.
+    perl -0pi -e 's|(<string>serve</string>)|$1\n        <string>--trace-modes</string>|' "$PLIST"
+    grep -q -- "--trace-modes" "$PLIST" || { echo "error: could not enable --trace-modes" >&2; exit 1; }
+fi
 
 # bootout first so a re-install replaces rather than layers. Ignore failure: the
 # agent may not be loaded yet.
@@ -70,6 +90,7 @@ if [[ "$ready" != true ]]; then
 fi
 
 echo "installed $LABEL -> $BINARY"
+[[ "$TRACE_MODES" == true ]] && echo "mode trace: ON (stderr: $LOG_DIR/meshyyd.err, and list --json)"
 echo "socket: $HOME/.meshyy/meshyyd.sock"
 echo "logs:   $LOG_DIR/meshyyd.log"
 echo
