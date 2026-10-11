@@ -400,6 +400,13 @@ final class LocalClient: @unchecked Sendable {
                 if let last = info.lastOutputAt {
                     row["last_output_at"] = Int(last.timeIntervalSince1970)
                 }
+                // What the far-side program has armed right now, as the daemon
+                // parsed it — the truth a phone's emulator belief is held against.
+                // Additive: schema-2 consumers ignore fields they do not know.
+                row["modes"] = info.activeModes
+                if let trace = info.modeTrace {
+                    row["mode_trace"] = trace.map(\.jsonObject)
+                }
                 return row
             }
             // An ENVELOPE, not a bare array, and that shape is load-bearing: it is

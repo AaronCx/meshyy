@@ -146,6 +146,7 @@ enum SessionChild {
 func withServer(
     bufferCapacity: Int = RingBuffer.defaultCapacity,
     child: SessionChild = .bytePipe,
+    traceModes: Bool = false,
     _ body: (String, SessionStore) async throws -> Void
 ) async throws {
     // sockaddr_un.sun_path is 104 bytes on Darwin, and NSTemporaryDirectory()
@@ -190,6 +191,7 @@ func withServer(
             "HOME": NSHomeDirectory(),
         ]
     }
+    config.traceModes = traceModes
 
     let store = SessionStore(config: config)
     let server = LocalSocketServer(path: path, store: store)
