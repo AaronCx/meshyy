@@ -11,6 +11,7 @@
 
 import Foundation
 import MeshyyCore
+import Synchronization
 
 /// What a session tells its owner.
 public enum MeshyySessionEvent: Sendable {
@@ -161,6 +162,19 @@ public actor MeshyySession {
     /// actually running" — see HeartbeatMonitor.ticks.
     public var heartbeatTicks: UInt64 { heartbeat.ticks }
 
+    /// When the newest frame of ANY kind arrived from the daemon — pty bytes,
+    /// control frames, and heartbeat pongs, which nothing surfaces as an event.
+    ///
+    /// The pong is the point. An idle, healthy session produces no events for
+    /// minutes, but it is answered every heartbeat interval; a path that has
+    /// silently died answers nothing. So "how long since the daemon said anything"
+    /// separates the two in the window BEFORE the heartbeat declares death (3-4 s),
+    /// which is exactly where a swipe sent from a phone can disappear without any
+    /// error. Readable synchronously, from any thread, because the caller is a
+    /// gesture recognizer that must not await.
+    public nonisolated var lastInboundFrameAt: Date? { inboundStamp.value }
+    private nonisolated let inboundStamp = InboundStamp()
+
     public init(size: TerminalSize = .default, heartbeatInterval: Duration? = nil) {
         self.size = size
         if let heartbeatInterval {
@@ -263,7 +277,13 @@ public actor MeshyySession {
         let connection = MeshyyConnection(bootstrap: bootstrap, sshHost: sshHost)
         // Yield synchronously from the transport's callback: order in is order out.
         let continuation = ingressContinuation
-        connection.onFrame = { envelope in continuation.yield(envelope) }
+        let inboundStamp = self.inboundStamp
+        connection.onFrame = { envelope in
+            // Stamped on arrival, before the ingress queue, so a backed-up
+            // consumer does not make a live path look silent.
+            inboundStamp.mark()
+            continuation.yield(envelope)
+        }
         connection.onState = { [weak self] state in
             guard let self, case .failed(let reason) = state else { return }
             Task {
@@ -730,5 +750,18 @@ public actor MeshyySession {
 
     private func emit(_ event: MeshyySessionEvent) {
         continuation.yield(event)
+    }
+}
+
+/// A thread-safe "last heard at" timestamp. See `MeshyySession.lastInboundFrameAt`.
+private final class InboundStamp: Sendable {
+    private let last = Mutex<Date?>(nil)
+
+    func mark() {
+        last.withLock { $0 = Date() }
+    }
+
+    var value: Date? {
+        last.withLock { $0 }
     }
 }
