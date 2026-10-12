@@ -132,7 +132,7 @@ struct AttachResyncTests {
         let session = try PTYSession(
             name: "resize-repair",
             executable: "/bin/sh",
-            arguments: ["-c", "trap 'stty size' WINCH; while :; do sleep 0.05; done"],
+            arguments: ["-c", "trap 'stty size' WINCH; echo TRAP''READY; while :; do sleep 0.05; done"],
             environment: ["PATH": "/usr/bin:/bin"],
             size: TerminalSize(cols: 74, rows: 39)
         )
@@ -146,8 +146,14 @@ struct AttachResyncTests {
                 }
             }
         }
-        // Let the trap be installed before signalling, same as the PTY-level tests.
-        try await Task.sleep(for: .milliseconds(700))
+        // Signal only once the trap is installed: the shell says so. A fixed
+        // 700 ms wait passed locally and lost the race on a loaded CI runner,
+        // where the WINCH then hit the default (ignore) disposition.
+        let ready = Date().addingTimeInterval(10)
+        while Date() < ready, !box.withLock({ $0.contains("TRAPREADY") }) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        #expect(box.withLock { $0.contains("TRAPREADY") }, "the shell never installed its trap")
 
         // The exact stuck state: the PTY is already 74x39, the client sends 74x39.
         try await session.resize(to: TerminalSize(cols: 74, rows: 39))

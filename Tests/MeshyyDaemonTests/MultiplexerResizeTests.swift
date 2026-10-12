@@ -89,22 +89,35 @@ struct MultiplexerResizeTests {
     /// Runs a marker'd `stty size` inside the pane and returns the ROWS the pane
     /// believes it has. The marker is assembled by printf so the echoed command
     /// cannot satisfy the scan.
+    /// Asks the pane for `stty size` and reads the answer off the stream.
+    ///
+    /// Re-asks with a fresh marker every few seconds until the deadline: right
+    /// after a resize the multiplexer is redrawing, and one probe's answer can be
+    /// split by cursor moves or land before the pane has the new size. A single
+    /// ask with a fixed wait passed locally and failed on a loaded CI runner.
+    /// Only an answer to the LATEST ask counts, so a stale size cannot satisfy it.
     private func paneRows(
-        _ client: TestClient, marker: String, seconds: Double = 10
+        _ client: TestClient, marker: String, seconds: Double = 20
     ) -> Int? {
-        let head = String(marker.prefix(2)), tail = String(marker.dropFirst(2))
-        client.send(.pty(0, Array(
-            "printf '%s%s:%s\\n' '\(head)' '\(tail)' \"$(stty size)\"\n".utf8)))
         let deadline = Date().addingTimeInterval(seconds)
+        var attempt = 0
         while Date() < deadline {
-            _ = client.pump(timeout: 0.3) { _ in false }   // keep draining
-            let text = Self.plainText(client.ptyStream)
-            if let range = text.range(of: "\(marker):"),
-               let match = text[range.upperBound...]
-                   .split(separator: "\n").first?
-                   .split(separator: " ").first,
-               let rows = Int(match.trimmingCharacters(in: .whitespaces)) {
-                return rows
+            attempt += 1
+            let current = "\(marker)\(attempt)"
+            let head = String(current.prefix(2)), tail = String(current.dropFirst(2))
+            client.send(.pty(0, Array(
+                "printf '%s%s:%s\\n' '\(head)' '\(tail)' \"$(stty size)\"\n".utf8)))
+            let askDeadline = min(deadline, Date().addingTimeInterval(4))
+            while Date() < askDeadline {
+                _ = client.pump(timeout: 0.3) { _ in false }   // keep draining
+                let text = Self.plainText(client.ptyStream)
+                if let range = text.range(of: "\(current):", options: .backwards),
+                   let match = text[range.upperBound...]
+                       .split(separator: "\n").first?
+                       .split(separator: " ").first,
+                   let rows = Int(match.trimmingCharacters(in: .whitespaces)) {
+                    return rows
+                }
             }
         }
         return nil
