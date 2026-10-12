@@ -123,6 +123,19 @@ struct MultiplexerResizeTests {
         return nil
     }
 
+    /// The process table rows for the multiplexer and its shells, for failure messages.
+    private static func processTree(matching name: String) -> String {
+        let snapshot = Process()
+        snapshot.executableURL = URL(fileURLWithPath: "/bin/ps")
+        snapshot.arguments = ["-eo", "pid,ppid,pgid,stat,command"]
+        let out = Pipe(); snapshot.standardOutput = out
+        try? snapshot.run(); snapshot.waitUntilExit()
+        let all = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return all.split(separator: "\n")
+            .filter { $0.contains(name) || $0.contains("zsh") }
+            .joined(separator: "\n")
+    }
+
     /// screen only, deliberately. zellij ignores keystrokes from a scripted pty —
     /// verified with meshyy out of the picture entirely, so it is a property of
     /// zellij and not something to work around here — which makes every
@@ -169,13 +182,7 @@ struct MultiplexerResizeTests {
 
             guard let tall = paneRows(client, marker: "SZA") else {
                 let tail = Self.plainText(client.ptyStream).suffix(400)
-                let snapshot = Process()
-                snapshot.executableURL = URL(fileURLWithPath: "/bin/ps")
-                snapshot.arguments = ["-eo", "pid,ppid,pgid,stat,command"]
-                let out = Pipe(); snapshot.standardOutput = out
-                try? snapshot.run(); snapshot.waitUntilExit()
-                let all = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                let tree = all.split(separator: "\n").filter { $0.contains(mux.name) || $0.contains("zsh") }.joined(separator: "\n")
+                let tree = Self.processTree(matching: mux.name)
                 Issue.record("(\(mux.name)) the pane never answered stty at 74x64; saw: \(tail.debugDescription)\nprocesses:\n\(tree)")
                 return
             }
@@ -195,6 +202,9 @@ struct MultiplexerResizeTests {
                 (\(mux.name)) after growing back to 64 rows the pane reports \
                 \(String(describing: regrown)) instead of \(tall) — everything below is \
                 the black space the user reported
+                last output: \(String(Self.plainText(client.ptyStream).suffix(600)).debugDescription)
+                processes:
+                \(regrown == nil ? Self.processTree(matching: mux.name) : "")
                 """)
         }
     }
