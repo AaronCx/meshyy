@@ -485,10 +485,19 @@ transport lost something" rather than "the terminal transformed it".
 # Addendum, 2026-10-11: scroll oracle, and what CI actually ran
 
 **Correction to the table above.** "running on merge: all" was not true for every
-suite: CI had no tmux, so every tmux-gated suite (`Scroll-mode belief vs far-side
-truth`, `Resize with a real tmux client`) was SKIPPED on merge, verified in the
-logs of run 32322621185. CI now installs tmux (`brew install tmux`), and
-`clientOrderingIsPreserved`, which needs no tmux, moved out of the tmux gate.
+suite: CI has no tmux, so every tmux-gated suite (`Scroll-mode belief vs far-side
+truth`, `Resize with a real tmux client`, and now the SSH oracle) is SKIPPED on
+merge, verified in the logs of run 32322621185. They run only under `make check`
+on the dev Mac, which is why `make check` before every push is not optional.
+`clientOrderingIsPreserved`, which needs no tmux, moved out of the tmux gate and
+now does run on merge.
+
+Installing tmux on CI was tried in #68 and backed out. On the 3-core runner the
+tmux suites then ran in parallel with the other real-process suites and starved
+the timing-sensitive ones: 6 failures, then 10 on a re-run (resize-signal,
+socket replay, list polling, tmux "no client"). None of them reproduce locally.
+Running them on merge needs either a bigger runner or serializing every
+real-process suite under one parent. That is a separate change.
 
 **New: `ScrollOracleOrderingTests`** (3 tests, about 250 s). Real `/usr/bin/ssh -tt`
 in a real PTY is the oracle and a `MeshyySession` over QUIC through

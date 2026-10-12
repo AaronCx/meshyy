@@ -46,12 +46,13 @@ jobs:
         run: swift --version && xcodebuild -version
       - name: Build
         run: swift build
-      - name: Install tmux
-        # The tmux-driven suites (scroll-mode belief, tmux resize) skip without a
-        # tmux binary, and the runner image has none, so they ran nowhere on merge.
-        # The SSH-oracle suite still skips here — no probe key or sshd on a runner —
-        # and says so in its skip reason.
-        run: brew install tmux && tmux -V
+      # No tmux here, deliberately. The tmux-driven suites (scroll-mode belief,
+      # tmux resize, the SSH oracle) run under `make check` on the dev Mac only.
+      # Measured 2026-10-11 (#68): installing tmux on this 3-core runner made
+      # those suites run in parallel with the other real-process suites and
+      # starved the timing-sensitive ones (resize-signal, socket replay) into
+      # 6 and then 10 failures that do not reproduce locally. See
+      # docs/qa/test-inventory.md.
       - name: Test
         # Runs everything, including the PTY, socket and QUIC suites. They were
         # gated until 1b-zero; the fix was to stop asserting on a real interactive
