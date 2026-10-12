@@ -318,3 +318,37 @@ stream kinds. The outcome test caught the revert in every run.
 
 Both mutants reverted (`git checkout --`); `git diff` clean. Logs are in
 `~/Developer/cc-sessions/meshyy-mutant-63/`.
+
+### Follow-up: review hardening of the oracle suite (same day)
+
+A review found five places where the suite could pass without testing what
+it names. Each now fails instead:
+
+- **Leftover copy mode.** `resetScroll` ignored its poll, and no swipe checked
+  the pane was out of copy mode, so a leftover `mode=1 pos=10` would read as
+  the correct mouse-on outcome of a swipe that never arrived. Both now
+  assert.
+- **Path-drop legs.** Every leg must log at least one `.failed`, and
+  `heal-redial` / `path-change` must actually redial. Before this a late
+  `.failed` quietly turned `heal-redial` into a second `heal`. All runs so
+  far logged `failedEvents=1` on every leg.
+- **Row checker resizes.** The far-side program now logs each SIGWINCH as
+  `W/<rows>`. Every seed must log `W/18`, then `W/24`, with `W/18` ahead of the
+  swipe. **Planted:** the subject skipped its 18-row resize, the transport
+  equivalent of merging it into the dismiss. Before this change that mutant
+  scored `20/24` everywhere and stayed green. Now it is red on 20/20 seeds,
+  for example `seed 1: ["W/24", "20/24", "20/24", "20/24"]`.
+- **Through-tmux dismiss-then-swipe.** With mouse on, "taken at the old size"
+  and "never delivered" both read `mode=0 pos=- rx=""`. A sentinel `x` is now
+  sent behind each swipe on the same side, after copy mode is cancelled. It
+  must reach the pane, behind exactly what the swipe produced. A client that
+  dropped the swipe's whole `send()` would still pass this check, but the row
+  checker would not.
+- **Keystroke-replay.** The pane must receive exactly `k`, and this check sits
+  outside any known issue, so it applies with mouse off too. The replay must
+  still be arriving when `k` is sent. Measured: `k` goes out 120–215 ms after
+  the attach starts, and the first output arrives about 110–150 ms later.
+
+A correction to the stabilize-run summary (not to this log): over ssh,
+tmux's late resize lost 5 to 8 of 10 mouse-on dismiss-then-swipes (final1 7,
+final2 5, final3 5, make-check run 8), not 5 to 7.

@@ -479,3 +479,29 @@ point (`resumeFrom: nil` on every attach) turns it red.
 being typed at the PTY. A PTY is not transparent to arbitrary bytes even in raw mode —
 1f saw 312 of 700 bytes come back mangled — so this keeps a failure meaning "the
 transport lost something" rather than "the terminal transformed it".
+
+---
+
+# Addendum, 2026-10-11: scroll oracle, and what CI actually ran
+
+**Correction to the table above.** "running on merge: all" was not true for every
+suite: CI had no tmux, so every tmux-gated suite (`Scroll-mode belief vs far-side
+truth`, `Resize with a real tmux client`) was SKIPPED on merge, verified in the
+logs of run 32322621185. CI now installs tmux (`brew install tmux`), and
+`clientOrderingIsPreserved`, which needs no tmux, moved out of the tmux gate.
+
+**New: `ScrollOracleOrderingTests`** (3 tests, about 250 s). Real `/usr/bin/ssh -tt`
+in a real PTY is the oracle and a `MeshyySession` over QUIC through
+`ChaosUDPProxy` is the subject. Both attach the same isolated tmux, and every
+swipe is judged by what tmux DID (`pane_in_mode`, `scroll_position`) or what the
+pane program received, never by belief alone. Gated on tmux, `~/.ssh/aplus_probe`
+and sshd on 127.0.0.1:22, so it **skips on CI by design** and runs under
+`make check` on this Mac. Its 16 strict known issues are the two deferred
+divergences, documented in a+Terminal `docs/qa/scroll-divergence-audit.md`. The
+#63 revert turns it red; see mutation-log.md.
+
+| | |
+|---|---|
+| test functions | 250 (`make check`, 2026-10-11) |
+| skipped on CI | the SSH oracle suite (no probe key or sshd on the runner) |
+
