@@ -88,3 +88,35 @@ runs distinct top-level suites in parallel, and without that nesting the
 refused-attach tests passed alone and failed in the suite — which reads exactly
 like a product bug and is not one. If a new suite in this package touches a real
 socket, nest it too.
+
+## Two resize-signal tests are flaky on the CI runner (open, 2026-10-12)
+
+`MultiplexerResizeTests` "A pane inside the multiplexer tracks shrink and growth"
+(screen) and, less often, `AttachResyncTests` "A mid-session resize repairs a
+program that missed its signal" fail on the 3-core `macos-26` runner and never
+locally, including under 12 busy loops of CPU load. Measured with probe branches
+dispatched against fixed commits:
+
+| commit | screen test on CI |
+|---|---|
+| `bc33d14` (before the mode trace, #66) | 6 of 6 green |
+| `af36e63` (main after #66/#67) | 0 of 5 green |
+| `af36e63` minus `ModeTraceTests` | 2 of 2 green |
+| `af36e63`, only the `list --json` trace test enabled | 0 of 1 green |
+| ...that test with tracing off | 3 of 4 green |
+| ...trace lines captured, not written to stderr | 0 of 3 green |
+| ...polling without blocking the cooperative pool | 0 of 3 green |
+
+Adding the trace suite shifted what runs concurrently and raised the flake rate.
+No single mechanism in it explains the failure: blocking, stderr and lingering
+sessions were each ruled out. The tests themselves are the fragile part.
+- The attach-resync test fired its signal after a fixed 700 ms. It now waits for
+  the shell to report its trap is installed.
+- The screen test asked once and read a redraw-mangled stream. It now re-asks
+  with fresh markers for 20 s.
+
+Even so, screen intermittently never answers after the regrow on the runner.
+That failure now records the pane's last output and the process tree, so the
+next red run says what the pane showed. Until then a red run here is not
+evidence about a product change. Re-run it once. If it fails twice, read the
+recorded tail before deciding anything.
