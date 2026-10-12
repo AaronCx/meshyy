@@ -1269,14 +1269,37 @@ extension MeshyyKitSuite {
                     // Keystroke-then-replay: a fresh emulator types the moment
                     // its attach returns, while the replay is still arriving —
                     // the first keystroke of a connection is what opened the
-                    // separate pty stream before #63. Then a swipe.
+                    // separate pty stream before #63. The keystroke must reach
+                    // the pane (outside any known issue, so it holds with mouse
+                    // off too); the MEASURE line records whether it really went
+                    // out mid-replay. Then a swipe.
+                    await resetScroll(bench)
+                    let keyOffset = bench.transcriptCount
                     let subject = await SubjectClient()
+                    let attachStarted = Date()
                     try await subject.attach(daemon, name: "reorder", relayPort: relayPort)
+                    let attachReturned = Date()
                     try await subject.session.send(Array("k".utf8))
+                    let keySent = Date()
                     await Self.settle(subject, mouse: mouse)
+                    let keyLanded = await poll(timeout: 5) { bench.transcript(from: keyOffset).contains("k") }
+                    let keyText = bench.transcript(from: keyOffset)
+                    let outputs = subject.log.all.filter { if case .output = $0.event { true } else { false } }
+                    let ms = { (date: Date?) in date.map { "\(Int($0.timeIntervalSince(attachStarted) * 1000))ms" } ?? "none" }
+                    let keyOrder = "keystroke{attachReturned=\(ms(attachReturned)) sent=\(ms(keySent)) "
+                        + "firstOutput=\(ms(outputs.first?.at)) lastOutput=\(ms(outputs.last?.at)) "
+                        + "outputsAfterSend=\(outputs.filter { $0.at > keySent }.count)/\(outputs.count) "
+                        + "pane=\"\(keyText)\"}"
+                    #expect(keyLanded && keyText == "k", """
+                        seed \(seed): the keystroke typed as the attach returned did not reach the pane \
+                        exactly once: pane got "\(keyText)" — \(keyOrder) — \(relay.snapshot().summary)
+                        """)
+                    // Not an outcome assertion: proof the step is what it says.
+                    #expect(outputs.contains { $0.at > keySent },
+                            "seed \(seed): the replay had finished before the keystroke went out: \(keyOrder)")
                     await resetScroll(bench)
                     let fresh = await swipe(subject.side, step: "\(variant) keystroke-replay seed=\(seed)", on: bench)
-                    report(attachOracle, fresh, relay: relay)
+                    report(attachOracle, fresh, relay: relay, note: keyOrder)
                     judge(attachOracle, fresh, bench: bench, relay: relay,
                           knownIssue: mouse ? nil : Self.screenModeIssue)
 
