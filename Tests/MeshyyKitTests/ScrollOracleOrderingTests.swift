@@ -801,6 +801,13 @@ extension MeshyyKitSuite {
                         #expect((dropped.landedAfter ?? .infinity) < 15,
                                 "the swipe took \(dropped.landedAfter ?? -1)s to land after a 4s hole")
                     }
+                    // Proof each leg is the leg it says: a hole the heartbeat
+                    // never called dead tests a plain delay, and a redial leg
+                    // that never redialled is a second `heal`.
+                    #expect(Self.failures(oldLog) > failuresBefore,
+                            "\(step): the hole never produced .failed, so no dead path was ridden out")
+                    #expect(leg == .heal || redial != "none",
+                            "\(step): .failed never fired before the swipe landed, so no redial was exercised")
 
                     // The next swipe, once recovered. After a redial this is a
                     // fresh emulator, so with tmux mouse off the screenMode
