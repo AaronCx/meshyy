@@ -1185,6 +1185,31 @@ extension MeshyyKitSuite {
                 || (bench.mouse && outcome == ScrollOutcome(inMode: 0, scrollPosition: nil, received: ""))
         }
 
+        /// With `mouse on`, "taken at the old size" and "never delivered" both
+        /// read `mode=0 pos=- rx=""`. A sentinel keystroke sent behind the swipe
+        /// on the same side tells them apart: input is one ordered lane, so the
+        /// sentinel reaching the pane means tmux had already read every swipe
+        /// byte. Copy mode is cancelled first so the sentinel reaches the
+        /// program; a swipe byte arriving after that would re-enter copy mode and
+        /// swallow the sentinel. The pane must then hold exactly what the swipe
+        /// gave it plus the sentinel. (A client that discarded the swipe's
+        /// send() whole, rather than a lane that lost it, would still pass here;
+        /// `dismissAndSwipeStayOrdered` sends the same shape to a far side that
+        /// logs every wheel event and requires all three.)
+        private static func sentinelFollows(
+            _ outcome: ScrollOutcome,
+            since offset: Int,
+            on bench: OracleBench,
+            deliver: ([UInt8]) async throws -> Void
+        ) async throws -> (ok: Bool, transcript: String) {
+            await resetScroll(bench)
+            try await deliver(Array("x".utf8))
+            await poll(timeout: 5) { bench.transcript(from: offset).contains("x") }
+            try await Task.sleep(for: .milliseconds(100))
+            let text = bench.transcript(from: offset)
+            return (text == outcome.received + "x", text)
+        }
+
         @Test("Ordering under a reordering relay, through tmux: fresh client + keystroke, and dismiss-then-swipe",
               arguments: [true, false])
         func reorderedClientsMatchTheOracle(mouse: Bool) async throws {
@@ -1214,6 +1239,12 @@ extension MeshyyKitSuite {
                 oracleOutcomes["\(outcome)", default: 0] += 1
                 #expect(Self.isWholeSwipe(outcome, bench),
                         "seed \(seed): the ssh ORACLE split or garbled a swipe: \(outcome)")
+                let sentinel = try await Self.sentinelFollows(outcome, since: offset, on: bench,
+                                                              deliver: { try await side.deliver($0) })
+                #expect(sentinel.ok, """
+                    seed \(seed): the ssh ORACLE's sentinel keystroke never followed the swipe into \
+                    the pane, so the swipe was not delivered: \(outcome), pane got "\(sentinel.transcript)"
+                    """)
             }
             oracle.close()
 
@@ -1264,6 +1295,13 @@ extension MeshyyKitSuite {
                     subjectOutcomes["\(outcome)", default: 0] += 1
                     #expect(Self.isWholeSwipe(outcome, bench),
                             "seed \(seed): meshyy split or garbled a swipe: \(outcome) — \(relay.snapshot().summary)")
+                    let sentinel = try await Self.sentinelFollows(outcome, since: offset, on: bench,
+                                                                  deliver: { try await subject.session.send($0) })
+                    #expect(sentinel.ok, """
+                        seed \(seed): meshyy's sentinel keystroke never followed the swipe into the pane, \
+                        so the swipe was not delivered: \(outcome), pane got "\(sentinel.transcript)" — \
+                        \(relay.snapshot().summary)
+                        """)
                     print("MEASURE reorderTmux \(variant) seed=\(seed) gap=\(Self.reorderGap(seed)) "
                           + "route=\(route.rawValue) outcome{\(outcome)} relay{\(relay.snapshot().summary)}")
 
