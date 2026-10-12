@@ -6,9 +6,18 @@
 //                    [--sever 300]
 //   meshyy-chaos udp --target 127.0.0.1:4433 --rtt 80 [--listen 0] [--jitter 0]
 //                    [--loss 0.05] [--reorder 0.02] [--seed N] [--sever 300]
+//                    [--blackhole-on-usr1 4] [--pidfile /tmp/relay.pid]
 //
 // Prints the bound port on the first line of stdout, then runs until killed.
 // The benchmark script reads that line to know where to point ssh.
+//
+// `--blackhole-on-usr1 SECONDS` (UDP only) turns SIGUSR1 into a runtime impairment:
+// every SIGUSR1 drops all datagrams in both directions for SECONDS, then heals. It
+// exists for callers that cannot reach the relay object — an a+Terminal simulator
+// test cannot spawn host processes, so it runs this relay on the host over an SSH
+// exec channel and triggers a path drop with `kill -USR1 "$(cat PIDFILE)"`.
+// `--pidfile PATH` writes this process's pid there on start and removes it on a
+// SIGINT/SIGTERM exit, so that caller has something to signal.
 //
 // TCP and UDP both, deliberately. The brief for 1d-bis says to replace the TCP shim
 // with a UDP relay, and for impairing QUIC that is exactly right — but the §1
@@ -30,7 +39,8 @@ enum ChaosCLI {
                 [--listen PORT] [--jitter MS] [--sever SECONDS]
                        meshyy-chaos udp --target HOST:PORT --rtt MS \
                 [--listen PORT] [--jitter MS] [--loss 0..1] [--reorder 0..1] \
-                [--seed N] [--sever SECONDS]
+                [--seed N] [--sever SECONDS] [--blackhole-on-usr1 SECONDS] \
+                [--pidfile PATH]
                 """)
         }
         arguments.removeFirst()
@@ -80,7 +90,24 @@ enum ChaosCLI {
                 )
                 bound = try proxy.start()
                 held = proxy
+                if let raw = option("blackhole-on-usr1") {
+                    guard let seconds = Double(raw), seconds > 0 else {
+                        die("--blackhole-on-usr1 must be a positive number of seconds, got \(raw)")
+                    }
+                    let window = Duration.milliseconds(Int(seconds * 1000))
+                    // Same dispatch-source shape as SIGINT/SIGTERM below: ignore the
+                    // default disposition first (SIGUSR1's default is to terminate),
+                    // then handle it on a queue rather than in signal context.
+                    signal(SIGUSR1, SIG_IGN)
+                    let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+                    source.setEventHandler { proxy.blackHole(.both, for: window) }
+                    source.resume()
+                    signalSources.append(source)
+                }
             } else {
+                if option("blackhole-on-usr1") != nil {
+                    die("--blackhole-on-usr1 is UDP only: a TCP relay cannot drop datagrams")
+                }
                 let proxy = ChaosTCPProxy(
                     listenPort: listenPort, targetHost: host,
                     targetPort: targetPort, profile: profile
@@ -88,8 +115,6 @@ enum ChaosCLI {
                 bound = try proxy.start()
                 held = proxy
             }
-            print(bound)
-            fflush(stdout)
         } catch {
             die("\(error)")
         }
@@ -102,12 +127,32 @@ enum ChaosCLI {
         for number in [SIGINT, SIGTERM] {
             signal(number, SIG_IGN)   // or the default disposition kills us first
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-            source.setEventHandler { exit(0) }
+            source.setEventHandler {
+                if let pidfile { try? FileManager.default.removeItem(atPath: pidfile) }
+                exit(0)
+            }
             source.resume()
             signalSources.append(source)
         }
+
+        // The pidfile is written only once the exit handlers exist (so a stop can
+        // never leave it behind) and BEFORE the port line, so a caller that has read
+        // the port can signal the relay without polling for the file.
+        if let path = option("pidfile") {
+            do {
+                try "\(getpid())\n".write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                die("could not write --pidfile \(path): \(error)")
+            }
+            pidfile = path
+        }
+        print(bound)
+        fflush(stdout)
         dispatchMain()
     }
+
+    /// Where `--pidfile` wrote this process's pid, removed again on a clean exit.
+    nonisolated(unsafe) private static var pidfile: String?
 
     /// Keeps the running proxy alive for the process's lifetime. Without a strong
     /// reference the relay is deallocated the moment `main` stops using it, and the

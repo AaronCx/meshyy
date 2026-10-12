@@ -479,3 +479,38 @@ point (`resumeFrom: nil` on every attach) turns it red.
 being typed at the PTY. A PTY is not transparent to arbitrary bytes even in raw mode —
 1f saw 312 of 700 bytes come back mangled — so this keeps a failure meaning "the
 transport lost something" rather than "the terminal transformed it".
+
+---
+
+# Addendum, 2026-10-11: scroll oracle, and what CI actually ran
+
+**Correction to the table above.** "running on merge: all" was not true for every
+suite: CI has no tmux, so every tmux-gated suite (`Scroll-mode belief vs far-side
+truth`, `Resize with a real tmux client`, and now the SSH oracle) is SKIPPED on
+merge, verified in the logs of run 32322621185. They run only under `make check`
+on the dev Mac, which is why `make check` before every push is not optional.
+`clientOrderingIsPreserved`, which needs no tmux, moved out of the tmux gate and
+now does run on merge.
+
+Installing tmux on CI was tried in #68 and backed out. On the 3-core runner the
+tmux suites then ran in parallel with the other real-process suites and starved
+the timing-sensitive ones: 6 failures, then 10 on a re-run (resize-signal,
+socket replay, list polling, tmux "no client"). None of them reproduce locally.
+Running them on merge needs either a bigger runner or serializing every
+real-process suite under one parent. That is a separate change.
+
+**New: `ScrollOracleOrderingTests`** (3 tests, about 250 s). Real `/usr/bin/ssh -tt`
+in a real PTY is the oracle and a `MeshyySession` over QUIC through
+`ChaosUDPProxy` is the subject. Both attach the same isolated tmux, and every
+swipe is judged by what tmux DID (`pane_in_mode`, `scroll_position`) or what the
+pane program received, never by belief alone. Gated on tmux, `~/.ssh/aplus_probe`
+and sshd on 127.0.0.1:22, so it **skips on CI by design** and runs under
+`make check` on this Mac. Its 16 strict known issues are the two deferred
+divergences, documented in a+Terminal `docs/qa/scroll-divergence-audit.md`. The
+#63 revert turns it red; see mutation-log.md.
+
+| | |
+|---|---|
+| test functions | 250 (`make check`, 2026-10-11) |
+| skipped on CI | the SSH oracle suite (no probe key or sshd on the runner) |
+

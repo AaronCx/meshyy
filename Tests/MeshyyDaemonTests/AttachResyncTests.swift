@@ -54,118 +54,126 @@ private func drain(_ pty: PTY, seconds: Double) throws -> String {
     return String(decoding: accumulated, as: UTF8.self)
 }
 
-@Suite("Attach resync", .serialized)
-struct AttachResyncTests {
+extension DaemonRealProcessSuite {
+    @Suite("Attach resync", .serialized)
+    struct AttachResyncTests {
 
-    /// THE PROPERTY. An attach makes the foreground program re-read the size even when
-    /// the size did not change.
-    @Test("An attach re-signals the size even when nothing changed")
-    func attachResyncsAnUnchangedSize() throws {
-        let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
-        defer { pty.terminate() }
-        // Let the trap be installed before anything is signalled, or this races the
-        // shell's startup and fails for a reason unrelated to the fix.
-        _ = try drain(pty, seconds: 0.7)
+        /// THE PROPERTY. An attach makes the foreground program re-read the size even when
+        /// the size did not change.
+        @Test("An attach re-signals the size even when nothing changed")
+        func attachResyncsAnUnchangedSize() throws {
+            let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
+            defer { pty.terminate() }
+            // Let the trap be installed before anything is signalled, or this races the
+            // shell's startup and fails for a reason unrelated to the fix.
+            _ = try drain(pty, seconds: 0.7)
 
-        // The PTY is already 74x39 and the client attaches at 74x39 — the exact state
-        // that used to be unrecoverable.
-        try pty.resyncSize(to: TerminalSize(cols: 74, rows: 39))
-        let reported = try drain(pty, seconds: 1.0)
+            // The PTY is already 74x39 and the client attaches at 74x39 — the exact state
+            // that used to be unrecoverable.
+            try pty.resyncSize(to: TerminalSize(cols: 74, rows: 39))
+            let reported = try drain(pty, seconds: 1.0)
 
-        #expect(reported.contains("39 74"), """
-            the child was never told the size on an attach that did not change it \
-            (saw \(reported.debugDescription)). A program that drifted out of sync with a \
-            PTY that is already the right size can then never be corrected — which is the \
-            terminal that stops filling the screen and never recovers
-            """)
-    }
+            #expect(reported.contains("39 74"), """
+                the child was never told the size on an attach that did not change it \
+                (saw \(reported.debugDescription)). A program that drifted out of sync with a \
+                PTY that is already the right size can then never be corrected — which is the \
+                terminal that stops filling the screen and never recovers
+                """)
+        }
 
-    /// The ordinary path must keep working: a real change still resizes and still
-    /// signals, exactly as before. A fix that signals on every attach must not have
-    /// been bought by breaking the case that already worked.
-    @Test("A changed size still reaches the child")
-    func changedSizeStillApplies() throws {
-        let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
-        defer { pty.terminate() }
-        _ = try drain(pty, seconds: 0.7)
+        /// The ordinary path must keep working: a real change still resizes and still
+        /// signals, exactly as before. A fix that signals on every attach must not have
+        /// been bought by breaking the case that already worked.
+        @Test("A changed size still reaches the child")
+        func changedSizeStillApplies() throws {
+            let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
+            defer { pty.terminate() }
+            _ = try drain(pty, seconds: 0.7)
 
-        try pty.resize(to: TerminalSize(cols: 74, rows: 64))
-        let reported = try drain(pty, seconds: 1.0)
+            try pty.resize(to: TerminalSize(cols: 74, rows: 64))
+            let reported = try drain(pty, seconds: 1.0)
 
-        #expect(reported.contains("64 74"),
-                "a genuine resize did not reach the child (saw \(reported.debugDescription))")
-    }
+            #expect(reported.contains("64 74"),
+                    "a genuine resize did not reach the child (saw \(reported.debugDescription))")
+        }
 
-    /// The negative control, which is what makes the resync tests meaningful: the RAW
-    /// PTY apply (`PTY.resize`, kernel semantics only) really does signal nobody when
-    /// the size is unchanged. Without this, `attachResyncsAnUnchangedSize` could be
-    /// passing because the kernel signals on every ioctl, and the fix would be
-    /// untested. Note this pins the KERNEL's behaviour at the PTY layer — the SESSION
-    /// layer now deliberately repairs on every resize (see the test below).
-    @Test("The raw PTY apply stays silent when the size is unchanged")
-    func unchangedResizeSignalsNobody() throws {
-        let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
-        defer { pty.terminate() }
-        _ = try drain(pty, seconds: 0.7)
+        /// The negative control, which is what makes the resync tests meaningful: the RAW
+        /// PTY apply (`PTY.resize`, kernel semantics only) really does signal nobody when
+        /// the size is unchanged. Without this, `attachResyncsAnUnchangedSize` could be
+        /// passing because the kernel signals on every ioctl, and the fix would be
+        /// untested. Note this pins the KERNEL's behaviour at the PTY layer — the SESSION
+        /// layer now deliberately repairs on every resize (see the test below).
+        @Test("The raw PTY apply stays silent when the size is unchanged")
+        func unchangedResizeSignalsNobody() throws {
+            let pty = try makeSizeReporter(size: TerminalSize(cols: 74, rows: 39))
+            defer { pty.terminate() }
+            _ = try drain(pty, seconds: 0.7)
 
-        try pty.resize(to: TerminalSize(cols: 74, rows: 39))
-        let reported = try drain(pty, seconds: 0.8)
+            try pty.resize(to: TerminalSize(cols: 74, rows: 39))
+            let reported = try drain(pty, seconds: 0.8)
 
-        #expect(!reported.contains("39 74"), """
-            re-applying an unchanged size DID signal the child, so the premise of the \
-            resync fix no longer holds and `attachResyncsAnUnchangedSize` is proving \
-            nothing — re-derive both before trusting either
-            """)
-    }
+            #expect(!reported.contains("39 74"), """
+                re-applying an unchanged size DID signal the child, so the premise of the \
+                resync fix no longer holds and `attachResyncsAnUnchangedSize` is proving \
+                nothing — re-derive both before trusting either
+                """)
+        }
 
-    /// THE MID-SESSION REPAIR. A client re-sending a size the PTY already has must
-    /// still reach the foreground program.
-    ///
-    /// The old session-level early return was correct while the transport flapped —
-    /// any missed WINCH was repaired seconds later by a reattach's resync. The
-    /// heartbeat fix removed the flapping, and with it the accidental repair:
-    /// measured on a real session, a tmux client that missed one WINCH drew 74x39
-    /// against a 74x64 PTY for a DAY, with the phone re-sending the right size on
-    /// every keyboard toggle and the daemon answering every one with silence.
-    @Test("A mid-session resize repairs a program that missed its signal")
-    func unchangedResizeStillRepairs() async throws {
-        let session = try PTYSession(
-            name: "resize-repair",
-            executable: "/bin/sh",
-            arguments: ["-c", "trap 'stty size' WINCH; while :; do sleep 0.05; done"],
-            environment: ["PATH": "/usr/bin:/bin"],
-            size: TerminalSize(cols: 74, rows: 39)
-        )
-        await session.start()
-        let (_, events, token) = await session.attach(resumeFrom: nil)
-        let box = Mutex("")
-        let pump = Task {
-            for await event in events {
-                if case .output(_, let bytes) = event {
-                    box.withLock { $0 += String(decoding: bytes, as: UTF8.self) }
+        /// THE MID-SESSION REPAIR. A client re-sending a size the PTY already has must
+        /// still reach the foreground program.
+        ///
+        /// The old session-level early return was correct while the transport flapped —
+        /// any missed WINCH was repaired seconds later by a reattach's resync. The
+        /// heartbeat fix removed the flapping, and with it the accidental repair:
+        /// measured on a real session, a tmux client that missed one WINCH drew 74x39
+        /// against a 74x64 PTY for a DAY, with the phone re-sending the right size on
+        /// every keyboard toggle and the daemon answering every one with silence.
+        @Test("A mid-session resize repairs a program that missed its signal")
+        func unchangedResizeStillRepairs() async throws {
+            let session = try PTYSession(
+                name: "resize-repair",
+                executable: "/bin/sh",
+                arguments: ["-c", "trap 'stty size' WINCH; echo TRAP''READY; while :; do sleep 0.05; done"],
+                environment: ["PATH": "/usr/bin:/bin"],
+                size: TerminalSize(cols: 74, rows: 39)
+            )
+            await session.start()
+            let (_, events, token) = await session.attach(resumeFrom: nil)
+            let box = Mutex("")
+            let pump = Task {
+                for await event in events {
+                    if case .output(_, let bytes) = event {
+                        box.withLock { $0 += String(decoding: bytes, as: UTF8.self) }
+                    }
                 }
             }
-        }
-        // Let the trap be installed before signalling, same as the PTY-level tests.
-        try await Task.sleep(for: .milliseconds(700))
+            // Signal only once the trap is installed: the shell says so. A fixed
+            // 700 ms wait passed locally and lost the race on a loaded CI runner,
+            // where the WINCH then hit the default (ignore) disposition.
+            let ready = Date().addingTimeInterval(10)
+            while Date() < ready, !box.withLock({ $0.contains("TRAPREADY") }) {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            #expect(box.withLock { $0.contains("TRAPREADY") }, "the shell never installed its trap")
 
-        // The exact stuck state: the PTY is already 74x39, the client sends 74x39.
-        try await session.resize(to: TerminalSize(cols: 74, rows: 39))
+            // The exact stuck state: the PTY is already 74x39, the client sends 74x39.
+            try await session.resize(to: TerminalSize(cols: 74, rows: 39))
 
-        var seen = ""
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            seen = box.withLock { $0 }
-            if seen.contains("39 74") { break }
-            try await Task.sleep(for: .milliseconds(50))
+            var seen = ""
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                seen = box.withLock { $0 }
+                if seen.contains("39 74") { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            pump.cancel()
+            await session.detach(token)
+            await session.close()
+            #expect(seen.contains("39 74"), """
+                a mid-session resize to an unchanged size signalled nobody \
+                (saw \(seen.debugDescription)) — a program that missed one WINCH now stays \
+                wrong for the life of a session that no longer reattaches
+                """)
         }
-        pump.cancel()
-        await session.detach(token)
-        await session.close()
-        #expect(seen.contains("39 74"), """
-            a mid-session resize to an unchanged size signalled nobody \
-            (saw \(seen.debugDescription)) — a program that missed one WINCH now stays \
-            wrong for the life of a session that no longer reattaches
-            """)
     }
 }

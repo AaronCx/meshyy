@@ -52,109 +52,111 @@ private struct TmuxProbe {
     }
 }
 
-@Suite("Resize with a real tmux client", .serialized,
-       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason),
-       .enabled(if: tmuxAvailable, "tmux not found at /opt/homebrew/bin/tmux"))
-struct TmuxResizeTests {
+extension DaemonRealProcessSuite {
+    @Suite("Resize with a real tmux client", .serialized,
+           .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason),
+           .enabled(if: tmuxAvailable, "tmux not found at /opt/homebrew/bin/tmux"))
+    struct TmuxResizeTests {
 
-    /// Polls tmux's belief until it matches or the deadline passes.
-    private func awaitClientSize(
-        _ probe: TmuxProbe, expecting size: String, seconds: Double = 8
-    ) -> String {
-        let deadline = Date().addingTimeInterval(seconds)
-        var seen = "no client"
-        while Date() < deadline {
-            if let current = probe.clientSize() {
-                seen = current
-                if current == size { return current }
+        /// Polls tmux's belief until it matches or the deadline passes.
+        private func awaitClientSize(
+            _ probe: TmuxProbe, expecting size: String, seconds: Double = 8
+        ) -> String {
+            let deadline = Date().addingTimeInterval(seconds)
+            var seen = "no client"
+            while Date() < deadline {
+                if let current = probe.clientSize() {
+                    seen = current
+                    if current == size { return current }
+                }
+                usleep(100_000)
             }
-            usleep(100_000)
+            return seen
         }
-        return seen
-    }
 
-    /// A daemon session whose shell starts an isolated tmux client, with the
-    /// given starting size, plus the connected test client driving it.
-    private func startTmuxSession(
-        path: String, probe: TmuxProbe, cols: Int, rows: Int
-    ) throws -> TestClient {
-        let client = try TestClient(socketPath: path)
-        client.send(.control(.hello(.init(
-            token: "", cols: cols, rows: rows, session: "tmux-\(probe.label)"
-        ))))
-        #expect(client.pump { frames in frames.contains { $0.kind == .control } },
-                "no Welcome")
-        client.send(.pty(0, Array("\(tmuxPath) -L \(probe.label) new -A -s p\n".utf8)))
-        return client
-    }
-
-    /// The dismiss sequence under BOTH process topologies. `/bin/sh` keeps its jobs
-    /// in its own group, so any delivery at all reaches tmux — that is the shape
-    /// most harnesses accidentally test, and it hid this bug from every layer. A
-    /// job-control shell (zsh — the daemon's real default) puts the tmux client in
-    /// its OWN group: on the phone, every resize was applied to the kernel and
-    /// heard by nobody, and tmux kept drawing at the old height — black below.
-    @Test("The keyboard-dismiss sequence: shrink, grow — tmux must follow",
-          arguments: [SessionChild.shell, SessionChild.jobControlShell])
-    func keyboardDismissSequence(child: SessionChild) async throws {
-        try await withServer(child: child) { path, _ in
-            let probe = TmuxProbe()
-            defer { probe.killServer() }
-            let client = try startTmuxSession(path: path, probe: probe, cols: 74, rows: 64)
-            defer { client.close() }
-
-            #expect(awaitClientSize(probe, expecting: "74x64") == "74x64",
-                    "tmux never saw the starting size (\(child))")
-
-            // Keyboard up.
-            client.send(.control(.resize(cols: 74, rows: 39)))
-            #expect(awaitClientSize(probe, expecting: "74x39") == "74x39",
-                    "tmux missed the shrink (\(child))")
-
-            // Keyboard dismissed — THE black-space step.
-            client.send(.control(.resize(cols: 74, rows: 64)))
-            let grown = awaitClientSize(probe, expecting: "74x64")
-            #expect(grown == "74x64", """
-                (\(child)) tmux is drawing \(grown) against a 74x64 terminal — \
-                everything below its idea of the bottom row is the black space the \
-                user reported
-                """)
-        }
-    }
-
-    /// The suspend-cycle variant: the taller size arrives as a RE-ATTACH (the app
-    /// was backgrounded when the keyboard went away, so no resize frame was ever
-    /// sent — the new size shows up in the next Hello instead).
-    @Test("A reattach at a taller size than the pty holds — tmux must follow")
-    func reattachAtDifferentSize() async throws {
-        try await withServer(child: .shell) { path, _ in
-            let probe = TmuxProbe()
-            defer { probe.killServer() }
-            let first = try startTmuxSession(path: path, probe: probe, cols: 74, rows: 39)
-
-            #expect(awaitClientSize(probe, expecting: "74x39") == "74x39",
-                    "tmux never saw the starting size")
-
-            // The app suspends: transport gone, no Bye, shell and tmux live on.
-            first.close()
-            usleep(300_000)
-
-            // Foreground: reattach with the keyboard now dismissed — taller.
-            let second = try TestClient(socketPath: path)
-            defer { second.close() }
-            second.send(.control(.hello(.init(
-                token: "", cols: 74, rows: 64, session: "tmux-\(probe.label)"
+        /// A daemon session whose shell starts an isolated tmux client, with the
+        /// given starting size, plus the connected test client driving it.
+        private func startTmuxSession(
+            path: String, probe: TmuxProbe, cols: Int, rows: Int
+        ) throws -> TestClient {
+            let client = try TestClient(socketPath: path)
+            client.send(.control(.hello(.init(
+                token: "", cols: cols, rows: rows, session: "tmux-\(probe.label)"
             ))))
-            #expect(second.pump { frames in frames.contains { $0.kind == .control } },
-                    "no Welcome on reattach")
-
-            let grown = awaitClientSize(probe, expecting: "74x64")
-            #expect(grown == "74x64", """
-                after a reattach at 74x64, tmux is still drawing \(grown) — the exact \
-                suspended-with-keyboard-up, foregrounded-without state
-                """)
+            #expect(client.pump { frames in frames.contains { $0.kind == .control } },
+                    "no Welcome")
+            client.send(.pty(0, Array("\(tmuxPath) -L \(probe.label) new -A -s p\n".utf8)))
+            return client
         }
+
+        /// The dismiss sequence under BOTH process topologies. `/bin/sh` keeps its jobs
+        /// in its own group, so any delivery at all reaches tmux — that is the shape
+        /// most harnesses accidentally test, and it hid this bug from every layer. A
+        /// job-control shell (zsh — the daemon's real default) puts the tmux client in
+        /// its OWN group: on the phone, every resize was applied to the kernel and
+        /// heard by nobody, and tmux kept drawing at the old height — black below.
+        @Test("The keyboard-dismiss sequence: shrink, grow — tmux must follow",
+              arguments: [SessionChild.shell, SessionChild.jobControlShell])
+        func keyboardDismissSequence(child: SessionChild) async throws {
+            try await withServer(child: child) { path, _ in
+                let probe = TmuxProbe()
+                defer { probe.killServer() }
+                let client = try startTmuxSession(path: path, probe: probe, cols: 74, rows: 64)
+                defer { client.close() }
+
+                #expect(awaitClientSize(probe, expecting: "74x64") == "74x64",
+                        "tmux never saw the starting size (\(child))")
+
+                // Keyboard up.
+                client.send(.control(.resize(cols: 74, rows: 39)))
+                #expect(awaitClientSize(probe, expecting: "74x39") == "74x39",
+                        "tmux missed the shrink (\(child))")
+
+                // Keyboard dismissed — THE black-space step.
+                client.send(.control(.resize(cols: 74, rows: 64)))
+                let grown = awaitClientSize(probe, expecting: "74x64")
+                #expect(grown == "74x64", """
+                    (\(child)) tmux is drawing \(grown) against a 74x64 terminal — \
+                    everything below its idea of the bottom row is the black space the \
+                    user reported
+                    """)
+            }
+        }
+
+        /// The suspend-cycle variant: the taller size arrives as a RE-ATTACH (the app
+        /// was backgrounded when the keyboard went away, so no resize frame was ever
+        /// sent — the new size shows up in the next Hello instead).
+        @Test("A reattach at a taller size than the pty holds — tmux must follow")
+        func reattachAtDifferentSize() async throws {
+            try await withServer(child: .shell) { path, _ in
+                let probe = TmuxProbe()
+                defer { probe.killServer() }
+                let first = try startTmuxSession(path: path, probe: probe, cols: 74, rows: 39)
+
+                #expect(awaitClientSize(probe, expecting: "74x39") == "74x39",
+                        "tmux never saw the starting size")
+
+                // The app suspends: transport gone, no Bye, shell and tmux live on.
+                first.close()
+                usleep(300_000)
+
+                // Foreground: reattach with the keyboard now dismissed — taller.
+                let second = try TestClient(socketPath: path)
+                defer { second.close() }
+                second.send(.control(.hello(.init(
+                    token: "", cols: 74, rows: 64, session: "tmux-\(probe.label)"
+                ))))
+                #expect(second.pump { frames in frames.contains { $0.kind == .control } },
+                        "no Welcome on reattach")
+
+                let grown = awaitClientSize(probe, expecting: "74x64")
+                #expect(grown == "74x64", """
+                    after a reattach at 74x64, tmux is still drawing \(grown) — the exact \
+                    suspended-with-keyboard-up, foregrounded-without state
+                    """)
+            }
+        }
+
+
     }
-
-
 }

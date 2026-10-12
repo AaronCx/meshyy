@@ -88,3 +88,42 @@ runs distinct top-level suites in parallel, and without that nesting the
 refused-attach tests passed alone and failed in the suite — which reads exactly
 like a product bug and is not one. If a new suite in this package touches a real
 socket, nest it too.
+
+## ~~Two resize-signal tests are flaky on the CI runner~~ — RESOLVED (2026-10-12)
+
+**Symptom.** `MultiplexerResizeTests` "A pane inside the multiplexer tracks shrink
+and growth" (screen) and, less often, `AttachResyncTests` "A mid-session resize
+repairs a program that missed its signal" failed on the 3-core `macos-26` runner.
+They never failed locally, not even under 12 busy loops of CPU load. Main went
+red when the mode-trace suite (#66) landed.
+
+**Cause.** Thread-pool starvation, not CPU. The daemon suites wait with
+synchronous helpers (`TestClient.pump`, `usleep`) inside async tests. The daemon
+under test runs in-process on the same cooperative pool, whose width is the core
+count. On the runner, three suites blocking at once left the daemon no thread
+to produce the output they were waiting for. The process stalled about 20 s: in
+the diagnostic run, three unrelated tests each took 20.5 to 21.3 s. Whichever
+timing-sensitive test sat in that window went red. Adding any suite changed the
+odds, and that is why the bisect below could not pin it on one mechanism.
+
+| commit | screen test on CI |
+|---|---|
+| `bc33d14` (before #66) | 6 of 6 green |
+| `af36e63` (main after #66) | 0 of 5 green |
+| `af36e63` minus `ModeTraceTests` | 2 of 2 green |
+| ...with stderr, blocking polls or lingering sessions fixed one at a time | 0 of 11 green |
+| ...real-process daemon suites serialized | **3 of 3 green** |
+
+**Fix.** Every real-process daemon suite now nests under one `.serialized`
+parent, `DaemonRealProcessSuite` in RealProcessTests.swift, the same rule
+MeshyyKit already followed. At most one test blocks a thread at a time.
+
+Also hardened along the way:
+- The attach-resync test waits for the shell to report its trap is installed,
+  not a fixed 700 ms.
+- The screen test re-asks the pane with fresh markers for 20 s.
+- The screen failure now records the pane's last output and the process tree.
+
+**Rule.** A new daemon suite that spawns a process or binds a socket goes inside
+`DaemonRealProcessSuite`. Prefer `await`-based waits over `pump` and `usleep` in
+new tests.

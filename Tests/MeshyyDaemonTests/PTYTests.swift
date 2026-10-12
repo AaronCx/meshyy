@@ -79,464 +79,466 @@ private func markerCommand(_ marker: String) -> String {
         + "'\(marker[midpoint...])'\n"
 }
 
-@Suite("PTY", .serialized,
-       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
-struct PTYTests {
+extension DaemonRealProcessSuite {
+    @Suite("PTY", .serialized,
+           .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
+    struct PTYTests {
 
-    @Test("A spawned command's output arrives on the master")
-    func spawnAndRead() throws {
-        let pty = try PTY(
-            executable: "/bin/echo",
-            arguments: ["MESHYY_PTY_OK"],
-            environment: ["PATH": "/usr/bin:/bin"]
-        )
-        defer { pty.terminate() }
-        let (found, output) = try readUntil(pty, marker: "MESHYY_PTY_OK")
-        #expect(found, "expected the marker; got \(output.debugDescription)")
-    }
-
-    @Test("Keystrokes written to the master reach the shell")
-    func interactiveRoundTrip() throws {
-        let pty = try makeShell()
-        defer { pty.terminate() }
-        try writeAll(pty, Array(markerCommand("MESHYY_ROUNDTRIP").utf8))
-        let (found, output) = try readUntil(pty, marker: "MESHYY_ROUNDTRIP")
-        #expect(found, "got \(output.debugDescription)")
-    }
-
-    /// Design doc §7.1 claims the daemon can read the line discipline from the
-    /// master fd. If that were false the whole prediction design would need a
-    /// different mechanism, so it is checked rather than believed.
-    @Test("A fresh PTY reports cooked mode on the master fd")
-    func freshPTYIsCooked() throws {
-        let pty = try makeShell()
-        defer { pty.terminate() }
-        let state = pty.termios()
-        #expect(state != nil, "tcgetattr on the master fd must succeed")
-        #expect(state?.echo == true, "a fresh PTY echoes")
-        #expect(state?.icanon == true, "a fresh PTY is line-buffered")
-        #expect(state?.raw == false)
-    }
-
-    /// The load-bearing one. A child changes its termios; the daemon must see it
-    /// through the master fd with no cooperation from the child.
-    ///
-    /// Driven with `sh -c` rather than an interactive shell on purpose. An
-    /// interactive shell runs readline, which holds the tty in raw mode for its
-    /// whole life — see `interactiveShellsAreRawNotCooked` below and
-    /// docs/spikes/2026-07-27-line-discipline.md. `sh -c` does no input handling,
-    /// so the PTY starts in cooked mode and the transitions are observable.
-    @Test("termios read on the master reflects the child's own tcsetattr")
-    func termiosOnMasterReflectsChildChanges() throws {
-        let script = """
-            printf 'PHASE%s\\n' _COOKED
-            stty -echo -icanon
-            printf 'PHASE%s\\n' _RAW
-            sleep 1
-            stty sane
-            printf 'PHASE%s\\n' _SANE
-            sleep 2
-            """
-        let pty = try PTY(
-            executable: "/bin/sh",
-            arguments: ["-c", script],
-            environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-        )
-        defer { pty.terminate() }
-
-        // Cooked before the child touches anything.
-        #expect(pty.termios()?.echo == true, "a fresh PTY under a non-interactive sh is cooked")
-        #expect(pty.termios()?.icanon == true)
-
-        // Raw, after the child's own stty.
-        var sawRaw: TermiosState?
-        var deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            _ = try? pty.read()
-            if let state = pty.termios(), !state.echo, !state.icanon { sawRaw = state; break }
-            usleep(10_000)
-        }
-        #expect(sawRaw?.echo == false, "the daemon must observe ECHO going away")
-        #expect(sawRaw?.icanon == false, "the daemon must observe ICANON going away")
-        #expect(sawRaw?.raw == true, "no echo and no icanon is raw mode — do not predict")
-
-        // And back, because a one-way transition would be enough to build a latch
-        // bug on.
-        var restored = false
-        deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            _ = try? pty.read()
-            if pty.termios()?.echo == true { restored = true; break }
-            usleep(10_000)
-        }
-        #expect(restored, "leaving raw mode must be observable too")
-    }
-
-    /// Documents the M0 finding that reshapes design doc §7, so a future reader
-    /// does not mistake it for a bug and "fix" prediction back on.
-    ///
-    /// §7.3 predicted prediction would be off in an agent TUI and **on at a bare
-    /// shell prompt**. It is off at a bare shell prompt too: readline and zle echo
-    /// characters themselves and hold the tty in raw mode for the shell's entire
-    /// life. Under the §7.2 gate, prediction never engages in any real
-    /// configuration.
-    ///
-    /// See docs/spikes/2026-07-27-line-discipline.md.
-    @Test(
-        "Interactive shells hold the tty in RAW mode, so the §7.2 gate never opens",
-        arguments: [
-            ("/bin/bash", ["-i"]),
-            ("/bin/zsh", ["-f", "-i"]),
-        ]
-    )
-    func interactiveShellsAreRawNotCooked(shell: (String, [String])) throws {
-        let pty = try PTY(
-            executable: shell.0,
-            arguments: shell.1,
-            environment: [
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                "TERM": "xterm-256color",
-                "HOME": NSHomeDirectory(),
-            ]
-        )
-        defer { pty.terminate() }
-
-        // Let the line editor initialise and take the terminal.
-        var state: TermiosState?
-        let deadline = Date().addingTimeInterval(4)
-        while Date() < deadline {
-            _ = try? pty.read()
-            if let observed = pty.termios(), !observed.echo { state = observed; break }
-            usleep(20_000)
-        }
-
-        #expect(state?.echo == false, "\(shell.0): readline/zle turns kernel ECHO off")
-        #expect(state?.icanon == false, "\(shell.0): readline/zle turns ICANON off")
-
-        let gate = PredictionGate(
-            termios: state ?? .cooked,
-            altScreen: false,
-            smoothedRTT: .milliseconds(200)
-        )
-        #expect(!gate.shouldPredict,
-                "prediction must stay off at a real shell prompt — this is the finding, not a bug")
-        #expect(gate.reasonPredictionIsOff != nil, "and the reason must be explainable to a user")
-    }
-
-    @Test("The child gets the PTY as its controlling terminal")
-    func childHasControllingTerminal() throws {
-        let pty = try makeShell()
-        defer { pty.terminate() }
-        // `tty` prints the controlling terminal, or "not a tty" if there is none.
-        // Without POSIX_SPAWN_SETSID plus the addopen trick, this fails.
-        try writeAll(pty, Array("tty\n".utf8))
-        let (found, output) = try readUntil(pty, marker: "/dev/ttys")
-        #expect(found, "child has no controlling terminal; got \(output.debugDescription)")
-        #expect(!output.contains("not a tty"))
-    }
-
-    @Test("The child is a session leader, so job control works")
-    func childIsSessionLeader() throws {
-        let pty = try makeShell()
-        defer { pty.terminate() }
-        // A session leader's sid equals its pid.
-        #expect(getsid(pty.childPID) == pty.childPID,
-                "POSIX_SPAWN_SETSID did not take effect")
-    }
-
-    @Test("The initial window size reaches the child")
-    func initialSizeIsVisible() throws {
-        let pty = try makeShell(size: TerminalSize(cols: 133, rows: 47))
-        defer { pty.terminate() }
-        try writeAll(pty, Array("stty size\n".utf8))
-        let (found, output) = try readUntil(pty, marker: "47 133")
-        #expect(found, "expected '47 133'; got \(output.debugDescription)")
-    }
-
-    @Test("Resizing is visible to the child")
-    func resizeIsVisible() throws {
-        let pty = try makeShell(size: TerminalSize(cols: 80, rows: 24))
-        defer { pty.terminate() }
-        try writeAll(pty, Array(markerCommand("MESHYY_READY").utf8))
-        _ = try readUntil(pty, marker: "MESHYY_READY")
-
-        try pty.resize(to: TerminalSize(cols: 100, rows: 30))
-        try writeAll(pty, Array("stty size\n".utf8))
-        let (found, output) = try readUntil(pty, marker: "30 100")
-        #expect(found, "expected '30 100'; got \(output.debugDescription)")
-    }
-
-    @Test("A dimension of zero is clamped rather than passed to the kernel")
-    func sizeIsClamped() {
-        #expect(TerminalSize(cols: 0, rows: 0) == TerminalSize(cols: 1, rows: 1))
-        #expect(TerminalSize(cols: -5, rows: -5) == TerminalSize(cols: 1, rows: 1))
-        let huge = TerminalSize(cols: 1 << 30, rows: 1 << 30)
-        #expect(huge.cols == TerminalSize.maximumDimension)
-        #expect(huge.rows == TerminalSize.maximumDimension)
-    }
-
-    /// The requirement is that a short-lived child's output is never lost, not
-    /// that end of file arrives.
-    ///
-    /// The daemon holds a slave descriptor precisely so a child that prints and
-    /// exits in the same breath does not have its output discarded — on Darwin,
-    /// once the last slave closes, a read on the master returns EIO and throws
-    /// away whatever was buffered. This test failed on CI (and passed locally on
-    /// timing) before that fix. See the note on `PTY.slaveFD`.
-    @Test("A child that prints and exits immediately does not lose its output")
-    func shortLivedChildOutputSurvives() throws {
-        for attempt in 1...10 {
+        @Test("A spawned command's output arrives on the master")
+        func spawnAndRead() throws {
             let pty = try PTY(
                 executable: "/bin/echo",
-                arguments: ["MESHYY_LAST_WORDS"],
+                arguments: ["MESHYY_PTY_OK"],
+                environment: ["PATH": "/usr/bin:/bin"]
+            )
+            defer { pty.terminate() }
+            let (found, output) = try readUntil(pty, marker: "MESHYY_PTY_OK")
+            #expect(found, "expected the marker; got \(output.debugDescription)")
+        }
+
+        @Test("Keystrokes written to the master reach the shell")
+        func interactiveRoundTrip() throws {
+            let pty = try makeShell()
+            defer { pty.terminate() }
+            try writeAll(pty, Array(markerCommand("MESHYY_ROUNDTRIP").utf8))
+            let (found, output) = try readUntil(pty, marker: "MESHYY_ROUNDTRIP")
+            #expect(found, "got \(output.debugDescription)")
+        }
+
+        /// Design doc §7.1 claims the daemon can read the line discipline from the
+        /// master fd. If that were false the whole prediction design would need a
+        /// different mechanism, so it is checked rather than believed.
+        @Test("A fresh PTY reports cooked mode on the master fd")
+        func freshPTYIsCooked() throws {
+            let pty = try makeShell()
+            defer { pty.terminate() }
+            let state = pty.termios()
+            #expect(state != nil, "tcgetattr on the master fd must succeed")
+            #expect(state?.echo == true, "a fresh PTY echoes")
+            #expect(state?.icanon == true, "a fresh PTY is line-buffered")
+            #expect(state?.raw == false)
+        }
+
+        /// The load-bearing one. A child changes its termios; the daemon must see it
+        /// through the master fd with no cooperation from the child.
+        ///
+        /// Driven with `sh -c` rather than an interactive shell on purpose. An
+        /// interactive shell runs readline, which holds the tty in raw mode for its
+        /// whole life — see `interactiveShellsAreRawNotCooked` below and
+        /// docs/spikes/2026-07-27-line-discipline.md. `sh -c` does no input handling,
+        /// so the PTY starts in cooked mode and the transitions are observable.
+        @Test("termios read on the master reflects the child's own tcsetattr")
+        func termiosOnMasterReflectsChildChanges() throws {
+            let script = """
+                printf 'PHASE%s\\n' _COOKED
+                stty -echo -icanon
+                printf 'PHASE%s\\n' _RAW
+                sleep 1
+                stty sane
+                printf 'PHASE%s\\n' _SANE
+                sleep 2
+                """
+            let pty = try PTY(
+                executable: "/bin/sh",
+                arguments: ["-c", script],
+                environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            )
+            defer { pty.terminate() }
+
+            // Cooked before the child touches anything.
+            #expect(pty.termios()?.echo == true, "a fresh PTY under a non-interactive sh is cooked")
+            #expect(pty.termios()?.icanon == true)
+
+            // Raw, after the child's own stty.
+            var sawRaw: TermiosState?
+            var deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                _ = try? pty.read()
+                if let state = pty.termios(), !state.echo, !state.icanon { sawRaw = state; break }
+                usleep(10_000)
+            }
+            #expect(sawRaw?.echo == false, "the daemon must observe ECHO going away")
+            #expect(sawRaw?.icanon == false, "the daemon must observe ICANON going away")
+            #expect(sawRaw?.raw == true, "no echo and no icanon is raw mode — do not predict")
+
+            // And back, because a one-way transition would be enough to build a latch
+            // bug on.
+            var restored = false
+            deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                _ = try? pty.read()
+                if pty.termios()?.echo == true { restored = true; break }
+                usleep(10_000)
+            }
+            #expect(restored, "leaving raw mode must be observable too")
+        }
+
+        /// Documents the M0 finding that reshapes design doc §7, so a future reader
+        /// does not mistake it for a bug and "fix" prediction back on.
+        ///
+        /// §7.3 predicted prediction would be off in an agent TUI and **on at a bare
+        /// shell prompt**. It is off at a bare shell prompt too: readline and zle echo
+        /// characters themselves and hold the tty in raw mode for the shell's entire
+        /// life. Under the §7.2 gate, prediction never engages in any real
+        /// configuration.
+        ///
+        /// See docs/spikes/2026-07-27-line-discipline.md.
+        @Test(
+            "Interactive shells hold the tty in RAW mode, so the §7.2 gate never opens",
+            arguments: [
+                ("/bin/bash", ["-i"]),
+                ("/bin/zsh", ["-f", "-i"]),
+            ]
+        )
+        func interactiveShellsAreRawNotCooked(shell: (String, [String])) throws {
+            let pty = try PTY(
+                executable: shell.0,
+                arguments: shell.1,
+                environment: [
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                    "TERM": "xterm-256color",
+                    "HOME": NSHomeDirectory(),
+                ]
+            )
+            defer { pty.terminate() }
+
+            // Let the line editor initialise and take the terminal.
+            var state: TermiosState?
+            let deadline = Date().addingTimeInterval(4)
+            while Date() < deadline {
+                _ = try? pty.read()
+                if let observed = pty.termios(), !observed.echo { state = observed; break }
+                usleep(20_000)
+            }
+
+            #expect(state?.echo == false, "\(shell.0): readline/zle turns kernel ECHO off")
+            #expect(state?.icanon == false, "\(shell.0): readline/zle turns ICANON off")
+
+            let gate = PredictionGate(
+                termios: state ?? .cooked,
+                altScreen: false,
+                smoothedRTT: .milliseconds(200)
+            )
+            #expect(!gate.shouldPredict,
+                    "prediction must stay off at a real shell prompt — this is the finding, not a bug")
+            #expect(gate.reasonPredictionIsOff != nil, "and the reason must be explainable to a user")
+        }
+
+        @Test("The child gets the PTY as its controlling terminal")
+        func childHasControllingTerminal() throws {
+            let pty = try makeShell()
+            defer { pty.terminate() }
+            // `tty` prints the controlling terminal, or "not a tty" if there is none.
+            // Without POSIX_SPAWN_SETSID plus the addopen trick, this fails.
+            try writeAll(pty, Array("tty\n".utf8))
+            let (found, output) = try readUntil(pty, marker: "/dev/ttys")
+            #expect(found, "child has no controlling terminal; got \(output.debugDescription)")
+            #expect(!output.contains("not a tty"))
+        }
+
+        @Test("The child is a session leader, so job control works")
+        func childIsSessionLeader() throws {
+            let pty = try makeShell()
+            defer { pty.terminate() }
+            // A session leader's sid equals its pid.
+            #expect(getsid(pty.childPID) == pty.childPID,
+                    "POSIX_SPAWN_SETSID did not take effect")
+        }
+
+        @Test("The initial window size reaches the child")
+        func initialSizeIsVisible() throws {
+            let pty = try makeShell(size: TerminalSize(cols: 133, rows: 47))
+            defer { pty.terminate() }
+            try writeAll(pty, Array("stty size\n".utf8))
+            let (found, output) = try readUntil(pty, marker: "47 133")
+            #expect(found, "expected '47 133'; got \(output.debugDescription)")
+        }
+
+        @Test("Resizing is visible to the child")
+        func resizeIsVisible() throws {
+            let pty = try makeShell(size: TerminalSize(cols: 80, rows: 24))
+            defer { pty.terminate() }
+            try writeAll(pty, Array(markerCommand("MESHYY_READY").utf8))
+            _ = try readUntil(pty, marker: "MESHYY_READY")
+
+            try pty.resize(to: TerminalSize(cols: 100, rows: 30))
+            try writeAll(pty, Array("stty size\n".utf8))
+            let (found, output) = try readUntil(pty, marker: "30 100")
+            #expect(found, "expected '30 100'; got \(output.debugDescription)")
+        }
+
+        @Test("A dimension of zero is clamped rather than passed to the kernel")
+        func sizeIsClamped() {
+            #expect(TerminalSize(cols: 0, rows: 0) == TerminalSize(cols: 1, rows: 1))
+            #expect(TerminalSize(cols: -5, rows: -5) == TerminalSize(cols: 1, rows: 1))
+            let huge = TerminalSize(cols: 1 << 30, rows: 1 << 30)
+            #expect(huge.cols == TerminalSize.maximumDimension)
+            #expect(huge.rows == TerminalSize.maximumDimension)
+        }
+
+        /// The requirement is that a short-lived child's output is never lost, not
+        /// that end of file arrives.
+        ///
+        /// The daemon holds a slave descriptor precisely so a child that prints and
+        /// exits in the same breath does not have its output discarded — on Darwin,
+        /// once the last slave closes, a read on the master returns EIO and throws
+        /// away whatever was buffered. This test failed on CI (and passed locally on
+        /// timing) before that fix. See the note on `PTY.slaveFD`.
+        @Test("A child that prints and exits immediately does not lose its output")
+        func shortLivedChildOutputSurvives() throws {
+            for attempt in 1...10 {
+                let pty = try PTY(
+                    executable: "/bin/echo",
+                    arguments: ["MESHYY_LAST_WORDS"],
+                    environment: ["PATH": "/usr/bin:/bin"]
+                )
+                defer { pty.terminate() }
+
+                // Wait for the child to be gone *first*, so the read races exit as
+                // badly as possible — which is what CI does on a slow runner.
+                let exitDeadline = Date().addingTimeInterval(3)
+                while pty.isChildAlive && Date() < exitDeadline { usleep(5_000) }
+
+                let (found, output) = try readUntil(pty, marker: "MESHYY_LAST_WORDS", timeout: 3)
+                #expect(found,
+                        "attempt \(attempt): output was discarded at child exit; got \(output.debugDescription)")
+                if !found { return }
+            }
+        }
+
+        @Test("Child exit is observable through waitpid rather than end of file")
+        func childExitIsObservable() throws {
+            let pty = try PTY(
+                executable: "/bin/echo",
+                arguments: ["done"],
                 environment: ["PATH": "/usr/bin:/bin"]
             )
             defer { pty.terminate() }
 
-            // Wait for the child to be gone *first*, so the read races exit as
-            // badly as possible — which is what CI does on a slow runner.
-            let exitDeadline = Date().addingTimeInterval(3)
-            while pty.isChildAlive && Date() < exitDeadline { usleep(5_000) }
-
-            let (found, output) = try readUntil(pty, marker: "MESHYY_LAST_WORDS", timeout: 3)
-            #expect(found,
-                    "attempt \(attempt): output was discarded at child exit; got \(output.debugDescription)")
-            if !found { return }
+            var exited = false
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if !pty.isChildAlive { exited = true; break }
+                usleep(10_000)
+            }
+            #expect(exited, "the child's exit must be visible to waitpid")
         }
-    }
 
-    @Test("Child exit is observable through waitpid rather than end of file")
-    func childExitIsObservable() throws {
-        let pty = try PTY(
-            executable: "/bin/echo",
-            arguments: ["done"],
-            environment: ["PATH": "/usr/bin:/bin"]
-        )
-        defer { pty.terminate() }
-
-        var exited = false
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            if !pty.isChildAlive { exited = true; break }
-            usleep(10_000)
-        }
-        #expect(exited, "the child's exit must be visible to waitpid")
-    }
-
-    @Test("The child's environment is exactly what was passed")
-    func environmentIsExact() throws {
-        let pty = try PTY(
-            executable: "/bin/sh",
-            arguments: ["-c", "echo MARK-$MESHYY_TEST_VAR-$HOME-END"],
-            environment: ["PATH": "/usr/bin:/bin", "MESHYY_TEST_VAR": "present"]
-        )
-        defer { pty.terminate() }
-        let (found, output) = try readUntil(pty, marker: "MARK-present--END")
-        #expect(found, "environment was not passed verbatim; got \(output.debugDescription)")
-    }
-
-    @Test("Spawning a nonexistent executable throws instead of hanging")
-    func spawnFailureIsReported() {
-        #expect(throws: (any Error).self) {
-            try PTY(
-                executable: "/nonexistent/meshyy-not-a-binary",
-                arguments: [],
-                environment: [:]
+        @Test("The child's environment is exactly what was passed")
+        func environmentIsExact() throws {
+            let pty = try PTY(
+                executable: "/bin/sh",
+                arguments: ["-c", "echo MARK-$MESHYY_TEST_VAR-$HOME-END"],
+                environment: ["PATH": "/usr/bin:/bin", "MESHYY_TEST_VAR": "present"]
             )
+            defer { pty.terminate() }
+            let (found, output) = try readUntil(pty, marker: "MARK-present--END")
+            #expect(found, "environment was not passed verbatim; got \(output.debugDescription)")
         }
-    }
 
-    /// Pins the zombie-on-close fix (docs/qa/zombie-on-close.md).
-    ///
-    /// **The mechanism, stated so nobody re-derives it the hard way.** A session
-    /// leader exiting with a controlling terminal is held inside the kernel's exit
-    /// path until that terminal's OUTPUT queue has drained, and a pty's output
-    /// queue only drains when somebody reads the master. `PTYSession.close`
-    /// cancels its read source before calling `terminate`, so from that instant
-    /// nobody does. A child that writes anything while dying therefore parks in
-    /// `P_WEXIT` — `waitpid(WNOHANG)` answers 0, `ps` shows `?Es` — until
-    /// `terminate`'s very last line closes the master and hangs the tty up. That
-    /// is a second or two after both reap loops gave up, and the exit watcher is
-    /// already cancelled, so the child becomes a zombie nothing will ever wait on.
-    ///
-    /// The reproducer is therefore three things at once, and drops to zero if any
-    /// one is missing: the child must WRITE during teardown, nothing must READ the
-    /// master while it does, and the child must be the session leader holding the
-    /// ctty. Measured: this shape left a zombie every run before the fix, while
-    /// the otherwise identical `quiet-hup` child that exits silently never did.
-    ///
-    /// A `trap ... HUP` child rather than a real shell with a foreground job: in
-    /// the wild the bytes are zsh's `zsh: hangup     sleep 900` job notice, but
-    /// reproducing that needs an interactive login shell whose rc files talk on
-    /// the way out — measured, a hermetic `zsh -l` with no dotfiles reaps cleanly
-    /// and would have made this test pass against the bug it exists to catch. The
-    /// trap makes the write explicit and owes nothing to anyone's dotfiles.
-    @Test("terminate reaps a child that writes while dying on an unread tty")
-    func terminateReapsChildParkedOnUnreadTTY() throws {
-        for attempt in 1...3 {
-            // Writes on SIGHUP and exits. `terminate` sends that SIGHUP, so the
-            // bytes land in the tty at exactly the moment nothing is reading.
+        @Test("Spawning a nonexistent executable throws instead of hanging")
+        func spawnFailureIsReported() {
+            #expect(throws: (any Error).self) {
+                try PTY(
+                    executable: "/nonexistent/meshyy-not-a-binary",
+                    arguments: [],
+                    environment: [:]
+                )
+            }
+        }
+
+        /// Pins the zombie-on-close fix (docs/qa/zombie-on-close.md).
+        ///
+        /// **The mechanism, stated so nobody re-derives it the hard way.** A session
+        /// leader exiting with a controlling terminal is held inside the kernel's exit
+        /// path until that terminal's OUTPUT queue has drained, and a pty's output
+        /// queue only drains when somebody reads the master. `PTYSession.close`
+        /// cancels its read source before calling `terminate`, so from that instant
+        /// nobody does. A child that writes anything while dying therefore parks in
+        /// `P_WEXIT` — `waitpid(WNOHANG)` answers 0, `ps` shows `?Es` — until
+        /// `terminate`'s very last line closes the master and hangs the tty up. That
+        /// is a second or two after both reap loops gave up, and the exit watcher is
+        /// already cancelled, so the child becomes a zombie nothing will ever wait on.
+        ///
+        /// The reproducer is therefore three things at once, and drops to zero if any
+        /// one is missing: the child must WRITE during teardown, nothing must READ the
+        /// master while it does, and the child must be the session leader holding the
+        /// ctty. Measured: this shape left a zombie every run before the fix, while
+        /// the otherwise identical `quiet-hup` child that exits silently never did.
+        ///
+        /// A `trap ... HUP` child rather than a real shell with a foreground job: in
+        /// the wild the bytes are zsh's `zsh: hangup     sleep 900` job notice, but
+        /// reproducing that needs an interactive login shell whose rc files talk on
+        /// the way out — measured, a hermetic `zsh -l` with no dotfiles reaps cleanly
+        /// and would have made this test pass against the bug it exists to catch. The
+        /// trap makes the write explicit and owes nothing to anyone's dotfiles.
+        @Test("terminate reaps a child that writes while dying on an unread tty")
+        func terminateReapsChildParkedOnUnreadTTY() throws {
+            for attempt in 1...3 {
+                // Writes on SIGHUP and exits. `terminate` sends that SIGHUP, so the
+                // bytes land in the tty at exactly the moment nothing is reading.
+                let pty = try PTY(
+                    executable: "/bin/sh",
+                    arguments: [
+                        "-c",
+                        "trap 'printf MESHYY_PARTING_WORDS; exit 0' HUP;"
+                            + " printf MESHYY_UP; while :; do sleep 0.05; done",
+                    ],
+                    environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+                )
+                let child = pty.childPID
+
+                // Read while the child is "live", as the daemon's read source does,
+                // so the queue is empty going in and the only bytes in it are the
+                // parting ones. Then stop, and never read again.
+                let (found, output) = try readUntil(pty, marker: "MESHYY_UP", timeout: 15)
+                guard found else {
+                    Issue.record("attempt \(attempt): child never started; got \(output.debugDescription)")
+                    pty.terminate()
+                    return
+                }
+
+                pty.terminate()
+
+                // terminate must leave NOTHING behind. ECHILD means it reaped the
+                // child itself; the child's own pid coming back means this test just
+                // reaped the zombie terminate walked away from, and 0 means the child
+                // is still parked mid-exit with nobody left to wait for it.
+                var status: Int32 = 0
+                let waited = waitpid(child, &status, WNOHANG)
+                #expect(
+                    waited == -1 && errno == ECHILD,
+                    """
+                    attempt \(attempt): terminate() left pid \(child) unreaped \
+                    (waitpid returned \(waited), errno \(errno)) — a zombie for the \
+                    daemon's lifetime. See PTY.discardPendingOutput.
+                    """
+                )
+            }
+        }
+
+        @Test("terminate signals the whole process group, not just the shell")
+        func terminateKillsGroup() throws {
+            // `sh -c` again: an interactive shell would add job-control chatter and
+            // its own process-group handling, neither of which is under test here.
+            let pty = try PTY(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 300 & printf 'MESHYY%s_%s\\n' _CHILD \"$!\"; sleep 10"],
+                environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            )
+            let (found, output) = try readUntil(pty, marker: "MESHYY_CHILD_")
+            #expect(found, "got \(output.debugDescription)")
+
+            guard let range = output.range(of: "MESHYY_CHILD_") else {
+                Issue.record("no marker in \(output.debugDescription)")
+                pty.terminate()
+                return
+            }
+            let digits = output[range.upperBound...].prefix { $0.isNumber }
+            guard let grandchild = pid_t(digits) else {
+                Issue.record("no pid after the marker in \(output.debugDescription)")
+                pty.terminate()
+                return
+            }
+
+            #expect(getpgid(grandchild) == pty.childPID,
+                    "the grandchild must be in the session's process group for a group signal to reach it")
+            pty.terminate()
+
+            // SIGHUP to the group should take the backgrounded sleep with it.
+            var reaped = false
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if kill(grandchild, 0) != 0 && errno == ESRCH { reaped = true; break }
+                usleep(50_000)
+            }
+            #expect(reaped, "pid \(grandchild) survived terminate() — the group was not signalled")
+        }
+
+        /// The other half of the zombie fix, and the reason `terminate`'s grace loop
+        /// observes the child's exit instead of reaping it.
+        ///
+        /// Draining the master let the shell finish exiting inside the grace period for
+        /// the first time. That immediately created a NEW leak: the loop reaped the
+        /// child, `reaped` turned true, and the SIGKILL escalation — guarded on
+        /// `!reaped` — was skipped altogether. Anything that ignored the SIGHUP then
+        /// outlived its session and was reparented onto launchd. Measured against the
+        /// drain-only fix: 12 of 12 sessions leaked both the `sh` and its `sleep`,
+        /// where the code before the drain had killed them. One leak traded for
+        /// another, with every zombie assertion still green — which is why this is a
+        /// separate test.
+        ///
+        /// A descendant that IGNORES SIGHUP is the whole point: SIG_IGN survives fork
+        /// and exec, so the backgrounded `sleep` inherits it and only the escalation
+        /// can end it. The shell exits at once so the grace loop takes its early exit —
+        /// the exact path that used to reap.
+        @Test("terminate escalates to SIGKILL even when the child exits during the grace period")
+        func terminateKillsSighupProofChildAfterCleanExit() throws {
             let pty = try PTY(
                 executable: "/bin/sh",
                 arguments: [
                     "-c",
-                    "trap 'printf MESHYY_PARTING_WORDS; exit 0' HUP;"
-                        + " printf MESHYY_UP; while :; do sleep 0.05; done",
+                    #"trap "" HUP; sleep 300 & printf 'MESHYY%s_%s\n' _IMMORTAL "$!"; exit 0"#,
                 ],
                 environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
             )
-            let child = pty.childPID
+            let (found, output) = try readUntil(pty, marker: "MESHYY_IMMORTAL_")
+            #expect(found, "got \(output.debugDescription)")
 
-            // Read while the child is "live", as the daemon's read source does,
-            // so the queue is empty going in and the only bytes in it are the
-            // parting ones. Then stop, and never read again.
-            let (found, output) = try readUntil(pty, marker: "MESHYY_UP", timeout: 15)
-            guard found else {
-                Issue.record("attempt \(attempt): child never started; got \(output.debugDescription)")
+            guard let range = output.range(of: "MESHYY_IMMORTAL_"),
+                  let grandchild = pid_t(output[range.upperBound...].prefix { $0.isNumber })
+            else {
+                Issue.record("no pid after the marker in \(output.debugDescription)")
                 pty.terminate()
                 return
             }
 
             pty.terminate()
 
-            // terminate must leave NOTHING behind. ECHILD means it reaped the
-            // child itself; the child's own pid coming back means this test just
-            // reaped the zombie terminate walked away from, and 0 means the child
-            // is still parked mid-exit with nobody left to wait for it.
-            var status: Int32 = 0
-            let waited = waitpid(child, &status, WNOHANG)
-            #expect(
-                waited == -1 && errno == ECHILD,
-                """
-                attempt \(attempt): terminate() left pid \(child) unreaped \
-                (waitpid returned \(waited), errno \(errno)) — a zombie for the \
-                daemon's lifetime. See PTY.discardPendingOutput.
-                """
+            var gone = false
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if kill(grandchild, 0) != 0 && errno == ESRCH { gone = true; break }
+                usleep(50_000)
+            }
+            #expect(gone, """
+                pid \(grandchild) ignored SIGHUP and survived terminate() — the SIGKILL \
+                escalation was skipped because the grace loop reaped the child. An \
+                orphan on launchd for as long as the machine is up.
+                """)
+        }
+
+        /// Pins the fix for a latent daemon bug: SIG_IGN is inherited across fork and
+        /// exec, so if anything in the daemon's process ignores a signal, every shell
+        /// meshyyd spawns inherits that and `terminate()` becomes a polite suggestion
+        /// that leaks processes silently.
+        ///
+        /// This test ignores SIGHUP in the *parent* on purpose — reproducing what the
+        /// test harness happened to do, and what launchd or a future Dispatch version
+        /// might — and asserts the child still dies.
+        @Test("A spawned child gets default signal dispositions even if the parent ignores them")
+        func childDoesNotInheritIgnoredSignals() throws {
+            let previous = signal(SIGHUP, SIG_IGN)
+            defer { signal(SIGHUP, previous) }
+
+            let pty = try PTY(
+                executable: "/bin/sh",
+                arguments: ["-c", "printf 'MESHYY%s\\n' _UP; sleep 30"],
+                environment: ["PATH": "/usr/bin:/bin"]
             )
-        }
-    }
+            let (found, output) = try readUntil(pty, marker: "MESHYY_UP")
+            #expect(found, "child never started; got \(output.debugDescription)")
 
-    @Test("terminate signals the whole process group, not just the shell")
-    func terminateKillsGroup() throws {
-        // `sh -c` again: an interactive shell would add job-control chatter and
-        // its own process-group handling, neither of which is under test here.
-        let pty = try PTY(
-            executable: "/bin/sh",
-            arguments: ["-c", "sleep 300 & printf 'MESHYY%s_%s\\n' _CHILD \"$!\"; sleep 10"],
-            environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-        )
-        let (found, output) = try readUntil(pty, marker: "MESHYY_CHILD_")
-        #expect(found, "got \(output.debugDescription)")
-
-        guard let range = output.range(of: "MESHYY_CHILD_") else {
-            Issue.record("no marker in \(output.debugDescription)")
+            let child = pty.childPID
             pty.terminate()
-            return
+
+            var died = false
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if kill(child, 0) != 0 && errno == ESRCH { died = true; break }
+                usleep(50_000)
+            }
+            #expect(died, "child \(child) inherited the parent's ignored SIGHUP and survived")
         }
-        let digits = output[range.upperBound...].prefix { $0.isNumber }
-        guard let grandchild = pid_t(digits) else {
-            Issue.record("no pid after the marker in \(output.debugDescription)")
-            pty.terminate()
-            return
-        }
-
-        #expect(getpgid(grandchild) == pty.childPID,
-                "the grandchild must be in the session's process group for a group signal to reach it")
-        pty.terminate()
-
-        // SIGHUP to the group should take the backgrounded sleep with it.
-        var reaped = false
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            if kill(grandchild, 0) != 0 && errno == ESRCH { reaped = true; break }
-            usleep(50_000)
-        }
-        #expect(reaped, "pid \(grandchild) survived terminate() — the group was not signalled")
-    }
-
-    /// The other half of the zombie fix, and the reason `terminate`'s grace loop
-    /// observes the child's exit instead of reaping it.
-    ///
-    /// Draining the master let the shell finish exiting inside the grace period for
-    /// the first time. That immediately created a NEW leak: the loop reaped the
-    /// child, `reaped` turned true, and the SIGKILL escalation — guarded on
-    /// `!reaped` — was skipped altogether. Anything that ignored the SIGHUP then
-    /// outlived its session and was reparented onto launchd. Measured against the
-    /// drain-only fix: 12 of 12 sessions leaked both the `sh` and its `sleep`,
-    /// where the code before the drain had killed them. One leak traded for
-    /// another, with every zombie assertion still green — which is why this is a
-    /// separate test.
-    ///
-    /// A descendant that IGNORES SIGHUP is the whole point: SIG_IGN survives fork
-    /// and exec, so the backgrounded `sleep` inherits it and only the escalation
-    /// can end it. The shell exits at once so the grace loop takes its early exit —
-    /// the exact path that used to reap.
-    @Test("terminate escalates to SIGKILL even when the child exits during the grace period")
-    func terminateKillsSighupProofChildAfterCleanExit() throws {
-        let pty = try PTY(
-            executable: "/bin/sh",
-            arguments: [
-                "-c",
-                #"trap "" HUP; sleep 300 & printf 'MESHYY%s_%s\n' _IMMORTAL "$!"; exit 0"#,
-            ],
-            environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-        )
-        let (found, output) = try readUntil(pty, marker: "MESHYY_IMMORTAL_")
-        #expect(found, "got \(output.debugDescription)")
-
-        guard let range = output.range(of: "MESHYY_IMMORTAL_"),
-              let grandchild = pid_t(output[range.upperBound...].prefix { $0.isNumber })
-        else {
-            Issue.record("no pid after the marker in \(output.debugDescription)")
-            pty.terminate()
-            return
-        }
-
-        pty.terminate()
-
-        var gone = false
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            if kill(grandchild, 0) != 0 && errno == ESRCH { gone = true; break }
-            usleep(50_000)
-        }
-        #expect(gone, """
-            pid \(grandchild) ignored SIGHUP and survived terminate() — the SIGKILL \
-            escalation was skipped because the grace loop reaped the child. An \
-            orphan on launchd for as long as the machine is up.
-            """)
-    }
-
-    /// Pins the fix for a latent daemon bug: SIG_IGN is inherited across fork and
-    /// exec, so if anything in the daemon's process ignores a signal, every shell
-    /// meshyyd spawns inherits that and `terminate()` becomes a polite suggestion
-    /// that leaks processes silently.
-    ///
-    /// This test ignores SIGHUP in the *parent* on purpose — reproducing what the
-    /// test harness happened to do, and what launchd or a future Dispatch version
-    /// might — and asserts the child still dies.
-    @Test("A spawned child gets default signal dispositions even if the parent ignores them")
-    func childDoesNotInheritIgnoredSignals() throws {
-        let previous = signal(SIGHUP, SIG_IGN)
-        defer { signal(SIGHUP, previous) }
-
-        let pty = try PTY(
-            executable: "/bin/sh",
-            arguments: ["-c", "printf 'MESHYY%s\\n' _UP; sleep 30"],
-            environment: ["PATH": "/usr/bin:/bin"]
-        )
-        let (found, output) = try readUntil(pty, marker: "MESHYY_UP")
-        #expect(found, "child never started; got \(output.debugDescription)")
-
-        let child = pty.childPID
-        pty.terminate()
-
-        var died = false
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            if kill(child, 0) != 0 && errno == ESRCH { died = true; break }
-            usleep(50_000)
-        }
-        #expect(died, "child \(child) inherited the parent's ignored SIGHUP and survived")
     }
 }

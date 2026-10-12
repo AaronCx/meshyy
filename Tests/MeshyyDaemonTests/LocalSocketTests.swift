@@ -226,509 +226,511 @@ private func payload(_ count: Int, seed: UInt8 = 0) -> [UInt8] {
 }
 
 
-@Suite("Local socket transport", .serialized,
-       .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
-struct LocalSocketTests {
+extension DaemonRealProcessSuite {
+    @Suite("Local socket transport", .serialized,
+           .enabled(if: RealProcessTests.isEnabled, RealProcessTests.reason))
+    struct LocalSocketTests {
 
-    @Test("The socket and its directory are private (design doc §8)")
-    func socketPermissions() async throws {
-        try await withServer { path, _ in
-            let socket = try FileManager.default.attributesOfItem(atPath: path)
-            let directory = try FileManager.default.attributesOfItem(
-                atPath: (path as NSString).deletingLastPathComponent
-            )
-            #expect(socket[.posixPermissions] as? Int == 0o600,
-                    "the socket's permissions are the whole authentication story")
-            #expect(directory[.posixPermissions] as? Int == 0o700)
-        }
-    }
-
-    /// Design doc M1 acceptance: attach gives a working shell.
-    @Test("Hello is answered with Welcome and a live shell")
-    func attachGivesAShell() async throws {
-        try await withServer(child: .shell) { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-
-            client.send(.control(.hello(.init(token: "", cols: 100, rows: 30, session: "m1"))))
-            #expect(client.pump { frames in
-                frames.contains { $0.kind == .control }
-            }, "no Welcome arrived")
-
-            guard case .welcome(let welcome)? = client.controlFrames.first(where: {
-                if case .welcome = $0 { return true }
-                return false
-            }) else {
-                Issue.record("first control frame was not a Welcome: \(client.controlFrames)")
-                return
-            }
-            #expect(welcome.sessionID.count == 32, "session ids are 128-bit random (design doc §8)")
-            #expect(welcome.protocolVersion == Meshyy.protocolVersion)
-
-            client.send(.pty(0, markerCommand("M1_ATTACH_OK")))
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("M1_ATTACH_OK")
-            }, "shell never ran the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
-        }
-    }
-
-    @Test("The requested window size reaches the shell, and a resize is forwarded")
-    func sizeAndResize() async throws {
-        try await withServer(child: .shell) { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 111, rows: 41, session: "size"))))
-            #expect(client.pump { !$0.isEmpty })
-
-            client.send(.pty(0, Array("stty size\n".utf8)))
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("41 111")
-            }, "initial size did not reach the shell")
-
-            client.send(.control(.resize(cols: 90, rows: 28)))
-            client.send(.pty(0, Array("stty size\n".utf8)))
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("28 90")
-            }, "resize did not reach the shell")
-        }
-    }
-
-    /// The M3 payoff, over the M1 transport: a client that reconnects with the
-    /// offset it last held gets a byte-exact continuation.
-    ///
-    /// Asserts on whole byte arrays, not marker substrings. `docs/qa/mutation-log.md`
-    /// records a duplicating mutant that slipped past a substring-based "no
-    /// duplicates" assertion because the duplication missed the marker.
-    @Test("Reattaching with a resume offset replays byte-exactly")
-    func resumeReplaysExactly() async throws {
-        try await withServer { path, store in
-            let first = try TestClient(socketPath: path)
-            first.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "resume"))))
-            #expect(first.pump { !$0.isEmpty }, "no Welcome")
-
-            let before = payload(400, seed: 1)
-            first.send(.pty(0, before))
-            #expect(first.pump { _ in first.ptyStream.count >= before.count },
-                    "byte pipe did not return the first payload")
-            let seenBefore = first.ptyStream
-            // Absolute, including the handshake marker — see `absolutePTYCount`.
-            let absoluteOffset = first.absolutePTYCount
-
-            // The socket dies, standing in for an iOS suspension.
-            first.close()
-
-            // Output continues while nobody is attached.
-            let session = await store.session(named: "resume")
-            #expect(session != nil)
-            let away = payload(300, seed: 2)
-            try await session?.send(away)
-            try await Task.sleep(for: .milliseconds(400))
-
-            // Reattach from exactly what the first client consumed.
-            let second = try TestClient(socketPath: path)
-            defer { second.close() }
-            second.send(.control(.hello(.init(
-                token: "", cols: 80, rows: 24,
-                resumeFrom: UInt64(absoluteOffset),
-                session: "resume"
-            ))))
-            #expect(second.pump { _ in second.ptyStream.count >= away.count },
-                    "replay did not contain what happened while away")
-
-            // §6.4, asserted exactly: the two clients' streams concatenated must
-            // equal what the PTY produced, with no gap and no overlap.
-            let combined = seenBefore + second.ptyStream
-            let expected = before + away
-            #expect(combined.count == expected.count,
-                    "expected \(expected.count) bytes across the seam, got \(combined.count)")
-            #expect(combined == expected, "the byte stream across the seam is not exact")
-
-            #expect(!second.controlFrames.contains { frame in
-                if case .resumeTooOld = frame { return true }
-                return false
-            }, "resume should have been honoured outright")
-        }
-    }
-
-    /// Design doc §3.5, fail visible: an overrun must be announced, not spliced.
-    ///
-    /// The first version of this test assumed a fixed amount of shell output would
-    /// overflow a 512-byte buffer. It did locally and did not on CI, because the
-    /// prompt string differs per machine and the prompt is part of the volume. So
-    /// this waits for the precondition it actually needs — that eviction has
-    /// happened — instead of assuming it.
-    @Test("An overrun resume is announced with ResumeTooOld rather than spliced silently")
-    func overrunIsAnnounced() async throws {
-        try await withServer(bufferCapacity: 512) { path, store in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "overrun"))))
-            #expect(client.pump { !$0.isEmpty })
-
-            guard let session = await store.session(named: "overrun") else {
-                Issue.record("session was not created")
-                return
-            }
-
-            // Far more than 512 bytes, deterministically.
-            // Written straight to the PTY rather than looped in a shell: 12 KiB
-            // against a 512-byte buffer, with no dependence on shell timing.
-            try await session.send(payload(12_288, seed: 6))
-
-            // Wait for eviction rather than for a duration: the buffer's own window
-            // moving off zero is the precondition, and nothing else will do.
-            var evicted = false
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline {
-                if await session.info.bufferedFrom > 0 { evicted = true; break }
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            #expect(evicted, "the ring buffer never overran, so there is nothing to announce")
-            guard evicted else { return }
-
-            let late = try TestClient(socketPath: path)
-            defer { late.close() }
-            late.send(.control(.hello(.init(
-                token: "", cols: 80, rows: 24, resumeFrom: 0, session: "overrun"
-            ))))
-            #expect(late.pump { frames in
-                frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
-                    if case .resumeTooOld = frame { return true }
-                    return false
-                }
-            }, "an evicted offset must produce ResumeTooOld; got \(late.controlFrames)")
-        }
-    }
-
-    @Test("A resume offset ahead of the session is refused, not clamped")
-    func impossibleOffsetIsRefused() async throws {
-        try await withServer { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(
-                token: "", cols: 80, rows: 24, resumeFrom: 999_999, session: "ahead"
-            ))))
-            #expect(client.pump { frames in
-                frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
-                    if case .error = frame { return true }
-                    return false
-                }
-            }, "an impossible offset must be reported; got \(client.controlFrames)")
-        }
-    }
-
-    @Test("Two clients on the same session both see live output")
-    func twoClientsShareASession() async throws {
-        try await withServer { path, store in
-            let first = try TestClient(socketPath: path)
-            defer { first.close() }
-            let second = try TestClient(socketPath: path)
-            defer { second.close() }
-
-            for client in [first, second] {
-                client.send(.control(.hello(.init(
-                    token: "", cols: 80, rows: 24, session: "shared"
-                ))))
-                #expect(client.pump { !$0.isEmpty }, "no Welcome")
-            }
-
-            // Driven from the daemon side so neither client is the writer, which
-            // makes "both saw it" a claim about fan-out rather than about echo.
-            let bytes = payload(256, seed: 3)
-            try await (await store.session(named: "shared"))?.send(bytes)
-
-            for (index, client) in [first, second].enumerated() {
-                #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
-                        "client \(index) did not see the shared output")
-                #expect(client.ptyStream.suffix(bytes.count) == bytes,
-                        "client \(index) saw different bytes")
+        @Test("The socket and its directory are private (design doc §8)")
+        func socketPermissions() async throws {
+            try await withServer { path, _ in
+                let socket = try FileManager.default.attributesOfItem(atPath: path)
+                let directory = try FileManager.default.attributesOfItem(
+                    atPath: (path as NSString).deletingLastPathComponent
+                )
+                #expect(socket[.posixPermissions] as? Int == 0o600,
+                        "the socket's permissions are the whole authentication story")
+                #expect(directory[.posixPermissions] as? Int == 0o700)
             }
         }
-    }
 
-    @Test("An unknown control frame is ignored, not fatal (design doc §5.3)")
-    func unknownFrameIsIgnored() async throws {
-        try await withServer { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "skew"))))
-            #expect(client.pump { !$0.isEmpty }, "no Welcome")
+        /// Design doc M1 acceptance: attach gives a working shell.
+        @Test("Hello is answered with Welcome and a live shell")
+        func attachGivesAShell() async throws {
+            try await withServer(child: .shell) { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
 
-            // A frame from a hypothetical newer client.
-            let future = CBOR.map([
-                (.text("t"), .text("teleport")),
-                (.text("destination"), .text("mars")),
-            ])
-            client.send(FrameEnvelope(kind: .control, payload: future.encode()))
-
-            // The session must still work afterwards.
-            let bytes = payload(64, seed: 4)
-            client.send(.pty(0, bytes))
-            #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
-                    "an unknown control frame killed the session")
-            #expect(client.ptyStream.suffix(bytes.count) == bytes)
-        }
-    }
-
-    @Test("A malformed frame header closes the connection with an error")
-    func malformedFrameIsTerminal() async throws {
-        try await withServer { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            // Channel kind 99 does not exist. A length-prefixed stream cannot
-            // resynchronise, so this must be terminal rather than skipped.
-            client.send(FrameEnvelope(kind: .control, payload: []))
-            var raw = FrameEnvelope(kind: .pty, payload: [1, 2, 3]).encoded
-            raw[0] = 99
-            client.sendRaw(raw)
-
-            #expect(client.pump(timeout: 3) { frames in
-                frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
-                    if case .error = frame { return true }
-                    return false
-                }
-            }, "a malformed frame must be reported; got \(client.controlFrames)")
-        }
-    }
-
-    /// Pins the ordering guarantee. `SessionAttachment` used to spawn a separate
-    /// Task per pty write and per resize, and tasks enqueued on an actor run in an
-    /// UNSPECIFIED order — so two keystroke chunks could reach the PTY reversed, and
-    /// a resize could apply after the command that depended on it. CI caught the
-    /// resize case; scrambled input is the one that would have been blamed on the
-    /// network.
-    @Test("Consecutive writes reach the PTY in the order they were sent")
-    func writesAreOrdered() async throws {
-        try await withServer { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "order"))))
-            #expect(client.pump { !$0.isEmpty }, "no Welcome")
-
-            // 512 bytes, ONE FRAME PER BYTE, through a byte pipe. Any reordering,
-            // duplication or loss changes the returned array — which the earlier
-            // shell-based version could not detect, because it only checked that a
-            // marker substring appeared somewhere.
-            let bytes = payload(512, seed: 5)
-            for byte in bytes {
-                client.send(.pty(0, [byte]))
-            }
-            #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
-                    "only \(client.ptyStream.count) of \(bytes.count) bytes came back")
-            #expect(client.ptyStream == bytes,
-                    "input was reordered, duplicated or dropped across 512 single-byte frames")
-        }
-    }
-
-    /// The case CI actually caught: a resize immediately followed by a command must
-    /// apply before the command runs.
-    @Test("A resize applies before a command sent immediately after it")
-    func resizeOrderedBeforeCommand() async throws {
-        try await withServer(child: .shell) { path, _ in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "rz"))))
-            #expect(client.pump { !$0.isEmpty })
-
-            // No wait between them, on purpose.
-            client.send(.control(.resize(cols: 133, rows: 47)))
-            client.send(.pty(0, Array("stty size\n".utf8)))
-            #expect(client.pump { _ in
-                String(decoding: client.ptyStream, as: UTF8.self).contains("47 133")
-            }, "the resize did not apply before the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
-        }
-    }
-
-    // MARK: - Backpressure (hardening 1d)
-
-    /// The daemon must keep draining the PTY when no client is attached.
-    ///
-    /// If the read loop ever waits on anything a client controls, the child blocks
-    /// on its own stdout and the session hangs for real — and it hangs for the user
-    /// who walked away, which is the user least able to explain what happened.
-    ///
-    /// This found a live deadlock in the mirror direction. `PTYSession.send` used to
-    /// loop until the PTY accepted every byte, on the same actor that runs the read
-    /// loop, so any write larger than the PTY's few-KiB input buffer wedged the
-    /// session permanently at 100% CPU. See `PTY.writeSome`.
-    @Test("A firehose child never blocks while no client is attached")
-    func firehoseKeepsDrainingWithNoClient() async throws {
-        // 64 KiB buffer against an unbounded producer: it must wrap many times.
-        try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { _, store in
-            let session = try await store.attachOrCreate(name: "firehose", size: .default)
-
-            // Wait for the ring to have cycled well past its capacity, which can only
-            // happen if the daemon kept reading with nobody attached.
-            let target: UInt64 = 8 * 64 * 1024
-            var produced: UInt64 = 0
-            let deadline = Date().addingTimeInterval(30)
-            while Date() < deadline {
-                produced = await session.info.bufferedTo
-                if produced >= target { break }
-                try await Task.sleep(for: .milliseconds(50))
-            }
-
-            #expect(produced >= target,
-                    "only \(produced) bytes drained in 30s; the read loop is not keeping up")
-            #expect(await session.isAlive, "the child died or blocked instead of producing")
-
-            // Oldest-first eviction: the window has moved off zero and is capped.
-            let window = await session.info
-            #expect(window.bufferedFrom > 0, "the ring buffer never evicted anything")
-            #expect(window.bufferedTo - window.bufferedFrom <= 64 * 1024,
-                    "the buffer grew past its capacity")
-
-            // And nothing is stuck waiting to be written to the PTY.
-            #expect(await session.pendingWriteCount == 0)
-        }
-    }
-
-    /// The other half of 1d: after all that eviction, a client resuming from an
-    /// offset that is long gone gets a clean answer rather than a stall.
-    @Test("A resume from an evicted offset yields ResumeTooOld, not a stall")
-    func evictedOffsetYieldsResumeTooOld() async throws {
-        try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { path, store in
-            let session = try await store.attachOrCreate(name: "firehose", size: .default)
-            let deadline = Date().addingTimeInterval(30)
-            while Date() < deadline {
-                if await session.info.bufferedFrom > 0 { break }
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            #expect(await session.info.bufferedFrom > 0, "nothing was evicted in 30s")
-
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(
-                token: "", cols: 80, rows: 24, resumeFrom: 0, session: "firehose"
-            ))))
-            #expect(client.pump(timeout: 10) { frames in
-                frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
-                    if case .resumeTooOld = frame { return true }
-                    return false
-                }
-            }, "an evicted offset must be answered, not stalled; got \(client.controlFrames)")
-        }
-    }
-
-    /// A write larger than the PTY's input buffer must be accepted and drained
-    /// rather than blocking the session. This is the exact shape of a paste.
-    @Test("A write far larger than the PTY input buffer drains without wedging")
-    func largeWriteDoesNotWedge() async throws {
-        try await withServer { path, store in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "paste"))))
-            #expect(client.pump { !$0.isEmpty }, "no Welcome")
-
-            // 128 KiB in one go — far past any PTY input buffer.
-            let big = payload(128 * 1024, seed: 9)
-            client.send(.pty(0, big))
-
-            #expect(client.pump(timeout: 30) { _ in client.ptyStream.count >= big.count },
-                    "only \(client.ptyStream.count) of \(big.count) bytes came back")
-            #expect(client.ptyStream == big, "a large write was not echoed byte-exactly")
-
-            let session = await store.session(named: "paste")
-            #expect(await session?.pendingWriteCount == 0, "the write queue did not drain")
-        }
-    }
-
-    /// A client that stops READING must never go mute.
-    ///
-    /// The daemon used to spin on EAGAIN inside the client's own queue while
-    /// writing — and that queue is also where the client's inbound frames are read.
-    /// So a client that stopped draining (a phone mid-redraw, a terminal whose
-    /// buffer filled) had its next RESIZE sit unread in the socket forever, and the
-    /// far side kept drawing at the old size with no way to recover: the black
-    /// space, arriving by a second route. A slow reader must fall behind, never
-    /// mute.
-    @Test("A control frame from a client that stopped reading is still processed")
-    func inputSurvivesAStalledReader() async throws {
-        try await withServer(child: .shell) { path, store in
-            let client = try TestClient(socketPath: path)
-            defer { client.close() }
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "stalled"))))
-            #expect(client.pump { !$0.isEmpty }, "no Welcome")
-
-            // Flood the client with far more than any socket buffer holds, and read
-            // NONE of it from here on.
-            client.send(.pty(0, Array("seq 1 400000\n".utf8)))
-            try await Task.sleep(for: .seconds(3))
-
-            // The size the daemon holds is the assertion: it can only change if the
-            // daemon actually read this frame off a socket it was busy writing to.
-            client.send(.control(.resize(cols: 132, rows: 50)))
-
-            var applied: TerminalSize?
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline {
-                applied = await store.session(named: "stalled")?.info.size
-                if applied == TerminalSize(cols: 132, rows: 50) { break }
-                try await Task.sleep(for: .milliseconds(100))
-            }
-            #expect(applied == TerminalSize(cols: 132, rows: 50), """
-                the daemon never processed a resize from a client that had stopped \
-                reading (size is \(String(describing: applied))) — one stalled reader \
-                and the session can never be resized again
-                """)
-        }
-    }
-
-    @Test("The list reports attachment truthfully, including across a client's death")
-    func listReportsAttachmentTruth() async throws {
-        try await withServer { path, _ in
-            /// Asks the daemon for its table and returns the row for `name`.
-            /// A FRESH connection per question, because the question under test is
-            /// what the daemon believes, not what one long-lived client has seen.
-            func daemonRow(_ name: String) throws -> [String: Any]? {
-                let asker = try TestClient(socketPath: path)
-                defer { asker.close() }
-                asker.send(.control(.sessionListRequest))
-                #expect(asker.pump { frames in
+                client.send(.control(.hello(.init(token: "", cols: 100, rows: 30, session: "m1"))))
+                #expect(client.pump { frames in
                     frames.contains { $0.kind == .control }
-                }, "no list answer")
-                guard case .sessionListResponse(let json)? = asker.controlFrames.first(where: {
-                    if case .sessionListResponse = $0 { return true }
+                }, "no Welcome arrived")
+
+                guard case .welcome(let welcome)? = client.controlFrames.first(where: {
+                    if case .welcome = $0 { return true }
                     return false
-                }) else { return nil }
-                // Schema 2: an envelope, never a bare array — that shape is what
-                // lets a consumer prove capability even when the table is empty.
-                guard let envelope = try JSONSerialization.jsonObject(
-                        with: Data(json.utf8)) as? [String: Any],
-                      envelope["schema"] as? Int ?? 0 >= 2,
-                      let rows = envelope["sessions"] as? [[String: Any]]
-                else {
-                    Issue.record("list --json did not answer with a schema>=2 envelope: \(json)")
-                    return nil
+                }) else {
+                    Issue.record("first control frame was not a Welcome: \(client.controlFrames)")
+                    return
                 }
-                return rows.first { $0["name"] as? String == name }
+                #expect(welcome.sessionID.count == 32, "session ids are 128-bit random (design doc §8)")
+                #expect(welcome.protocolVersion == Meshyy.protocolVersion)
+
+                client.send(.pty(0, markerCommand("M1_ATTACH_OK")))
+                #expect(client.pump { _ in
+                    String(decoding: client.ptyStream, as: UTF8.self).contains("M1_ATTACH_OK")
+                }, "shell never ran the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
             }
+        }
 
-            let client = try TestClient(socketPath: path)
-            client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "truth"))))
-            #expect(client.pump { !$0.isEmpty }, "no Welcome")
+        @Test("The requested window size reaches the shell, and a resize is forwarded")
+        func sizeAndResize() async throws {
+            try await withServer(child: .shell) { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 111, rows: 41, session: "size"))))
+                #expect(client.pump { !$0.isEmpty })
 
-            let attached = try daemonRow("truth")
-            #expect(attached?["attached_clients"] as? Int == 1,
-                    "one live client must read as one, got \(String(describing: attached))")
-            #expect(attached?["created_at"] as? Int ?? 0 > 0)
+                client.send(.pty(0, Array("stty size\n".utf8)))
+                #expect(client.pump { _ in
+                    String(decoding: client.ptyStream, as: UTF8.self).contains("41 111")
+                }, "initial size did not reach the shell")
 
-            // An abrupt close, not a Bye — the case that matters is the client that
-            // vanished (suspended app, dead network), because that is the session a
-            // user later wants offered back as detached rather than haunted by a
-            // phantom attachment.
-            client.close()
-
-            // The daemon notices on its next read; poll rather than sleep-and-hope.
-            var lastSeen: Int? = attached?["attached_clients"] as? Int
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline {
-                lastSeen = try daemonRow("truth")?["attached_clients"] as? Int
-                if lastSeen == 0 { break }
-                usleep(50_000)
+                client.send(.control(.resize(cols: 90, rows: 28)))
+                client.send(.pty(0, Array("stty size\n".utf8)))
+                #expect(client.pump { _ in
+                    String(decoding: client.ptyStream, as: UTF8.self).contains("28 90")
+                }, "resize did not reach the shell")
             }
-            #expect(lastSeen == 0,
-                    "a vanished client must leave the count, or no session ever reads as detached")
+        }
+
+        /// The M3 payoff, over the M1 transport: a client that reconnects with the
+        /// offset it last held gets a byte-exact continuation.
+        ///
+        /// Asserts on whole byte arrays, not marker substrings. `docs/qa/mutation-log.md`
+        /// records a duplicating mutant that slipped past a substring-based "no
+        /// duplicates" assertion because the duplication missed the marker.
+        @Test("Reattaching with a resume offset replays byte-exactly")
+        func resumeReplaysExactly() async throws {
+            try await withServer { path, store in
+                let first = try TestClient(socketPath: path)
+                first.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "resume"))))
+                #expect(first.pump { !$0.isEmpty }, "no Welcome")
+
+                let before = payload(400, seed: 1)
+                first.send(.pty(0, before))
+                #expect(first.pump { _ in first.ptyStream.count >= before.count },
+                        "byte pipe did not return the first payload")
+                let seenBefore = first.ptyStream
+                // Absolute, including the handshake marker — see `absolutePTYCount`.
+                let absoluteOffset = first.absolutePTYCount
+
+                // The socket dies, standing in for an iOS suspension.
+                first.close()
+
+                // Output continues while nobody is attached.
+                let session = await store.session(named: "resume")
+                #expect(session != nil)
+                let away = payload(300, seed: 2)
+                try await session?.send(away)
+                try await Task.sleep(for: .milliseconds(400))
+
+                // Reattach from exactly what the first client consumed.
+                let second = try TestClient(socketPath: path)
+                defer { second.close() }
+                second.send(.control(.hello(.init(
+                    token: "", cols: 80, rows: 24,
+                    resumeFrom: UInt64(absoluteOffset),
+                    session: "resume"
+                ))))
+                #expect(second.pump { _ in second.ptyStream.count >= away.count },
+                        "replay did not contain what happened while away")
+
+                // §6.4, asserted exactly: the two clients' streams concatenated must
+                // equal what the PTY produced, with no gap and no overlap.
+                let combined = seenBefore + second.ptyStream
+                let expected = before + away
+                #expect(combined.count == expected.count,
+                        "expected \(expected.count) bytes across the seam, got \(combined.count)")
+                #expect(combined == expected, "the byte stream across the seam is not exact")
+
+                #expect(!second.controlFrames.contains { frame in
+                    if case .resumeTooOld = frame { return true }
+                    return false
+                }, "resume should have been honoured outright")
+            }
+        }
+
+        /// Design doc §3.5, fail visible: an overrun must be announced, not spliced.
+        ///
+        /// The first version of this test assumed a fixed amount of shell output would
+        /// overflow a 512-byte buffer. It did locally and did not on CI, because the
+        /// prompt string differs per machine and the prompt is part of the volume. So
+        /// this waits for the precondition it actually needs — that eviction has
+        /// happened — instead of assuming it.
+        @Test("An overrun resume is announced with ResumeTooOld rather than spliced silently")
+        func overrunIsAnnounced() async throws {
+            try await withServer(bufferCapacity: 512) { path, store in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "overrun"))))
+                #expect(client.pump { !$0.isEmpty })
+
+                guard let session = await store.session(named: "overrun") else {
+                    Issue.record("session was not created")
+                    return
+                }
+
+                // Far more than 512 bytes, deterministically.
+                // Written straight to the PTY rather than looped in a shell: 12 KiB
+                // against a 512-byte buffer, with no dependence on shell timing.
+                try await session.send(payload(12_288, seed: 6))
+
+                // Wait for eviction rather than for a duration: the buffer's own window
+                // moving off zero is the precondition, and nothing else will do.
+                var evicted = false
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    if await session.info.bufferedFrom > 0 { evicted = true; break }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                #expect(evicted, "the ring buffer never overran, so there is nothing to announce")
+                guard evicted else { return }
+
+                let late = try TestClient(socketPath: path)
+                defer { late.close() }
+                late.send(.control(.hello(.init(
+                    token: "", cols: 80, rows: 24, resumeFrom: 0, session: "overrun"
+                ))))
+                #expect(late.pump { frames in
+                    frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
+                        if case .resumeTooOld = frame { return true }
+                        return false
+                    }
+                }, "an evicted offset must produce ResumeTooOld; got \(late.controlFrames)")
+            }
+        }
+
+        @Test("A resume offset ahead of the session is refused, not clamped")
+        func impossibleOffsetIsRefused() async throws {
+            try await withServer { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(
+                    token: "", cols: 80, rows: 24, resumeFrom: 999_999, session: "ahead"
+                ))))
+                #expect(client.pump { frames in
+                    frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
+                        if case .error = frame { return true }
+                        return false
+                    }
+                }, "an impossible offset must be reported; got \(client.controlFrames)")
+            }
+        }
+
+        @Test("Two clients on the same session both see live output")
+        func twoClientsShareASession() async throws {
+            try await withServer { path, store in
+                let first = try TestClient(socketPath: path)
+                defer { first.close() }
+                let second = try TestClient(socketPath: path)
+                defer { second.close() }
+
+                for client in [first, second] {
+                    client.send(.control(.hello(.init(
+                        token: "", cols: 80, rows: 24, session: "shared"
+                    ))))
+                    #expect(client.pump { !$0.isEmpty }, "no Welcome")
+                }
+
+                // Driven from the daemon side so neither client is the writer, which
+                // makes "both saw it" a claim about fan-out rather than about echo.
+                let bytes = payload(256, seed: 3)
+                try await (await store.session(named: "shared"))?.send(bytes)
+
+                for (index, client) in [first, second].enumerated() {
+                    #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                            "client \(index) did not see the shared output")
+                    #expect(client.ptyStream.suffix(bytes.count) == bytes,
+                            "client \(index) saw different bytes")
+                }
+            }
+        }
+
+        @Test("An unknown control frame is ignored, not fatal (design doc §5.3)")
+        func unknownFrameIsIgnored() async throws {
+            try await withServer { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "skew"))))
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+                // A frame from a hypothetical newer client.
+                let future = CBOR.map([
+                    (.text("t"), .text("teleport")),
+                    (.text("destination"), .text("mars")),
+                ])
+                client.send(FrameEnvelope(kind: .control, payload: future.encode()))
+
+                // The session must still work afterwards.
+                let bytes = payload(64, seed: 4)
+                client.send(.pty(0, bytes))
+                #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                        "an unknown control frame killed the session")
+                #expect(client.ptyStream.suffix(bytes.count) == bytes)
+            }
+        }
+
+        @Test("A malformed frame header closes the connection with an error")
+        func malformedFrameIsTerminal() async throws {
+            try await withServer { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                // Channel kind 99 does not exist. A length-prefixed stream cannot
+                // resynchronise, so this must be terminal rather than skipped.
+                client.send(FrameEnvelope(kind: .control, payload: []))
+                var raw = FrameEnvelope(kind: .pty, payload: [1, 2, 3]).encoded
+                raw[0] = 99
+                client.sendRaw(raw)
+
+                #expect(client.pump(timeout: 3) { frames in
+                    frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
+                        if case .error = frame { return true }
+                        return false
+                    }
+                }, "a malformed frame must be reported; got \(client.controlFrames)")
+            }
+        }
+
+        /// Pins the ordering guarantee. `SessionAttachment` used to spawn a separate
+        /// Task per pty write and per resize, and tasks enqueued on an actor run in an
+        /// UNSPECIFIED order — so two keystroke chunks could reach the PTY reversed, and
+        /// a resize could apply after the command that depended on it. CI caught the
+        /// resize case; scrambled input is the one that would have been blamed on the
+        /// network.
+        @Test("Consecutive writes reach the PTY in the order they were sent")
+        func writesAreOrdered() async throws {
+            try await withServer { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "order"))))
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+                // 512 bytes, ONE FRAME PER BYTE, through a byte pipe. Any reordering,
+                // duplication or loss changes the returned array — which the earlier
+                // shell-based version could not detect, because it only checked that a
+                // marker substring appeared somewhere.
+                let bytes = payload(512, seed: 5)
+                for byte in bytes {
+                    client.send(.pty(0, [byte]))
+                }
+                #expect(client.pump { _ in client.ptyStream.count >= bytes.count },
+                        "only \(client.ptyStream.count) of \(bytes.count) bytes came back")
+                #expect(client.ptyStream == bytes,
+                        "input was reordered, duplicated or dropped across 512 single-byte frames")
+            }
+        }
+
+        /// The case CI actually caught: a resize immediately followed by a command must
+        /// apply before the command runs.
+        @Test("A resize applies before a command sent immediately after it")
+        func resizeOrderedBeforeCommand() async throws {
+            try await withServer(child: .shell) { path, _ in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "rz"))))
+                #expect(client.pump { !$0.isEmpty })
+
+                // No wait between them, on purpose.
+                client.send(.control(.resize(cols: 133, rows: 47)))
+                client.send(.pty(0, Array("stty size\n".utf8)))
+                #expect(client.pump { _ in
+                    String(decoding: client.ptyStream, as: UTF8.self).contains("47 133")
+                }, "the resize did not apply before the command; got \(String(decoding: client.ptyStream, as: UTF8.self).debugDescription)")
+            }
+        }
+
+        // MARK: - Backpressure (hardening 1d)
+
+        /// The daemon must keep draining the PTY when no client is attached.
+        ///
+        /// If the read loop ever waits on anything a client controls, the child blocks
+        /// on its own stdout and the session hangs for real — and it hangs for the user
+        /// who walked away, which is the user least able to explain what happened.
+        ///
+        /// This found a live deadlock in the mirror direction. `PTYSession.send` used to
+        /// loop until the PTY accepted every byte, on the same actor that runs the read
+        /// loop, so any write larger than the PTY's few-KiB input buffer wedged the
+        /// session permanently at 100% CPU. See `PTY.writeSome`.
+        @Test("A firehose child never blocks while no client is attached")
+        func firehoseKeepsDrainingWithNoClient() async throws {
+            // 64 KiB buffer against an unbounded producer: it must wrap many times.
+            try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { _, store in
+                let session = try await store.attachOrCreate(name: "firehose", size: .default)
+
+                // Wait for the ring to have cycled well past its capacity, which can only
+                // happen if the daemon kept reading with nobody attached.
+                let target: UInt64 = 8 * 64 * 1024
+                var produced: UInt64 = 0
+                let deadline = Date().addingTimeInterval(30)
+                while Date() < deadline {
+                    produced = await session.info.bufferedTo
+                    if produced >= target { break }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+
+                #expect(produced >= target,
+                        "only \(produced) bytes drained in 30s; the read loop is not keeping up")
+                #expect(await session.isAlive, "the child died or blocked instead of producing")
+
+                // Oldest-first eviction: the window has moved off zero and is capped.
+                let window = await session.info
+                #expect(window.bufferedFrom > 0, "the ring buffer never evicted anything")
+                #expect(window.bufferedTo - window.bufferedFrom <= 64 * 1024,
+                        "the buffer grew past its capacity")
+
+                // And nothing is stuck waiting to be written to the PTY.
+                #expect(await session.pendingWriteCount == 0)
+            }
+        }
+
+        /// The other half of 1d: after all that eviction, a client resuming from an
+        /// offset that is long gone gets a clean answer rather than a stall.
+        @Test("A resume from an evicted offset yields ResumeTooOld, not a stall")
+        func evictedOffsetYieldsResumeTooOld() async throws {
+            try await withServer(bufferCapacity: 64 * 1024, child: .firehose) { path, store in
+                let session = try await store.attachOrCreate(name: "firehose", size: .default)
+                let deadline = Date().addingTimeInterval(30)
+                while Date() < deadline {
+                    if await session.info.bufferedFrom > 0 { break }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                #expect(await session.info.bufferedFrom > 0, "nothing was evicted in 30s")
+
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(
+                    token: "", cols: 80, rows: 24, resumeFrom: 0, session: "firehose"
+                ))))
+                #expect(client.pump(timeout: 10) { frames in
+                    frames.compactMap { try? ControlFrame.decode($0.payload) }.contains { frame in
+                        if case .resumeTooOld = frame { return true }
+                        return false
+                    }
+                }, "an evicted offset must be answered, not stalled; got \(client.controlFrames)")
+            }
+        }
+
+        /// A write larger than the PTY's input buffer must be accepted and drained
+        /// rather than blocking the session. This is the exact shape of a paste.
+        @Test("A write far larger than the PTY input buffer drains without wedging")
+        func largeWriteDoesNotWedge() async throws {
+            try await withServer { path, store in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "paste"))))
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+                // 128 KiB in one go — far past any PTY input buffer.
+                let big = payload(128 * 1024, seed: 9)
+                client.send(.pty(0, big))
+
+                #expect(client.pump(timeout: 30) { _ in client.ptyStream.count >= big.count },
+                        "only \(client.ptyStream.count) of \(big.count) bytes came back")
+                #expect(client.ptyStream == big, "a large write was not echoed byte-exactly")
+
+                let session = await store.session(named: "paste")
+                #expect(await session?.pendingWriteCount == 0, "the write queue did not drain")
+            }
+        }
+
+        /// A client that stops READING must never go mute.
+        ///
+        /// The daemon used to spin on EAGAIN inside the client's own queue while
+        /// writing — and that queue is also where the client's inbound frames are read.
+        /// So a client that stopped draining (a phone mid-redraw, a terminal whose
+        /// buffer filled) had its next RESIZE sit unread in the socket forever, and the
+        /// far side kept drawing at the old size with no way to recover: the black
+        /// space, arriving by a second route. A slow reader must fall behind, never
+        /// mute.
+        @Test("A control frame from a client that stopped reading is still processed")
+        func inputSurvivesAStalledReader() async throws {
+            try await withServer(child: .shell) { path, store in
+                let client = try TestClient(socketPath: path)
+                defer { client.close() }
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "stalled"))))
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+                // Flood the client with far more than any socket buffer holds, and read
+                // NONE of it from here on.
+                client.send(.pty(0, Array("seq 1 400000\n".utf8)))
+                try await Task.sleep(for: .seconds(3))
+
+                // The size the daemon holds is the assertion: it can only change if the
+                // daemon actually read this frame off a socket it was busy writing to.
+                client.send(.control(.resize(cols: 132, rows: 50)))
+
+                var applied: TerminalSize?
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    applied = await store.session(named: "stalled")?.info.size
+                    if applied == TerminalSize(cols: 132, rows: 50) { break }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                #expect(applied == TerminalSize(cols: 132, rows: 50), """
+                    the daemon never processed a resize from a client that had stopped \
+                    reading (size is \(String(describing: applied))) — one stalled reader \
+                    and the session can never be resized again
+                    """)
+            }
+        }
+
+        @Test("The list reports attachment truthfully, including across a client's death")
+        func listReportsAttachmentTruth() async throws {
+            try await withServer { path, _ in
+                /// Asks the daemon for its table and returns the row for `name`.
+                /// A FRESH connection per question, because the question under test is
+                /// what the daemon believes, not what one long-lived client has seen.
+                func daemonRow(_ name: String) throws -> [String: Any]? {
+                    let asker = try TestClient(socketPath: path)
+                    defer { asker.close() }
+                    asker.send(.control(.sessionListRequest))
+                    #expect(asker.pump { frames in
+                        frames.contains { $0.kind == .control }
+                    }, "no list answer")
+                    guard case .sessionListResponse(let json)? = asker.controlFrames.first(where: {
+                        if case .sessionListResponse = $0 { return true }
+                        return false
+                    }) else { return nil }
+                    // Schema 2: an envelope, never a bare array — that shape is what
+                    // lets a consumer prove capability even when the table is empty.
+                    guard let envelope = try JSONSerialization.jsonObject(
+                            with: Data(json.utf8)) as? [String: Any],
+                          envelope["schema"] as? Int ?? 0 >= 2,
+                          let rows = envelope["sessions"] as? [[String: Any]]
+                    else {
+                        Issue.record("list --json did not answer with a schema>=2 envelope: \(json)")
+                        return nil
+                    }
+                    return rows.first { $0["name"] as? String == name }
+                }
+
+                let client = try TestClient(socketPath: path)
+                client.send(.control(.hello(.init(token: "", cols: 80, rows: 24, session: "truth"))))
+                #expect(client.pump { !$0.isEmpty }, "no Welcome")
+
+                let attached = try daemonRow("truth")
+                #expect(attached?["attached_clients"] as? Int == 1,
+                        "one live client must read as one, got \(String(describing: attached))")
+                #expect(attached?["created_at"] as? Int ?? 0 > 0)
+
+                // An abrupt close, not a Bye — the case that matters is the client that
+                // vanished (suspended app, dead network), because that is the session a
+                // user later wants offered back as detached rather than haunted by a
+                // phantom attachment.
+                client.close()
+
+                // The daemon notices on its next read; poll rather than sleep-and-hope.
+                var lastSeen: Int? = attached?["attached_clients"] as? Int
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    lastSeen = try daemonRow("truth")?["attached_clients"] as? Int
+                    if lastSeen == 0 { break }
+                    usleep(50_000)
+                }
+                #expect(lastSeen == 0,
+                        "a vanished client must leave the count, or no session ever reads as detached")
+            }
         }
     }
 }

@@ -46,3 +46,17 @@ enum RealProcessTests {
     static let reason: Comment =
         "set MESHYY_INTEGRATION_TESTS=1 (make test does) — spawns a real shell/PTY/socket"
 }
+
+/// Every daemon suite that spawns real processes or binds a real socket, run one
+/// at a time.
+///
+/// Those suites wait with SYNCHRONOUS helpers (`TestClient.pump`, `usleep`)
+/// inside async tests, and the daemon under test runs in-process on the same
+/// cooperative thread pool, whose width is the core count. On the 3-core CI
+/// runner, three suites blocking at once left the daemon no thread to produce
+/// what they were waiting for: the whole process stalled about 20 s, and
+/// whichever timing-sensitive test was in that window went red (the screen
+/// resize test, most often). Measured 2026-10-12. See docs/qa/known-debt.md.
+/// Serialized, at most one test blocks a thread at a time.
+@Suite("Daemon, real processes (serialized)", .serialized)
+struct DaemonRealProcessSuite {}
