@@ -974,17 +974,28 @@ extension MeshyyKitSuite {
         /// tmux it applies a resize synchronously, so it sees exactly the order
         /// in which resize and input reached the PTY — the order #63 put on one
         /// QUIC stream. Perl because it is on every Mac and needs no build step.
+        ///
+        /// It also logs every window change it is signalled about as `W/<rows>`,
+        /// so a transport that merged the keyboard-up resize into the dismiss
+        /// (the PTY never at 18 rows, every swipe trivially `20/24`) is caught.
+        /// Perl installs %SIG handlers without SA_RESTART, so a SIGWINCH breaks
+        /// the blocked `sysread` (EINTR, retried) and is logged before any input
+        /// written after it is read: the `W/` line and the wheel lines are in
+        /// PTY order.
         private static let rowCheckScript = #"""
-            use strict; use warnings; use IO::Handle;
+            use strict; use warnings; use IO::Handle; use Errno qw(EINTR);
             open(my $log, '>>', $ARGV[0]) or die "log: $!";
             $log->autoflush(1);
+            sub rows { my $ws = "\0" x 8; ioctl(STDIN, 0x40087468, $ws) or return -1; (unpack('S', $ws))[0] }  # TIOCGWINSZ
+            $SIG{WINCH} = sub { print {$log} "W/" . rows() . "\n"; };
             system('stty', '-icanon', '-echo', 'min', '1');
             STDOUT->autoflush(1);
             print "\e[?1000h\e[?1006h", "ROWCHECK_READY\n";
-            while (sysread(STDIN, my $buffer, 4096)) {
-                my $ws = "\0" x 8;
-                ioctl(STDIN, 0x40087468, $ws) or next;    # TIOCGWINSZ
-                my ($rows) = unpack('S', $ws);
+            while (1) {
+                my $n = sysread(STDIN, my $buffer, 4096);
+                if (!defined $n) { next if $! == EINTR; last; }
+                last if $n == 0;
+                my $rows = rows();
                 while ($buffer =~ /\e\[<\d+;\d+;(\d+)M/g) { print {$log} "$1/$rows\n"; }
             }
             """#
@@ -1010,6 +1021,34 @@ extension MeshyyKitSuite {
             func remove() {
                 try? FileManager.default.removeItem(atPath: script)
                 try? FileManager.default.removeItem(atPath: log)
+            }
+
+            /// One dismiss-then-swipe's log lines, split: the window changes
+            /// (`W/<rows>`) and the wheel events (`<row>/<rows>`).
+            static func split(_ seen: [String]) -> (resizes: [String], wheels: [String]) {
+                (seen.filter { $0.hasPrefix("W/") }, seen.filter { !$0.hasPrefix("W/") })
+            }
+
+            /// Both resizes reached the PTY, in order, and the keyboard-up one
+            /// before any of the swipe: without that, `20/24` proves nothing.
+            static func resizesReached(_ seen: [String]) -> Bool {
+                guard split(seen).resizes == ["W/18", "W/24"],
+                      let up = seen.firstIndex(of: "W/18")
+                else { return false }
+                let firstWheel = seen.firstIndex { !$0.hasPrefix("W/") } ?? seen.endIndex
+                return up < firstWheel
+            }
+
+            /// All three wheel events arrived, each read at 24 rows.
+            static func swipeAfterDismiss(_ seen: [String]) -> Bool {
+                let wheels = split(seen).wheels
+                return wheels.count == 3 && wheels.allSatisfy { $0 == "20/24" }
+            }
+
+            /// The swipe's three wheel events have been read. Any window change
+            /// that reached the PTY ahead of them is logged by then (PTY order).
+            func landed(after before: Int) -> Bool {
+                Self.split(Array(lines.dropFirst(before))).wheels.count >= 3
             }
         }
 
@@ -1040,7 +1079,8 @@ extension MeshyyKitSuite {
             defer { try? FileManager.default.removeItem(atPath: knownHosts) }
 
             // The oracle: ssh delivers window-change and data in one ordered
-            // TCP stream, so every swipe must be seen at 24 rows.
+            // TCP stream, so every seed must log W/18, W/24, then three
+            // wheel events read at 24 rows.
             let pty = try PTY(
                 executable: "/usr/bin/ssh",
                 arguments: ["-tt", "-i", SSHOracleSupport.probeKey, "-o", "BatchMode=yes",
@@ -1061,19 +1101,22 @@ extension MeshyyKitSuite {
             #expect(ready, "the row checker never started over ssh: \(oracleText.suffix(300))")
             var oracleBelief = EmulatorBelief()
             oracleBelief.feed(Array(oracleText.utf8))
-            var oracleSeen: [String] = []
+            var oracleWrong: [String] = []
             for seed in Self.seeds {
                 let before = check.lines.count
                 _ = try await Self.dismissThenSwipe(
                     resize: { try pty.resize(to: $0) },
                     deliver: { _ = try pty.writeSome($0) },
                     belief: oracleBelief, gap: Self.reorderGap(seed))
-                await poll(timeout: 5) { check.lines.count >= before + 3 }
-                oracleSeen += check.lines.dropFirst(before)
+                await poll(timeout: 5) { check.landed(after: before) }
+                let seen = Array(check.lines.dropFirst(before))
+                if seen != ["W/18", "W/24", "20/24", "20/24", "20/24"] {
+                    oracleWrong.append("seed \(seed): \(seen)")
+                }
                 _ = try? pty.read()
             }
-            #expect(oracleSeen.count == 3 * Self.seeds.count && oracleSeen.allSatisfy { $0 == "20/24" },
-                    "the ssh ORACLE saw a swipe before its resize: \(oracleSeen)")
+            #expect(oracleWrong.isEmpty,
+                    "the ssh ORACLE did not see keyboard-up, dismiss, then the swipe at 24 rows: \(oracleWrong)")
             pty.terminate()
 
             // The subject, one fresh connection per seed through a reordering relay.
@@ -1090,6 +1133,7 @@ extension MeshyyKitSuite {
                 direct.stop()
 
                 var misordered: [String] = []
+                var resizesLost: [String] = []
                 for seed in Self.seeds {
                     let relay = ChaosUDPProxy(targetHost: "127.0.0.1", targetPort: daemon.quicPort,
                                               profile: Self.reordering(seed))
@@ -1102,20 +1146,28 @@ extension MeshyyKitSuite {
                         resize: { try await subject.resize($0) },
                         deliver: { try await subject.session.send($0) },
                         belief: subject.log.belief, gap: Self.reorderGap(seed))
-                    let arrived = await poll(timeout: 10) { check.lines.count >= before + 3 }
+                    let arrived = await poll(timeout: 10) { check.landed(after: before) }
                     let seen = Array(check.lines.dropFirst(before))
                     let stats = relay.snapshot()
                     print("MEASURE rowOrder seed=\(seed) gap=\(Self.reorderGap(seed)) route=\(route.rawValue) "
                           + "seen=\(seen) relay{\(stats.summary)}")
                     #expect(route == .sgrWheel && arrived,
                             "seed \(seed): the swipe never reached the far side (route \(route.rawValue)) — \(stats.summary)")
-                    if seen.contains(where: { $0 != "20/24" }) {
+                    if !RowCheck.resizesReached(seen) {
+                        resizesLost.append("seed \(seed): \(seen) — \(stats.summary)")
+                    }
+                    if !RowCheck.swipeAfterDismiss(seen) {
                         misordered.append("seed \(seed): \(seen) — \(stats.summary)")
                     }
                     await subject.session.shutdown()
                     relay.stop()
                 }
-                print("MEASURE rowOrder: \(misordered.count)/\(Self.seeds.count) seeds saw the swipe before the dismiss")
+                print("MEASURE rowOrder: \(misordered.count)/\(Self.seeds.count) seeds saw the swipe before the dismiss, "
+                      + "\(resizesLost.count)/\(Self.seeds.count) lost or merged a resize")
+                #expect(resizesLost.isEmpty, """
+                    the far side never saw the PTY go to 18 rows and back to 24 ahead of the \
+                    swipe — a resize was lost or merged, so 20/24 proves no ordering: \(resizesLost)
+                    """)
                 #expect(misordered.isEmpty, """
                     the swipe overtook the keyboard-dismiss resize — the far side read a \
                     row-20 wheel event while the PTY was still 18 rows: \(misordered)
