@@ -230,3 +230,91 @@ RED in 1.16s -> "lastInboundFrameAt keeps moving on an idle session, carried by
 ```
 
 Both reverted after the run; `git diff` clean; suites green.
+
+---
+
+## 2026-10-11 — #63 one ordered lane, against the SSH oracle (scroll trace, PR B)
+
+The brief: revert #63 and confirm the oracle suite goes red before trusting it.
+Each mutant ran `swift test --filter 'ScrollOracle|WireLane'` three times on the
+dev Mac, against tmux 3.6a.
+
+**Mutant 1: #63's routing reverted.** `git show 71c0880 -- QUICServer.swift
+MeshyyConnection.swift | git apply -R`. The client opens a stream per kind, so
+the first keystroke opens a separate pty stream. The daemon binds its reply
+stream per kind. `ChannelKind.wireLane` itself is left alone.
+
+**Mutant 2: the one-line version.** `wireLane` returns `self`. Client and daemon
+both route on it, so this is the same split, reached through the helper.
+
+| test | mutant 1, runs 1/2/3 | mutant 2, runs 1/2/3 |
+|---|---|---|
+| `dismissAndSwipeStayOrdered` (row checker) | **red / red / red** | **red / red / red** |
+| red seeds of 20 | 4, 6, 5 (**15/60**) | 4, 5, 4 (**13/60**) |
+| `WireLaneTests.laneAssignment` | green / green / green | **red / red / red** |
+| `swipeOutcomeMatchesTheOracle` (tmux, mouse on and off) | green / green / green | green / red* / green |
+| `reorderedClientsMatchTheOracle` (tmux, mouse on and off) | green / green / green | green / green / green |
+
+Red seeds, for replay:
+
+- Mutant 1: {2, 12, 13, 16}, {4, 12, 13, 14, 17, 20}, {12, 13, 16, 18, 20}.
+- Mutant 2: {2, 11, 13, 16}, {7, 8, 13, 16, 20}, {4, 8, 13, 14}.
+
+Seed 13 was red in all six runs.
+
+Every misordered seed failed the same way:
+
+```
+seed 13: ["20/18", "20/18", "20/18"]
+the swipe overtook the keyboard-dismiss resize — the far side read a row-20
+wheel event while the PTY was still 18 rows
+```
+
+The resize went on the control stream and the wheel bytes went on the pty
+stream. The relay reordered datagrams, and the PTY received the swipe first.
+The unmutated code scored 0/20 on this loop in each of its three acceptance
+runs. Over ssh, every swipe read `20/24`.
+
+Mutant 2's failure:
+
+```
+WireLaneTests.swift:24: (ChannelKind.pty.wireLane → .pty) == .control
+```
+
+**What this proves, and what it does not.**
+
+- **The suite catches the revert.** It went red in 6 of 6 runs. One test does
+  the catching: the row checker, a far-side program that applies a resize
+  synchronously. The per-seed hit rate is about 23% (28/120). With 20 seeds
+  per run, a mutant should rarely pass a whole run. The seeds are not
+  independent, though; seed 13 hit every time, so the true miss rate is not
+  simply 0.77^20.
+- **The tmux differential alone does not catch #63.** Both tmux suites stayed
+  green under mutant 1 in all three runs. Their dismiss-then-swipe loop
+  records tmux's outcome and does not assert it, for the reason in the
+  suite's header: tmux applies a resize late, on every transport. That late
+  resize hides transport reordering. With mouse on, meshyy took the swipe
+  whole at the new size:
+  - unmutated: 10/10 in each acceptance run;
+  - mutant 1: 6, 7, 7 of 10;
+  - mutant 2: 9, 4, 8 of 10.
+
+  Over ssh in the same runs: 2, 6, 6 and 4, 2, 3 of 10. The shift is real,
+  but it stays inside ssh's own spread, so it cannot be asserted.
+- **WireLaneTests misses mutant 1.** It pins the helper, not the routing.
+  The row checker is the only witness to the routing itself.
+
+No structural witness was added, such as a test seam that lists the open
+stream kinds. The outcome test caught the revert in every run.
+
+\* **Mutant 2, run 2: a red that is not yet explained.**
+
+- After `path-drop-heal`, tmux session `p` was gone (`no sessions`). Every
+  later mouse-on step then failed on `history → -1` and `mode=-1`, giving 22
+  issues on top of the known ones.
+- This did not happen in mutant 2's other two runs, in any mutant 1 run, or
+  in any unmutated run.
+- Cause not established. This red is not counted as a catch.
+
+Both mutants reverted (`git checkout --`); `git diff` clean. Logs are in
+`~/Developer/cc-sessions/meshyy-mutant-63/`.
