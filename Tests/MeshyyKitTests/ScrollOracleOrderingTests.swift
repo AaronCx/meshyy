@@ -374,6 +374,12 @@ func emitSwipe(
     row requestedRow: Int? = nil,
     sourceLocation: SourceLocation = #_sourceLocation
 ) async -> SentSwipe {
+    // Every swipe is judged from out-of-copy-mode; a leftover scroll would
+    // read as this swipe's outcome whether or not it was delivered.
+    let before = bench.tmux.scrollState()
+    #expect(before.inMode == 0,
+            "\(side.name): the pane is still in copy mode (\(before)) before the swipe is sent",
+            sourceLocation: sourceLocation)
     let history = bench.tmux.historySize()
     #expect(history >= 5 * ticks,
             "\(side.name): the pane has \(history) lines of scrollback — too few for a swipe to show a scroll",
@@ -457,10 +463,13 @@ func swipe(
                          timeout: timeout, until: done)
 }
 
-/// Out of copy mode and confirmed out, so the next swipe starts from zero.
-func resetScroll(_ bench: OracleBench) async {
+/// Out of copy mode and confirmed out, so the next swipe starts from zero. A
+/// pane left in copy mode would hand the next swipe a leftover `mode=1 pos=10`
+/// — the correct mouse-on outcome — so failing to leave it fails the test.
+func resetScroll(_ bench: OracleBench, sourceLocation: SourceLocation = #_sourceLocation) async {
     bench.tmux.cancelCopyMode()
-    await poll(timeout: 3) { bench.tmux.scrollState().inMode == 0 }
+    let out = await poll(timeout: 3) { bench.tmux.scrollState().inMode == 0 }
+    #expect(out, "copy mode would not cancel: \(bench.tmux.scrollState())", sourceLocation: sourceLocation)
 }
 
 // MARK: - The subject
